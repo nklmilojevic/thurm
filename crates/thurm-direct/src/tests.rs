@@ -1016,6 +1016,10 @@ fn wake_resockets_immediately_even_when_dns_stalls_or_fails() {
         creating: Mutex::new(0),
         created: Condvar::new(),
         out: Mutex::new(theirs),
+        wake_dns: Mutex::new(WakeDnsState {
+            in_flight: false,
+            pending: false,
+        }),
         mosh_rt: Some(mosh_rt),
     });
     let _keep = ours;
@@ -1083,4 +1087,122 @@ fn wake_resockets_immediately_even_when_dns_stalls_or_fails() {
     // Next datagram arrives from the same socket (unchanged DNS did not trigger a second wake).
     let (_, after_unchanged_src) = server_udp.recv_from(&mut buf).unwrap();
     assert_eq!(after_unchanged_src, second_src);
+}
+
+#[test]
+fn wake_coalesces_concurrent_dns_lookups_to_one_thread() {
+    use std::sync::atomic::AtomicUsize;
+
+    let key = TestKey::new(1);
+    let server = ssh_server(&key);
+    let mut t = direct_target(&server, Mode::Ssh);
+    let (_stream, direct) = super::serve(t.clone(), key).unwrap();
+    let server_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+
+    let mosh_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let session =
+        MoshSession::start(mosh_rt.handle(), server_addr, [9u8; 16], (80, 24), |_| {}).unwrap();
+
+    t.host = "coalesce.example".into();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let inner = Arc::new(Inner {
+        target: t,
+        key: TestKey::new(1),
+        session: Mutex::new(SessionSlot {
+            current: direct.inner.session.lock().current.clone(),
+            ip: server_addr.ip(),
+            connecting: false,
+        }),
+        session_ready: Condvar::new(),
+        panes: Mutex::new(HashMap::from([(
+            1,
+            Arc::new(Mutex::new(Pane {
+                id: 1,
+                term: new_terminal(size(80, 24)),
+                backend: Backend::Mosh {
+                    session,
+                    pid: None,
+                    current: 0,
+                    snapshots: BTreeMap::new(),
+                    status: Status::Connecting,
+                },
+                subscribed: false,
+                alive: true,
+                exit_code: None,
+                held_replies: Vec::new(),
+            })),
+        )])),
+        next_pane: AtomicU64::new(2),
+        closed: AtomicBool::new(false),
+        creating: Mutex::new(0),
+        created: Condvar::new(),
+        out: Mutex::new(theirs),
+        wake_dns: Mutex::new(WakeDnsState {
+            in_flight: false,
+            pending: false,
+        }),
+        mosh_rt: Some(mosh_rt),
+    });
+    let _keep = ours;
+    let host_direct = Direct { inner };
+
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let lookups_in_worker = lookups.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let worker = host_direct
+        .wake_with(move |_host, _port| {
+            let n = lookups_in_worker.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+                Err(DirectError::Failed("dns stalled".into()))
+            } else {
+                Ok(vec![server_addr])
+            }
+        })
+        .expect("first wake should spawn a single DNS worker");
+
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first lookup should start");
+
+    // Repeated wakes while DNS is blocked must NOT spawn additional threads; they coalesce into
+    // a single pending follow-up lookup on the active worker.
+    for _ in 0..4 {
+        assert!(
+            host_direct
+                .wake_with(move |_host, _port| {
+                    panic!("coalesced wake must not spawn or invoke a second resolver");
+                })
+                .is_none()
+        );
+    }
+    assert_eq!(lookups.load(Ordering::SeqCst), 1);
+
+    let _ = release_tx.send(());
+    worker.join().unwrap();
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        2,
+        "4 coalesced wakes must run at most one follow-up lookup"
+    );
+
+    // After the worker exits, a new wake starts cleanly again.
+    let next_lookups = Arc::new(AtomicUsize::new(0));
+    let next_in_worker = next_lookups.clone();
+    let worker2 = host_direct
+        .wake_with(move |_host, _port| {
+            next_in_worker.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![server_addr])
+        })
+        .expect("wake after worker completion should spawn a fresh lookup");
+    worker2.join().unwrap();
+    assert_eq!(next_lookups.load(Ordering::SeqCst), 1);
 }

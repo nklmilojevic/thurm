@@ -131,15 +131,16 @@ pub struct Direct {
 impl Direct {
     /// Every mosh session moves to a new socket at once (the network changed, or the app came
     /// back from the background). Existing sessions wake immediately so a stalled or failing DNS
-    /// lookup never delays UDP recovery; for hostnames, a background lookup then re-targets any
-    /// session whose peer IP changed (e.g. Wi-Fi IPv4 <-> cellular NAT64 IPv6).
+    /// lookup never delays UDP recovery; for hostnames, at most one background lookup thread runs
+    /// at a time (coalescing repeated wakes) and re-targets any session whose peer IP changed
+    /// (e.g. Wi-Fi IPv4 <-> cellular NAT64 IPv6).
     pub fn wake(&self) {
         let _ = self.wake_with(resolve_addrs);
     }
 
     fn wake_with<F>(&self, resolve: F) -> Option<std::thread::JoinHandle<()>>
     where
-        F: FnOnce(&str, u16) -> Result<Vec<SocketAddr>, DirectError> + Send + 'static,
+        F: Fn(&str, u16) -> Result<Vec<SocketAddr>, DirectError> + Send + 'static,
     {
         let panes: Vec<_> = self.inner.panes.lock().values().cloned().collect();
         for pane in panes {
@@ -147,32 +148,81 @@ impl Direct {
                 session.wake();
             }
         }
-        if self.inner.target.host.parse::<IpAddr>().is_ok() {
+        if self.inner.target.host.parse::<IpAddr>().is_ok()
+            || self.inner.closed.load(Ordering::SeqCst)
+        {
             return None;
         }
+        {
+            let mut dns = self.inner.wake_dns.lock();
+            if dns.in_flight {
+                dns.pending = true;
+                return None;
+            }
+            dns.in_flight = true;
+            dns.pending = false;
+        }
         let inner = self.inner.clone();
-        std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("thurm-direct-wake".into())
             .spawn(move || {
-                if inner.closed.load(Ordering::SeqCst) {
-                    return;
+                struct InFlightGuard<'a> {
+                    inner: &'a Inner,
+                    armed: bool,
                 }
-                let Ok(addrs) = resolve(&inner.target.host, inner.target.port) else {
-                    return;
-                };
-                let panes: Vec<_> = inner.panes.lock().values().cloned().collect();
-                for pane in panes {
-                    if let Backend::Mosh { session, .. } = &pane.lock().backend {
-                        let actual_ip = session.peer_ip();
-                        if let Some(ip) =
-                            pick_wake_ip(actual_ip, &addrs).filter(|&ip| ip != actual_ip)
-                        {
-                            session.wake_at(ip);
+                impl Drop for InFlightGuard<'_> {
+                    fn drop(&mut self) {
+                        if self.armed {
+                            let mut dns = self.inner.wake_dns.lock();
+                            dns.in_flight = false;
+                            dns.pending = false;
                         }
                     }
                 }
-            })
-            .ok()
+                let mut guard = InFlightGuard {
+                    inner: &inner,
+                    armed: true,
+                };
+                loop {
+                    if inner.closed.load(Ordering::SeqCst) {
+                        let mut dns = inner.wake_dns.lock();
+                        dns.in_flight = false;
+                        dns.pending = false;
+                        guard.armed = false;
+                        break;
+                    }
+                    if let Ok(addrs) = resolve(&inner.target.host, inner.target.port) {
+                        let panes: Vec<_> = inner.panes.lock().values().cloned().collect();
+                        for pane in panes {
+                            if let Backend::Mosh { session, .. } = &pane.lock().backend {
+                                let actual_ip = session.peer_ip();
+                                if let Some(ip) =
+                                    pick_wake_ip(actual_ip, &addrs).filter(|&ip| ip != actual_ip)
+                                {
+                                    session.wake_at(ip);
+                                }
+                            }
+                        }
+                    }
+                    let mut dns = inner.wake_dns.lock();
+                    if dns.pending && !inner.closed.load(Ordering::SeqCst) {
+                        dns.pending = false;
+                        continue;
+                    }
+                    dns.in_flight = false;
+                    dns.pending = false;
+                    guard.armed = false;
+                    break;
+                }
+            }) {
+            Ok(handle) => Some(handle),
+            Err(_) => {
+                let mut dns = self.inner.wake_dns.lock();
+                dns.in_flight = false;
+                dns.pending = false;
+                None
+            }
+        }
     }
 }
 
@@ -208,6 +258,10 @@ pub fn serve(
         creating: Mutex::new(0),
         created: Condvar::new(),
         out: Mutex::new(theirs),
+        wake_dns: Mutex::new(WakeDnsState {
+            in_flight: false,
+            pending: false,
+        }),
         mosh_rt: Some(mosh_rt),
     });
     let server = inner.clone();
@@ -734,6 +788,11 @@ struct SessionSlot {
     connecting: bool,
 }
 
+struct WakeDnsState {
+    in_flight: bool,
+    pending: bool,
+}
+
 struct Inner {
     target: DirectTarget,
     key: Arc<dyn DeviceKey>,
@@ -747,6 +806,8 @@ struct Inner {
     creating: Mutex<usize>,
     created: Condvar,
     out: Mutex<UnixStream>,
+    /// Coalesces hostname DNS lookups triggered by repeated `Direct::wake` calls.
+    wake_dns: Mutex<WakeDnsState>,
     /// Always set; taken on drop.
     mosh_rt: Option<tokio::runtime::Runtime>,
 }
