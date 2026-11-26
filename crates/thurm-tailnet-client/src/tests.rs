@@ -143,7 +143,9 @@ fn only_websocket_urls() {
         open("https://mac.tail1234.ts.net/v1/connect", CONNECT_TIMEOUT),
         Err(ConnectError::BadUrl(_))
     ));
-    // Cleartext ws:// is rejected by open() and connect(), even on a Tailscale IP.
+    // Cleartext ws:// is rejected by open(), even on a Tailscale IP. connect() takes it only as
+    // the plain route (older apps pass that here): a Tailscale IP, through a verified Tailscale
+    // interface; there is none on this machine, so that is unreachable, never a cleartext dial.
     for ws in [
         "ws://127.0.0.1:7297/v1/connect",
         "ws://100.64.0.7:7297/v1/connect",
@@ -153,13 +155,20 @@ fn only_websocket_urls() {
             matches!(open(ws, CONNECT_TIMEOUT), Err(ConnectError::BadUrl(_))),
             "{ws}"
         );
-        assert!(
-            matches!(
-                connect(ws, "test", &[], |_| {}, || {}),
-                Err(ConnectError::BadUrl(_))
-            ),
-            "{ws}"
-        );
+        let via_connect = connect(ws, "test", &[], |_| {}, || {});
+        if ws.contains("100.64.0.7") {
+            assert!(
+                matches!(via_connect, Err(ConnectError::Unreachable(_))),
+                "{ws}: {:?}",
+                via_connect.err()
+            );
+        } else {
+            assert!(
+                matches!(via_connect, Err(ConnectError::BadUrl(_))),
+                "{ws}: {:?}",
+                via_connect.err()
+            );
+        }
     }
 }
 

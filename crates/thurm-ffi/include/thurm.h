@@ -65,6 +65,9 @@ void thurm_disconnect(thurm_client *client);
 
 /* Optional teardown hook for `ctx`, invoked once when the last reference holding `ctx`
  * (including background reader and sync-flush tasks) drops. Safe to call with NULL.
+ * It may run on any thread (the reader thread, a background task, or the caller's), never
+ * necessarily the main one: it must only release what `ctx` holds, without touching UI or
+ * main-thread state.
  * When any connect function fails and returns NULL, any in-flight callback has completed and
  * `ctx` is detached before returning, so the caller may immediately release `ctx`. */
 typedef void (*thurm_ctx_drop_cb)(void *ctx);

@@ -2570,6 +2570,7 @@ dependencies = [
  "thurm-config",
  "thurm-mosh",
  "thurm-proto",
+ "thurm-remote",
  "thurm-ssh",
  "thurm-term",
  "tokio",

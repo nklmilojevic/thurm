@@ -106,8 +106,8 @@ const LIMITS: Limits = Limits {
     silent: SILENT_LIMIT,
 };
 
-/// Connects to the daemon at `url` (`wss://` only) and says Hello (with `capabilities`, e.g.
-/// `CAP_MOBILE`), within [`CONNECT_TIMEOUT`] in all.
+/// Connects to the daemon at `url` and says Hello (with `capabilities`, e.g. `CAP_MOBILE`),
+/// within [`CONNECT_TIMEOUT`] in all. A `ws://` address goes through [`connect_plain`].
 pub fn connect(
     url: &str,
     client_name: &str,
@@ -115,6 +115,11 @@ pub fn connect(
     on_event: impl Fn(Event) + Send + 'static,
     on_disconnect: impl FnOnce() + Send + 'static,
 ) -> Result<Remote, ConnectError> {
+    // Apps built before `connect_plain` existed pass their plain tailnet route (`ws://100.x`)
+    // here: it goes the plain way, checked and bound to the VPN interface, not refused.
+    if url.starts_with("ws://") {
+        return connect_plain(url, client_name, capabilities, on_event, on_disconnect);
+    }
     check_wss_url(url)?;
     connect_with(
         url,
@@ -520,9 +525,12 @@ fn select_tailnet_interface(
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
+                    // Another VPN may use 100.64.0.0/10 too: without Tailscale's IPv6 address on
+                    // the same interface, a plaintext connection could go to it.
                     return Err(ConnectError::Unreachable(
-                        "no utun interface confirmed as Tailscale (missing fd7a:115c:a1e0::/48 ULA); \
-                         refusing unverified 100.64.0.0/10 plain route"
+                        "no VPN interface is confirmed as Tailscale (none has a fd7a:115c:a1e0::/48 \
+                         address), so the plain route is refused; a tailnet without IPv6 (headscale \
+                         with no v6 prefix) needs IPv6 turned on, or a wss:// route"
                             .into(),
                     ));
                 }

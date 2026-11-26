@@ -834,7 +834,8 @@ fn racing_key_blocks_sibling_sign_until_auth_completes() {
                 racing.sign(b"auth-1").unwrap();
                 std::thread::sleep(Duration::from_millis(40));
                 racing.finish(false);
-                Err(SessionError::KeyRejected)
+                // The connection broke: another address may still work.
+                Err(SessionError::Ssh(thurm_remote::SshError::Transient("reset".into())))
             } else {
                 racing.sign(b"auth-2").unwrap();
                 racing.finish(true);
@@ -845,6 +846,98 @@ fn racing_key_blocks_sibling_sign_until_auth_completes() {
     );
     assert_eq!(res.unwrap(), ("second-won", second.ip()));
     assert_eq!(signs.load(Ordering::SeqCst), 2);
+}
+
+/// A rejected key is rejected at every address: the attempt ends after the grace, and no other
+/// address prompts for the same key.
+#[test]
+fn a_rejected_key_ends_the_attempt_without_another_prompt() {
+    let first: SocketAddr = "192.0.2.1:22".parse().unwrap();
+    let second: SocketAddr = "192.0.2.2:22".parse().unwrap();
+    let signs = Arc::new(AtomicU64::new(0));
+    let key: Arc<dyn DeviceKey> = TestKey::new(1);
+    let won = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(AuthGate::new());
+    let (won_d, gate_d, signs_d) = (won.clone(), gate.clone(), signs.clone());
+    let started = Instant::now();
+    let res = race_candidates(
+        "dual.example",
+        &[first, second],
+        Duration::from_millis(5),
+        won,
+        gate,
+        move |addr| {
+            let racing = RacingKey::new(key.clone(), gate_d.clone(), won_d.clone());
+            if addr == first {
+                racing.sign(b"auth-1").unwrap();
+                signs_d.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(40));
+                // As `connect_addrs_with_stagger` does: closed before the gate is released.
+                gate_d.close();
+                racing.finish(false);
+                Err(SessionError::KeyRejected)
+            } else {
+                // Waits for its turn, then must not get one.
+                let signed = racing.sign(b"auth-2");
+                if signed.is_ok() {
+                    signs_d.fetch_add(1, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_secs(2));
+                racing.finish(false);
+                Err(SessionError::KeyRejected)
+            }
+        },
+        |_: &str| {},
+    );
+    assert!(matches!(res, Err(DirectError::KeyRejected)), "{:?}", res.err());
+    assert!(started.elapsed() < FATAL_GRACE + Duration::from_millis(500), "{:?}", started.elapsed());
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(signs.load(Ordering::SeqCst), 1);
+}
+
+/// The host's key answers for every address: shown after the grace, not after slower dials time
+/// out.
+#[test]
+fn a_host_key_answer_does_not_wait_for_slow_dials() {
+    let first: SocketAddr = "192.0.2.1:22".parse().unwrap();
+    let second: SocketAddr = "192.0.2.2:22".parse().unwrap();
+    let started = Instant::now();
+    let res = race_candidates(
+        "dual.example",
+        &[first, second],
+        Duration::from_millis(5),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AuthGate::new()),
+        move |addr| {
+            if addr == first {
+                std::thread::sleep(Duration::from_secs(2));
+                Err::<&str, _>(SessionError::Ssh(thurm_remote::SshError::Transient("timed out".into())))
+            } else {
+                Err(SessionError::UnknownHostKey("SHA256:abc".into()))
+            }
+        },
+        |_| {},
+    );
+    assert!(matches!(res, Err(DirectError::UnknownHostKey(_))), "{:?}", res.err());
+    assert!(started.elapsed() < FATAL_GRACE + Duration::from_millis(500), "{:?}", started.elapsed());
+}
+
+/// A dial given up while waiting its turn (its own timeout ran out) never prompts.
+#[test]
+fn an_abandoned_dial_does_not_sign_when_its_turn_comes() {
+    let key: Arc<dyn DeviceKey> = TestKey::new(1);
+    let gate = Arc::new(AuthGate::new());
+    let won = Arc::new(AtomicBool::new(false));
+    let holder = RacingKey::new(key.clone(), gate.clone(), won.clone());
+    holder.sign(b"auth-1").unwrap();
+    let waiter = Arc::new(RacingKey::new(key, gate.clone(), won));
+    let w = waiter.clone();
+    let waiting = std::thread::spawn(move || w.sign(b"auth-2"));
+    std::thread::sleep(Duration::from_millis(50));
+    // Its connection timed out while it waited.
+    waiter.finish(false);
+    holder.finish(false);
+    assert!(waiting.join().unwrap().is_err());
 }
 
 #[test]

@@ -15,10 +15,10 @@ use crate::fragment::{self, Assembly};
 use crate::ssp::{Apply, Engine};
 use crate::wire::{self, HostEvent, UserEvent};
 
-/// After this long without hearing from the server, move to a new socket.
 /// How long a closed session goes on asking the host to end (resending on the retransmission
 /// timer) before it gives up; a host that is unreachable then is left to its idle timeout.
 pub const CLOSE_WAIT: Duration = Duration::from_secs(2);
+/// After this long without hearing from the server, move to a new socket.
 const RESOCKET_AFTER: Duration = Duration::from_secs(6);
 /// After this long, stop calling it reconnecting (it may come back; [`MoshSession::wake`]
 /// tries again at once).

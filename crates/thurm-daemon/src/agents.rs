@@ -907,42 +907,27 @@ pub fn tail(screen: &str, n: usize) -> String {
 }
 
 /// Returns the exact, un-summarized permission request text from an agent hook when `message`
-/// carries real tool/command detail, or `None` for empty or generic fallback wording.
+/// names the tool and what it would do (`Bash: rm -rf /tmp/foo`, optionally after Claude's
+/// `Claude needs your permission to use `), or `None` otherwise. The app offers Allow for this
+/// text, so anything else (generic wording from any agent, in any phrasing) is not a request.
 /// Never pass AI-paraphrased text here.
 pub fn verbatim_permission_request(message: Option<&str>) -> Option<String> {
     let trimmed = message?.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let trimmed_punct = lower.trim_end_matches(['.', '!', '?', '…']);
-    if matches!(
-        trimmed_punct,
-        "is waiting for your input"
-            | "waiting for your input"
-            | "waiting for input"
-            | "needs your attention"
-            | "needs attention"
-            | "asks for permission"
-            | "needs your permission"
-            | "needs permission"
-            | "claude needs your permission"
-            | "permission needed"
-            | "permission requested"
-    ) {
-        return None;
-    }
-    if let Some(rest) = trimmed_punct.strip_prefix("claude needs your permission to use ") {
-        let rest = rest.trim();
-        if !rest.is_empty()
-            && !rest.contains(':')
-            && !rest.contains('\n')
-            && rest.split_whitespace().count() == 1
-        {
-            return None;
-        }
-    }
-    Some(trimmed.to_owned())
+    const PREFIX: &str = "claude needs your permission to use ";
+    let body = if trimmed.len() >= PREFIX.len()
+        && trimmed.is_char_boundary(PREFIX.len())
+        && trimmed[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+    {
+        &trimmed[PREFIX.len()..]
+    } else {
+        trimmed
+    };
+    let (tool, detail) = body.split_once(':')?;
+    let tool_ok = !tool.is_empty()
+        && tool.len() <= 64
+        && tool.starts_with(|c: char| c.is_ascii_alphabetic())
+        && tool.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    (tool_ok && !detail.trim().is_empty()).then(|| trimmed.to_owned())
 }
 
 #[cfg(test)]
@@ -2312,6 +2297,10 @@ mod tests {
             verbatim_permission_request(Some("Claude needs your permission to use Bash: git push")),
             Some("Claude needs your permission to use Bash: git push".into())
         );
+        assert_eq!(
+            verbatim_permission_request(Some("mcp__github__create_issue: {\"title\": \"x\"}")),
+            Some("mcp__github__create_issue: {\"title\": \"x\"}".into())
+        );
         for generic in [
             None,
             Some(""),
@@ -2322,6 +2311,11 @@ mod tests {
             Some("Claude needs your permission"),
             Some("Claude needs your permission to use Bash"),
             Some("Claude needs your permission to use Edit."),
+            // Generic wording not on any list: not a request either.
+            Some("Codex needs your approval"),
+            Some("Claude is waiting for your input"),
+            Some("Bash:"),
+            Some("Bash:   "),
         ] {
             assert_eq!(
                 verbatim_permission_request(generic),

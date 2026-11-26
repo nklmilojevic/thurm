@@ -103,6 +103,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const EXEC_TIMEOUT: Duration = Duration::from_secs(20);
 /// Happy Eyeballs stagger between resolved addresses when dialing multiple candidates.
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+/// How long the other dials of a race may still win after one got a host-key or key-rejected
+/// answer, before that answer is shown.
+const FATAL_GRACE: Duration = Duration::from_secs(1);
 /// Deadline for a single background DNS lookup triggered by `Direct::wake`.
 const WAKE_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard cap on concurrent blocking OS DNS lookups per `Direct` instance so repeated mobile wakes
@@ -393,6 +396,9 @@ enum AuthState {
     /// The local device key declined or failed to sign (e.g. user cancelled biometrics): stop
     /// sibling candidates from re-prompting and preserve the original signing error.
     SignRefused(String),
+    /// No more signing in this attempt: it ended (the race returned), or the host rejected the
+    /// key (another address would reject the same key, after another prompt).
+    Closed,
 }
 
 /// Serializes SSH authentication across concurrent Happy Eyeballs dials from `sign()` through
@@ -401,6 +407,8 @@ enum AuthState {
 struct AuthGate {
     state: Mutex<AuthState>,
     cv: Condvar,
+    /// Close instead of going back to Idle when the signer in flight fails.
+    close_on_release: AtomicBool,
 }
 
 impl AuthGate {
@@ -408,14 +416,20 @@ impl AuthGate {
         Self {
             state: Mutex::new(AuthState::Idle),
             cv: Condvar::new(),
+            close_on_release: AtomicBool::new(false),
         }
     }
 
-    fn acquire_for_sign(&self, won: &AtomicBool) -> Result<(), String> {
+    /// Waits for the turn to sign. A dial whose connection was given up meanwhile (`abandoned`:
+    /// its own timeout ran out) leaves instead of prompting for a connection that is gone.
+    fn acquire_for_sign(&self, won: &AtomicBool, abandoned: &AtomicBool) -> Result<(), String> {
         let mut state = self.state.lock();
         loop {
+            if abandoned.load(Ordering::Acquire) {
+                return Err("cancelled".into());
+            }
             match &*state {
-                AuthState::Won => return Err("cancelled".into()),
+                AuthState::Won | AuthState::Closed => return Err("cancelled".into()),
                 AuthState::SignRefused(msg) => return Err(msg.clone()),
                 AuthState::Idle => {
                     if won.load(Ordering::Acquire) {
@@ -437,9 +451,35 @@ impl AuthGate {
     fn release_failed(&self) {
         let mut state = self.state.lock();
         if matches!(*state, AuthState::InFlight) {
-            *state = AuthState::Idle;
-            self.cv.notify_one();
+            *state = if self.close_on_release.load(Ordering::Acquire) {
+                AuthState::Closed
+            } else {
+                AuthState::Idle
+            };
+            // All waiters recheck: an abandoned one must not be the only one woken.
+            self.cv.notify_all();
         }
+    }
+
+    /// No more signing: now if nobody signs, else once the signer in flight is done (it may
+    /// still win). Waiters leave.
+    fn close(&self) {
+        let mut state = self.state.lock();
+        self.close_on_release.store(true, Ordering::Release);
+        if matches!(*state, AuthState::Idle) {
+            *state = AuthState::Closed;
+        }
+        self.cv.notify_all();
+    }
+
+    /// Wakes the waiters to recheck (a dial was abandoned).
+    fn nudge(&self) {
+        let _state = self.state.lock();
+        self.cv.notify_all();
+    }
+
+    fn signing(&self) -> bool {
+        matches!(*self.state.lock(), AuthState::InFlight)
     }
 
     fn mark_won(&self) {
@@ -471,6 +511,8 @@ struct RacingKey {
     gate: Arc<AuthGate>,
     won: Arc<AtomicBool>,
     holding: AtomicBool,
+    /// This dial's connection attempt is over: a `sign()` still waiting must not prompt.
+    abandoned: AtomicBool,
 }
 
 impl RacingKey {
@@ -480,15 +522,19 @@ impl RacingKey {
             gate,
             won,
             holding: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
         }
     }
 
     fn finish(&self, succeeded: bool) {
+        self.abandoned.store(true, Ordering::Release);
         if succeeded {
             self.holding.store(false, Ordering::Release);
             self.gate.mark_won();
         } else if self.holding.swap(false, Ordering::AcqRel) {
             self.gate.release_failed();
+        } else {
+            self.gate.nudge();
         }
     }
 }
@@ -508,7 +554,7 @@ impl DeviceKey for RacingKey {
 
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String> {
         if !self.holding.load(Ordering::Acquire) {
-            self.gate.acquire_for_sign(&self.won)?;
+            self.gate.acquire_for_sign(&self.won, &self.abandoned)?;
             self.holding.store(true, Ordering::Release);
         }
         match self.inner.sign(data) {
@@ -534,10 +580,12 @@ fn sign_refused_error(err: Option<SessionError>, msg: &str) -> DirectError {
     DirectError::Failed(format!("ssh: signing: {msg}"))
 }
 
-/// Races candidate addresses with Happy Eyeballs staggering. Prefers any winning connection;
-/// retains the first non-transport error (e.g. `KeyRejected`, `HostKeyChanged`) while draining
-/// remaining in-flight candidates rather than cancelling a valid sibling dial, except when the
-/// local device key refuses signing (which immediately ends the attempt with the signing error).
+/// Races candidate addresses with Happy Eyeballs staggering. Prefers any winning connection. A
+/// host's answer that likely holds for every address (`UnknownHostKey`, `HostKeyChanged`,
+/// `KeyRejected`) gives the other dials [`FATAL_GRACE`] to win, then ends the attempt with it
+/// (not after their full connect timeout); a dial signing when that runs out is waited for.
+/// The local device key refusing to sign ends the attempt with the signing error. When this
+/// returns, dials still running can no longer prompt.
 fn race_candidates<S, F, D>(
     host: &str,
     addrs: &[SocketAddr],
@@ -561,6 +609,38 @@ where
     let mut in_flight = 0usize;
     let mut last = DirectError::Failed(format!("{host}: no address"));
     let mut fatal: Option<DirectError> = None;
+    struct CloseOnReturn<'a>(&'a AuthGate);
+    impl Drop for CloseOnReturn<'_> {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let _closed = CloseOnReturn(&gate);
+    // When a host-key or key-rejected answer came, plus FATAL_GRACE.
+    let mut fatal_until: Option<Instant> = None;
+    // A failed dial: the error to end the attempt with now (the key refused to sign), if any.
+    let failed = |e: SessionError,
+                  fatal: &mut Option<DirectError>,
+                  fatal_until: &mut Option<Instant>,
+                  last: &mut DirectError| {
+        if let Some(msg) = gate.sign_refused() {
+            return Some(sign_refused_error(Some(e), &msg));
+        }
+        match e {
+            SessionError::Ssh(s) => *last = DirectError::Failed(s.to_string()),
+            other => {
+                if fatal.is_none() {
+                    *fatal = Some(other.into());
+                    *fatal_until = Some(Instant::now() + FATAL_GRACE);
+                }
+            }
+        }
+        None
+    };
+    // The grace after a fatal answer ran out, and nobody is signing: end with it.
+    let grace_over = |fatal_until: &Option<Instant>| {
+        fatal_until.is_some_and(|t| Instant::now() >= t) && !gate.signing()
+    };
 
     let spawn_one = |addr: SocketAddr| -> bool {
         let tx = tx.clone();
@@ -602,42 +682,38 @@ where
                 Ok(Ok(pair)) => return Ok(pair),
                 Ok(Err(e)) => {
                     in_flight = in_flight.saturating_sub(1);
-                    if let Some(msg) = gate.sign_refused() {
-                        return Err(sign_refused_error(Some(e), &msg));
-                    }
-                    match e {
-                        SessionError::Ssh(s) => last = DirectError::Failed(s.to_string()),
-                        other => {
-                            if fatal.is_none() {
-                                fatal = Some(other.into());
-                            }
-                        }
+                    if let Some(err) = failed(e, &mut fatal, &mut fatal_until, &mut last) {
+                        return Err(err);
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout)
                 | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
             }
+            if grace_over(&fatal_until) {
+                break;
+            }
         }
     }
     drop(tx);
-    while in_flight > 0 {
-        match rx.recv() {
+    while in_flight > 0 && !grace_over(&fatal_until) {
+        let got = match fatal_until {
+            // Woken at the end of the grace (and every 50ms after, while someone signs).
+            Some(t) => rx.recv_timeout(
+                t.saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(50)),
+            ),
+            None => rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+        };
+        match got {
             Ok(Ok(pair)) => return Ok(pair),
             Ok(Err(e)) => {
                 in_flight -= 1;
-                if let Some(msg) = gate.sign_refused() {
-                    return Err(sign_refused_error(Some(e), &msg));
-                }
-                match e {
-                    SessionError::Ssh(s) => last = DirectError::Failed(s.to_string()),
-                    other => {
-                        if fatal.is_none() {
-                            fatal = Some(other.into());
-                        }
-                    }
+                if let Some(err) = failed(e, &mut fatal, &mut fatal_until, &mut last) {
+                    return Err(err);
                 }
             }
-            Err(_) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     if let Some(msg) = gate.sign_refused() {
@@ -707,6 +783,11 @@ fn connect_addrs_with_stagger(
                 won_for_dial.clone(),
             ));
             let res = Session::connect_checked(&t, racing.clone(), CONNECT_TIMEOUT);
+            // A rejected key stops further prompts before this dial lets another sign: the
+            // other addresses would reject the same key.
+            if matches!(res, Err(SessionError::KeyRejected)) {
+                gate_for_dial.close();
+            }
             racing.finish(res.is_ok());
             res
         },

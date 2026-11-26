@@ -102,7 +102,7 @@ impl Encoders {
                     && (ev.shifted == Some(c)
                         || (had_text
                             && (c.is_uppercase()
-                                || (!c.is_ascii_alphanumeric() && !c.is_whitespace()))));
+                                || (!c.is_alphanumeric() && !c.is_whitespace()))));
                 if shifted_diff || already_shifted {
                     ffi::MODS_SHIFT
                 } else {
