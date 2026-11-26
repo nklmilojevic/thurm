@@ -73,11 +73,6 @@ fn write_config(env: &Env, text: &str) {
     std::fs::write(env.dir.join("config/config.toml"), text).unwrap();
 }
 
-fn read_snapshot(env: &Env) -> serde_json::Value {
-    let path = env.dir.join("state/session.json");
-    serde_json::from_slice(&std::fs::read(&path).expect("session.json")).unwrap()
-}
-
 /// Waits until `session.json` satisfies `pred` (the daemon writes it after updating the
 /// records the client sees, so it may lag them).
 fn wait_snapshot(env: &Env, what: &str, pred: impl Fn(&serde_json::Value) -> bool) {
@@ -723,8 +718,9 @@ fn clear_reject_exit_grace_and_close_pane_remove_records() {
     wait_match(&c, pane, "STAY");
     wait_records(&c, pane, "stay set", |r| r.len() == 1);
     c.request(Request::ClosePane { pane }).unwrap();
-    let snap = read_snapshot(&env);
-    assert!(snap["panes"].as_array().unwrap().is_empty());
+    wait_snapshot(&env, "closed pane's record discarded", |snap| {
+        snap["panes"].as_array().is_some_and(|p| p.is_empty())
+    });
 }
 
 #[test]
@@ -778,8 +774,10 @@ fn trust_rules_enforce_allowlist_reload_and_wrapped_check() {
     let recs = wait_records(&c, pane, "untrusted record", |r| r.len() == 1);
     assert!(!recs[0].trusted);
     assert_eq!(recs[0].untrusted_reason.as_deref(), Some("no_rule"));
-    let snap = read_snapshot(&env);
-    assert!(snap["panes"][0]["program_resume"].is_null());
+    // Saved on the monitor's next tick, without the record.
+    wait_snapshot(&env, "untrusted record not saved", |snap| {
+        snap["panes"][0].is_object() && snap["panes"][0]["program_resume"].is_null()
+    });
 
     // Add a trust rule and reload config -> running pane's record immediately becomes trusted
     // and persisted to session.json!
@@ -865,8 +863,10 @@ fn wrapped_child_under_non_shell_is_not_trusted_even_in_all_mode() {
         "wrapped child must not be trusted: {recs:?}"
     );
     assert_eq!(recs[0].untrusted_reason.as_deref(), Some("wrapped"));
-    let snap = read_snapshot(&env);
-    assert!(snap["panes"][0]["program_resume"].is_null());
+    // Saved on the monitor's next tick, without the record.
+    wait_snapshot(&env, "untrusted record not saved", |snap| {
+        snap["panes"][0].is_object() && snap["panes"][0]["program_resume"].is_null()
+    });
 }
 
 #[test]

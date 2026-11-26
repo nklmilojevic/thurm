@@ -651,6 +651,9 @@ pub struct Daemon {
     state_dir: PathBuf,
     integration_dir: Option<PathBuf>,
     session_dirty: AtomicBool,
+    /// An OSC 7577 record was set or removed, or a pane closed: the monitor saves on its next
+    /// tick, off the thread that parses output.
+    resume_save_due: AtomicBool,
     restored: AtomicBool,
     /// `restore_session` or `adopt` is still installing panes: a snapshot written now would
     /// lack the rest of them and the layout, so saves wait (the session stays dirty).
@@ -733,6 +736,7 @@ impl Daemon {
             state_dir,
             integration_dir,
             session_dirty: AtomicBool::new(false),
+            resume_save_due: AtomicBool::new(false),
             restored: AtomicBool::new(false),
             loading: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
@@ -1633,10 +1637,13 @@ impl Daemon {
                 self.broadcast(ev, true);
             }
         }
-        if resume_changed {
-            // Spec SHOULD: save each resume record and each removal when it happens.
+        if resume_changed
+            && self.config.read().session.resume_programs != thurm_config::ResumeProgramsMode::Off
+        {
+            // Spec SHOULD: save each resume record and each removal when it happens. The
+            // monitor does it within a tick, so this thread never waits on the disk.
             self.session_dirty.store(true, Ordering::Relaxed);
-            let _ = self.save_session();
+            self.resume_save_due.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1747,8 +1754,9 @@ impl Daemon {
         st.pty.hangup();
         drop(st);
         self.broadcast(Event::PaneClosed { pane: id }, false);
-        // Spec SHOULD: discard a record when the user closes the terminal on purpose.
-        let _ = self.save_session();
+        // Spec SHOULD: discard a record when the user closes the terminal on purpose. One save
+        // on the monitor's next tick covers every pane of a closed tab.
+        self.resume_save_due.store(true, Ordering::Relaxed);
         true
     }
 
@@ -2192,8 +2200,10 @@ impl Daemon {
                     }
                 }
             }
+            let resume_due = self.resume_save_due.swap(false, Ordering::Relaxed);
             if self.store.is_some()
                 && (resume_expired
+                    || resume_due
                     || self.session_dirty.load(Ordering::Relaxed)
                         && last_save.elapsed() > Duration::from_secs(1)
                     || last_save.elapsed() > interval)
@@ -2530,6 +2540,13 @@ impl Daemon {
         // disk BEFORE spawning so a crash or failed command never retries.
         let mut plans: Vec<Option<PlannedResume>> = Vec::with_capacity(snap.panes.len());
         let mut marked_attempted = false;
+        // Records an earlier start already tried: their pane gets a plain shell, since the
+        // program (or its resume) may be what failed.
+        let tried_before: Vec<bool> = snap
+            .panes
+            .iter()
+            .map(|p| p.program_resume.as_ref().is_some_and(|r| r.attempted))
+            .collect();
         for p in &mut snap.panes {
             let Some(rec) = p.program_resume.as_mut() else {
                 plans.push(None);
@@ -2542,7 +2559,7 @@ impl Daemon {
                 .unwrap_or_default();
             let skip = |reason: &str| {
                 log::info!(
-                    "pane {}: not resuming saved program {prog}, starting a shell (reason={reason})",
+                    "pane {}: not resuming saved program {prog} (reason={reason})",
                     p.id
                 );
             };
@@ -2579,20 +2596,6 @@ impl Daemon {
                     .cloned()
                     .or_else(|| p.cwd.clone())
             };
-            // A rule for this program limited to some directories applies to that directory,
-            // and the command may only start there.
-            let dir_restricted = resume_rules
-                .iter()
-                .any(|r| r.enabled && !r.dirs.is_empty() && r.command.first() == rec.argv.first());
-            if dir_restricted
-                && !resolved_cwd
-                    .as_deref()
-                    .is_some_and(|d| Path::new(d).is_dir())
-            {
-                skip("dir_gone");
-                plans.push(None);
-                continue;
-            }
             let trust = program_resume::evaluate_trust(
                 &TrustSubject {
                     argv: &rec.argv,
@@ -2605,14 +2608,28 @@ impl Daemon {
                 &resume_rules,
                 true,
             );
-            let rule = match trust {
-                TrustVerdict::Trusted { rule } => rule,
+            let (rule, dir_restricted) = match trust {
+                TrustVerdict::Trusted {
+                    rule,
+                    dirs_restricted,
+                } => (rule, dirs_restricted),
                 TrustVerdict::Untrusted(reason) => {
                     skip(&format!("not_trusted trust_reason={reason}"));
                     plans.push(None);
                     continue;
                 }
             };
+            // The rule that trusted it limits the program to some directories: it may only
+            // start in one that exists.
+            if dir_restricted
+                && !resolved_cwd
+                    .as_deref()
+                    .is_some_and(|d| Path::new(d).is_dir())
+            {
+                skip("dir_gone");
+                plans.push(None);
+                continue;
+            }
             // A job of the shell runs from the shell's own first-prompt hook, or else is typed
             // into a POSIX shell once its startup files had time to run.
             if !rec.first_process
@@ -2662,7 +2679,7 @@ impl Daemon {
         }
 
         let mut restored = 0;
-        for (p, plan) in snap.panes.iter().zip(plans) {
+        for ((p, plan), tried_before) in snap.panes.iter().zip(plans).zip(tried_before) {
             if let Some(plan) = plan {
                 let exe = thurmd_exe.as_ref().expect("checked above");
                 match program_resume::write_resume_file(&self.state_dir, &plan.spec) {
@@ -2738,11 +2755,11 @@ impl Daemon {
                 }
             }
 
-            // If an OSC 7577 record existed for this pane but was not resumed (untrusted,
-            // dir_gone, already_tried, shell_unsupported, or its launch failed), restore a plain
-            // shell in the pane's saved cwd rather than falling back to `p.command` or
-            // `agent_resume`.
-            if p.program_resume.is_some() {
+            // A record an earlier start already tried gets a plain shell in the pane's saved cwd,
+            // not `p.command` or `agent_resume`: never run what may have failed twice. Any other
+            // record not resumed here (untrusted, dir_gone, shell_unsupported, or a failed
+            // launch) leaves the pane as if it had never been reported.
+            if tried_before {
                 let req = CreatePane {
                     command: None,
                     cwd: p.cwd.clone(),

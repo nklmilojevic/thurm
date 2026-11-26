@@ -173,6 +173,8 @@ impl Store {
                 .recursive(true)
                 .mode(0o700)
                 .create(&self.dir)?;
+        } else {
+            make_private(&self.dir);
         }
         let json = serde_json::to_vec_pretty(snap).map_err(std::io::Error::other)?;
         write_atomic(&self.session_path(), &json)
@@ -181,6 +183,24 @@ impl Store {
     #[cfg(test)]
     pub fn clear(&self) {
         let _ = std::fs::remove_file(self.session_path());
+    }
+}
+
+/// Takes group and other access away from an existing directory this user owns (the state
+/// directory made under a umask like 002), so the records saved from now on are trusted on the
+/// next start. Those already there were written while others could change them, and stay
+/// untrusted until this save replaces them.
+fn make_private(dir: &Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return;
+    };
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 == 0 {
+        return;
+    }
+    let mode = meta.mode() & 0o700;
+    if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)) {
+        log::warn!("cannot make {} private: {e}", dir.display());
     }
 }
 
@@ -409,6 +429,16 @@ mod tests {
 
         store.clear();
         assert!(store.load().is_none());
+
+        // A state directory others could write to (made under umask 002) drops the records
+        // found in it, and the next save makes it private, so they hold from then on.
+        store.save(&snap).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(store.load().unwrap().panes[0].program_resume.is_none());
+        store.save(&snap).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert_eq!(store.load().unwrap(), snap);
         let _ = std::fs::remove_dir_all(dir);
     }
 

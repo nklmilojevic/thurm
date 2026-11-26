@@ -72,7 +72,9 @@ on where it ran:
   a few seconds after the shell started.
 
 Thurm records each attempt before it starts the command and never retries a resume that
-failed or crashed; if it cannot record the attempt, it starts plain shells instead.
+failed or crashed; if it cannot record the attempt, it starts plain shells instead. A pane
+whose record is not resumed for another reason (not trusted, its directory is gone, or the
+shell cannot run it) restores as it would without one: its command, or `resume_agents`.
 
 By default (`session.resume_programs = "rules"`), Thurm only resumes commands that match
 a trust rule and whose owning process is not wrapped inside a sandbox or another

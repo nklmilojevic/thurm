@@ -746,7 +746,7 @@ impl ProgramResumeState {
     }
 
     /// Processes a raw OSC 7577 report for this pane. Returns `true` if the stored records
-    /// changed (so the daemon can persist immediately).
+    /// changed in a way worth persisting (a repeated identical report returns `false`).
     pub fn handle_report(
         &mut self,
         body: &[u8],
@@ -823,8 +823,7 @@ impl ProgramResumeState {
                         exited_at_ms: None,
                         order,
                     };
-                    self.upsert(rec);
-                    true
+                    self.upsert(rec)
                 }
             },
         }
@@ -852,12 +851,23 @@ impl ProgramResumeState {
         self.records.len() != before
     }
 
-    fn upsert(&mut self, rec: ResumeRecord) {
+    /// Stores `rec` as its owner's newest record. Returns `false` when it only repeats the
+    /// newest record (its time and order move on, nothing worth saving changed).
+    fn upsert(&mut self, rec: ResumeRecord) -> bool {
+        let repeat = self.records.last().is_some_and(|last| {
+            last.exited_at_ms.is_none()
+                && ResumeRecord {
+                    reported_at: rec.reported_at,
+                    order: rec.order,
+                    ..last.clone()
+                } == rec
+        });
         self.records.retain(|r| r.pid != rec.pid);
         if self.records.len() >= MAX_RECORDS_PER_PANE {
             self.records.remove(0);
         }
         self.records.push(rec);
+        !repeat
     }
 
     /// Checks owning process liveness, expiring records whose owners have been gone longer than
@@ -948,7 +958,7 @@ impl ProgramResumeState {
                     false,
                 );
                 let (trusted, rule, untrusted_reason) = match trust {
-                    TrustVerdict::Trusted { rule } => (true, rule, None),
+                    TrustVerdict::Trusted { rule, .. } => (true, rule, None),
                     TrustVerdict::Untrusted(reason) => (false, None, Some(reason.to_owned())),
                 };
                 ResumeRecordInfo {
@@ -1020,7 +1030,12 @@ pub struct TrustSubject<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustVerdict {
-    Trusted { rule: Option<String> },
+    /// `dirs_restricted`: the rule that trusted it limits the program to some directories, so
+    /// on restore it may only start in an existing one.
+    Trusted {
+        rule: Option<String>,
+        dirs_restricted: bool,
+    },
     Untrusted(&'static str),
 }
 
@@ -1055,7 +1070,10 @@ fn evaluate_trust_with_root(
             if subject.wrapped {
                 TrustVerdict::Untrusted("wrapped")
             } else {
-                TrustVerdict::Trusted { rule: None }
+                TrustVerdict::Trusted {
+                    rule: None,
+                    dirs_restricted: false,
+                }
             }
         }
         ResumeProgramsMode::Rules => {
@@ -1071,6 +1089,7 @@ fn evaluate_trust_with_root(
                     Ok(()) => {
                         return TrustVerdict::Trusted {
                             rule: (!rule.name.is_empty()).then(|| rule.name.clone()),
+                            dirs_restricted: !rule.dirs.is_empty(),
                         };
                     }
                     Err(reason) => {
@@ -2136,6 +2155,41 @@ mod tests {
     }
 
     #[test]
+    fn repeated_report_is_not_a_change() {
+        let mut state = ProgramResumeState::with_token(Some(SPEC_TOKEN.into()));
+        let mk = |pid: u32, ancestors: Vec<u32>, order: u64| ResumeRecord {
+            pid,
+            birth: pid as u64 * 10,
+            reported_at: SPEC_TIME,
+            argv: vec![format!("prog{pid}")],
+            cwd: None,
+            cwd_from_report: false,
+            first_process: false,
+            uid: 1000,
+            process_name: format!("prog{pid}"),
+            process_exe: format!("/usr/bin/prog{pid}"),
+            process_argv: vec![format!("prog{pid}")],
+            ancestors,
+            wrapped: false,
+            exited_at_ms: None,
+            order,
+        };
+        assert!(state.upsert(mk(100, vec![10], 1)));
+        assert!(state.upsert(mk(200, vec![100, 10], 2)));
+        // The newest record reported again, later, is not a change worth saving; an older
+        // owner's report moves it to newest, and a changed command is a change.
+        assert!(!state.upsert(ResumeRecord {
+            reported_at: SPEC_TIME + 5,
+            ..mk(200, vec![100, 10], 3)
+        }));
+        assert!(state.upsert(mk(100, vec![10], 4)));
+        assert!(state.upsert(ResumeRecord {
+            argv: vec!["prog100".into(), "-x".into()],
+            ..mk(100, vec![10], 5)
+        }));
+    }
+
+    #[test]
     fn record_hierarchy_and_exit_grace() {
         let mut state = ProgramResumeState::with_token(Some(SPEC_TOKEN.into()));
         let mk = |pid: u32, ancestors: Vec<u32>, order: u64| ResumeRecord {
@@ -2213,7 +2267,8 @@ mod tests {
         assert_eq!(
             evaluate_trust_with_root(&ok, ResumeProgramsMode::Rules, &rules, false, false),
             TrustVerdict::Trusted {
-                rule: Some("claude".into())
+                rule: Some("claude".into()),
+                dirs_restricted: false,
             }
         );
         // Running as root is always refused even in `all` mode.
@@ -2308,7 +2363,8 @@ mod tests {
                 false
             ),
             TrustVerdict::Trusted {
-                rule: Some("nvim".into())
+                rule: Some("nvim".into()),
+                dirs_restricted: false,
             }
         );
         assert_eq!(
@@ -2335,7 +2391,8 @@ mod tests {
                 false
             ),
             TrustVerdict::Trusted {
-                rule: Some("nvim".into())
+                rule: Some("nvim".into()),
+                dirs_restricted: false,
             }
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -2547,6 +2604,7 @@ mod tests {
         };
         let trusted = TrustVerdict::Trusted {
             rule: Some("claude".into()),
+            dirs_restricted: false,
         };
         let differ = TrustVerdict::Untrusted("flags_differ");
 
