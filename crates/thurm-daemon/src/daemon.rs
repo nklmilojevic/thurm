@@ -3729,7 +3729,9 @@ impl Daemon {
             Request::DaemonId => thurm_config::daemon_id()
                 .map(Response::Text)
                 .map_err(|e| format!("the daemon's identifier: {e}")),
-            Request::GetPendingPrompt { .. } => Ok(Response::PendingPrompt(None)),
+            Request::GetPendingPrompt { pane } => self.with_pane(pane, |_, st| {
+                Response::PendingPrompt(st.agent.pending_prompt(pane))
+            }),
         }
     }
 
@@ -5265,6 +5267,83 @@ mod tests {
             .unwrap();
         prune_old_files(&dir, Duration::from_secs(24 * 60 * 60));
         assert!(!old.exists() && new.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn get_pending_prompt_returns_active_prompt_and_none_after_answer() {
+        let dir = std::env::temp_dir().join(format!("thurm-get-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (client, _rx) = daemon.add_client();
+        let pane = daemon
+            .create_pane(
+                CreatePane {
+                    command: Some(vec!["cat".into()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            daemon
+                .dispatch(&client, Request::GetPendingPrompt { pane })
+                .unwrap(),
+            Response::PendingPrompt(None)
+        ));
+
+        {
+            let p = daemon.pane(pane).unwrap();
+            let mut st = p.state.lock();
+            st.agent.saw_foreground(Some(1));
+            st.agent.apply_hook(
+                Some(1),
+                "claude",
+                "Claude Code",
+                "permission-prompt",
+                Some("s1".into()),
+                Some("Bash: cargo check".into()),
+            );
+            st.agent.refresh();
+        }
+
+        let resp = daemon
+            .dispatch(&client, Request::GetPendingPrompt { pane })
+            .unwrap();
+        let Response::PendingPrompt(Some(prompt)) = resp else {
+            panic!("expected PendingPrompt(Some), got {resp:?}");
+        };
+        assert_eq!(prompt.pane, pane);
+        assert_eq!(prompt.title, "Claude Code");
+        assert_eq!(prompt.body, "Bash: cargo check");
+
+        assert!(matches!(
+            daemon
+                .dispatch(
+                    &client,
+                    Request::AnswerPermission {
+                        pane,
+                        prompt: prompt.prompt,
+                        allow: true,
+                    },
+                )
+                .unwrap(),
+            Response::Ok
+        ));
+        assert!(matches!(
+            daemon
+                .dispatch(&client, Request::GetPendingPrompt { pane })
+                .unwrap(),
+            Response::PendingPrompt(None)
+        ));
+
+        daemon.close_pane(pane);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

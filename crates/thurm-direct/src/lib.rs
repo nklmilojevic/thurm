@@ -263,12 +263,93 @@ fn pick_wake_ip(current: IpAddr, addrs: &[SocketAddr]) -> Option<IpAddr> {
     addrs.first().map(SocketAddr::ip)
 }
 
-/// Wraps `DeviceKey` across concurrent Happy Eyeballs dials so only one winning connection
-/// invokes `sign()` (preventing duplicate Face ID prompts) and losers abort before signing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthState {
+    Idle,
+    InFlight,
+    Won,
+}
+
+/// Serializes SSH authentication across concurrent Happy Eyeballs dials from `sign()` through
+/// `Session::connect_checked` completion so overlapping dials never trigger duplicate biometric
+/// prompts while an earlier candidate is awaiting `USERAUTH_SUCCESS`.
+struct AuthGate {
+    state: Mutex<AuthState>,
+    cv: Condvar,
+}
+
+impl AuthGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AuthState::Idle),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire_for_sign(&self, won: &AtomicBool) -> bool {
+        let mut state = self.state.lock();
+        loop {
+            if *state == AuthState::Won || won.load(Ordering::Acquire) {
+                return false;
+            }
+            if *state == AuthState::Idle {
+                *state = AuthState::InFlight;
+                return true;
+            }
+            self.cv.wait(&mut state);
+        }
+    }
+
+    fn release_failed(&self) {
+        let mut state = self.state.lock();
+        if *state == AuthState::InFlight {
+            *state = AuthState::Idle;
+            self.cv.notify_one();
+        }
+    }
+
+    fn mark_won(&self) {
+        let mut state = self.state.lock();
+        *state = AuthState::Won;
+        self.cv.notify_all();
+    }
+}
+
+/// Wraps `DeviceKey` across concurrent Happy Eyeballs dials so only one candidate authenticates
+/// at a time and losing dials abort before invoking `sign()`.
 struct RacingKey {
     inner: Arc<dyn DeviceKey>,
-    sign_gate: Arc<Mutex<()>>,
+    gate: Arc<AuthGate>,
     won: Arc<AtomicBool>,
+    holding: AtomicBool,
+}
+
+impl RacingKey {
+    fn new(inner: Arc<dyn DeviceKey>, gate: Arc<AuthGate>, won: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            gate,
+            won,
+            holding: AtomicBool::new(false),
+        }
+    }
+
+    fn finish(&self, succeeded: bool) {
+        if succeeded {
+            self.holding.store(false, Ordering::Release);
+            self.gate.mark_won();
+        } else if self.holding.swap(false, Ordering::AcqRel) {
+            self.gate.release_failed();
+        }
+    }
+}
+
+impl Drop for RacingKey {
+    fn drop(&mut self) {
+        if self.holding.swap(false, Ordering::AcqRel) {
+            self.gate.release_failed();
+        }
+    }
 }
 
 impl DeviceKey for RacingKey {
@@ -277,11 +358,21 @@ impl DeviceKey for RacingKey {
     }
 
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String> {
-        let _guard = self.sign_gate.lock();
-        if self.won.load(Ordering::Acquire) {
-            return Err("cancelled".into());
+        if !self.holding.load(Ordering::Acquire) {
+            if !self.gate.acquire_for_sign(&self.won) {
+                return Err("cancelled".into());
+            }
+            self.holding.store(true, Ordering::Release);
         }
-        self.inner.sign(data)
+        match self.inner.sign(data) {
+            Ok(sig) => Ok(sig),
+            Err(e) => {
+                if self.holding.swap(false, Ordering::AcqRel) {
+                    self.gate.release_failed();
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -408,7 +499,7 @@ fn connect(
     }
 
     let won = Arc::new(AtomicBool::new(false));
-    let sign_gate = Arc::new(Mutex::new(()));
+    let gate = Arc::new(AuthGate::new());
     let target = target.clone();
     let key = key.clone();
     let won_for_dial = won.clone();
@@ -425,12 +516,14 @@ fn connect(
                 host_keys: target.host_keys.clone(),
                 socket: None,
             };
-            let racing: Arc<dyn DeviceKey> = Arc::new(RacingKey {
-                inner: key.clone(),
-                sign_gate: sign_gate.clone(),
-                won: won_for_dial.clone(),
-            });
-            Session::connect_checked(&t, racing, CONNECT_TIMEOUT)
+            let racing = Arc::new(RacingKey::new(
+                key.clone(),
+                gate.clone(),
+                won_for_dial.clone(),
+            ));
+            let res = Session::connect_checked(&t, racing.clone(), CONNECT_TIMEOUT);
+            racing.finish(res.is_ok());
+            res
         },
         |session| session.disconnect(),
     )

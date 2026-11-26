@@ -744,3 +744,99 @@ fn delayed_reconnect_finishing_after_shutdown_is_discarded() {
         "late reconnect must not remain installed after shutdown"
     );
 }
+
+#[test]
+fn racing_key_blocks_sibling_sign_until_auth_completes() {
+    struct CountingKey {
+        inner: Arc<TestKey>,
+        signs: Arc<AtomicU64>,
+    }
+    impl DeviceKey for CountingKey {
+        fn public_sec1(&self) -> Vec<u8> {
+            self.inner.public_sec1()
+        }
+        fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+            self.signs.fetch_add(1, Ordering::SeqCst);
+            self.inner.sign(data)
+        }
+    }
+
+    let first: SocketAddr = "192.0.2.1:22".parse().unwrap();
+    let second: SocketAddr = "192.0.2.2:22".parse().unwrap();
+
+    // Case 1: first dial wins after a post-sign handshake delay; overlapping second dial must
+    // block until first finishes and cancel without invoking `sign()` a second time.
+    let signs = Arc::new(AtomicU64::new(0));
+    let counting: Arc<dyn DeviceKey> = Arc::new(CountingKey {
+        inner: TestKey::new(1),
+        signs: signs.clone(),
+    });
+    let won = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(AuthGate::new());
+    let won_for_dial = won.clone();
+    let res = race_candidates(
+        "dual.example",
+        &[first, second],
+        Duration::from_millis(5),
+        won,
+        move |addr| {
+            let racing = Arc::new(RacingKey::new(
+                counting.clone(),
+                gate.clone(),
+                won_for_dial.clone(),
+            ));
+            if addr == first {
+                racing.sign(b"auth-1").unwrap();
+                // Simulate waiting for server USERAUTH_SUCCESS after sign() returns.
+                std::thread::sleep(Duration::from_millis(60));
+                racing.finish(true);
+                Ok("first-won")
+            } else {
+                // Reaches sign() while `first` is still awaiting USERAUTH_SUCCESS.
+                let signed = racing.sign(b"auth-2");
+                racing.finish(false);
+                assert!(signed.is_err(), "sibling should cancel after winner completes");
+                Err(SessionError::KeyRejected)
+            }
+        },
+        |_| {},
+    );
+    assert_eq!(res.unwrap(), ("first-won", first.ip()));
+    assert_eq!(signs.load(Ordering::SeqCst), 1);
+
+    // Case 2: first dial fails after signing; second dial must then be released to sign and win.
+    let signs = Arc::new(AtomicU64::new(0));
+    let counting: Arc<dyn DeviceKey> = Arc::new(CountingKey {
+        inner: TestKey::new(1),
+        signs: signs.clone(),
+    });
+    let won = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(AuthGate::new());
+    let won_for_dial = won.clone();
+    let res = race_candidates(
+        "dual.example",
+        &[first, second],
+        Duration::from_millis(5),
+        won,
+        move |addr| {
+            let racing = Arc::new(RacingKey::new(
+                counting.clone(),
+                gate.clone(),
+                won_for_dial.clone(),
+            ));
+            if addr == first {
+                racing.sign(b"auth-1").unwrap();
+                std::thread::sleep(Duration::from_millis(40));
+                racing.finish(false);
+                Err(SessionError::KeyRejected)
+            } else {
+                racing.sign(b"auth-2").unwrap();
+                racing.finish(true);
+                Ok("second-won")
+            }
+        },
+        |_| {},
+    );
+    assert_eq!(res.unwrap(), ("second-won", second.ip()));
+    assert_eq!(signs.load(Ordering::SeqCst), 2);
+}

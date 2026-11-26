@@ -184,6 +184,24 @@ impl AgentTracker {
             .filter(|_| shown && h.status == AgentStatus::NeedsInput)
     }
 
+    /// Active permission prompt details for [`thurm_proto::Request::GetPendingPrompt`], while the
+    /// prompt still shows untouched.
+    pub fn pending_prompt(&self, pane: thurm_proto::PaneId) -> Option<thurm_proto::PendingPrompt> {
+        let prompt = self.permission_prompt()?;
+        let state = self.current.as_ref()?;
+        let body = state
+            .message
+            .clone()
+            .unwrap_or_else(|| "is waiting for your input".into());
+        Some(thurm_proto::PendingPrompt {
+            pane,
+            prompt,
+            title: state.name.clone(),
+            body,
+            request: None,
+        })
+    }
+
     /// Answer permission prompt `prompt` if it still shows: the bytes to type, Enter for the
     /// dialog's default choice (allow once) or Esc (decline).
     pub fn answer_permission(&mut self, prompt: u64, allow: bool) -> Option<&'static [u8]> {
