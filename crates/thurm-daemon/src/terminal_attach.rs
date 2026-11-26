@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// [`Daemon::typing_frozen`]'s error: input held back while an upgrade captures the panes.
+const TYPING_FROZEN: &str = "typing waits for the upgrade";
+/// Longest a held-back input waits for the upgrade (which takes milliseconds) before failing.
+const TYPING_FROZEN_LIMIT: Duration = Duration::from_secs(10);
+
 impl Daemon {
     pub(super) fn with_input_pane<T>(
         &self,
@@ -20,19 +25,46 @@ impl Daemon {
         })?
     }
 
-    /// Refuses typing (what sets `typed`) into a pane waiting to resume a program while an
+    /// Holds back typing (what sets `typed`) into a pane waiting to resume a program while an
     /// upgrade hands the pane over: the first input would cancel the resume, after `typed` was
     /// captured (see `set_upgrading`). Called under the pane's lock, which `handoff` takes
-    /// after setting the flag, before anything of the input takes effect.
+    /// after setting the flag, before anything of the input takes effect. The caller drops the
+    /// lock and retries through [`Daemon::typing_after_upgrade`].
     pub(super) fn typing_frozen(&self, pane: PaneId, st: &PaneState) -> Result<(), String> {
         if !st.typed
             && self.upgrading.load(Ordering::SeqCst)
             && (st.pending_input.is_some()
                 || self.resume_tickets.lock().iter().any(|t| t.pane == pane))
         {
-            return Err("the daemon is restarting: try again".into());
+            return Err(TYPING_FROZEN.into());
         }
         Ok(())
+    }
+
+    /// Runs `typing` (input under the pane's lock that checks [`Daemon::typing_frozen`]) and,
+    /// while an upgrade holds it back, waits for the upgrade outside the lock and tries again.
+    /// The input is never refused for the hand-off: keystrokes come without waiting for a
+    /// reply, so an error would drop them unseen. If the upgrade gives up, the input goes
+    /// through here (and cancels the resume); if it goes ahead, this image ends before the
+    /// input reached the shell, as for any request in flight at the exec, and the next image
+    /// resumes the program with nothing typed: what the hand-off said.
+    pub(super) fn typing_after_upgrade<T>(
+        &self,
+        mut typing: impl FnMut() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let deadline = Instant::now() + TYPING_FROZEN_LIMIT;
+        loop {
+            match typing() {
+                Err(e) if e == TYPING_FROZEN => {}
+                other => return other,
+            }
+            while self.upgrading.load(Ordering::SeqCst) {
+                if Instant::now() >= deadline {
+                    return Err("the daemon is restarting: try again".into());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
     }
 
     pub(super) fn attach_terminal(

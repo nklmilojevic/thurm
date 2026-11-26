@@ -2601,9 +2601,10 @@ impl Daemon {
     }
 
     /// Set before [`Daemon::handoff`] captures the panes, and cleared if the upgrade doesn't
-    /// happen: meanwhile the first input into a pane with a resume pending is refused, so the
-    /// `typed` the next image gets is final (the bytes would reach the shell, but the image
-    /// that would cancel the resume for them is not the one that types it).
+    /// happen: meanwhile the first input into a pane with a resume pending waits (see
+    /// [`Daemon::typing_after_upgrade`]), so the `typed` the next image gets is final (the
+    /// bytes would reach the shell, but the image that would cancel the resume for them is not
+    /// the one that types it).
     pub fn set_upgrading(&self, on: bool) {
         self.upgrading.store(on, Ordering::SeqCst);
     }
@@ -3831,32 +3832,39 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::Input { pane, data } => {
-                self.with_input_pane(client.id, pane, |p, st| {
-                    if !data.is_empty() {
-                        self.typing_frozen(pane, st)?;
-                    }
-                    self.used_by(client, st);
-                    if !data.is_empty() {
-                        st.typed = true;
-                        st.agent.prompt.interrupted();
-                    }
-                    st.agent.user_answer(&data);
-                    self.acknowledge_programs(pane, st);
-                    if !data.is_empty() {
-                        self.pane_read(pane);
-                    }
-                    p.write(data);
-                    Ok::<_, String>(())
-                })??;
+                let mut data = Some(data);
+                self.typing_after_upgrade(|| {
+                    self.with_input_pane(client.id, pane, |p, st| {
+                        let typing = data.as_ref().is_some_and(|d| !d.is_empty());
+                        if typing {
+                            self.typing_frozen(pane, st)?;
+                        }
+                        let data = data.take().unwrap_or_default();
+                        self.used_by(client, st);
+                        if typing {
+                            st.typed = true;
+                            st.agent.prompt.interrupted();
+                        }
+                        st.agent.user_answer(&data);
+                        self.acknowledge_programs(pane, st);
+                        if typing {
+                            self.pane_read(pane);
+                        }
+                        p.write(data);
+                        Ok::<_, String>(())
+                    })?
+                })?;
                 Ok(Response::Ok)
             }
             Request::Paste { pane, text } => {
-                self.with_input_pane(client.id, pane, |p, st| {
-                    self.paste_text(client, pane, p, st, &text)
-                })??;
+                self.typing_after_upgrade(|| {
+                    self.with_input_pane(client.id, pane, |p, st| {
+                        self.paste_text(client, pane, p, st, &text)
+                    })?
+                })?;
                 Ok(Response::Ok)
             }
-            Request::Key { pane, key } => {
+            Request::Key { pane, key } => self.typing_after_upgrade(|| {
                 self.with_input_pane(client.id, pane, |p, st| {
                     // Before encoding it (which scrolls and clears the selection): even a key
                     // that types nothing waits out the hand-off.
@@ -3872,9 +3880,9 @@ impl Daemon {
                         p.write(bytes);
                     }
                     Ok::<_, String>(())
-                })??;
-                Ok(Response::Ok)
-            }
+                })?
+            })
+            .map(|()| Response::Ok),
             Request::Mouse { pane, event } => {
                 let copy_on_select = self.config.read().terminal.copy_on_select;
                 let text = self.with_input_pane(client.id, pane, |p, st| {
@@ -4646,13 +4654,15 @@ impl Daemon {
             return Err(gone());
         }
         between();
-        self.with_input_pane(client, pane, |p, st| {
-            // A program that ended while its files came has nothing to type them to.
-            if !st.info.alive {
-                return Err("This terminal has closed.".to_owned());
-            }
-            self.paste_text(&asker, pane, p, st, text)
-        })?
+        self.typing_after_upgrade(|| {
+            self.with_input_pane(client, pane, |p, st| {
+                // A program that ended while its files came has nothing to type them to.
+                if !st.info.alive {
+                    return Err("This terminal has closed.".to_owned());
+                }
+                self.paste_text(&asker, pane, p, st, text)
+            })?
+        })
     }
 
     /// Types `text` into pane `pane` as a paste for `client`: what [`Request::Paste`] and the
@@ -6804,7 +6814,10 @@ mod tests {
     }
 
     /// While an upgrade hands the panes over, the first input into a pane waiting to resume
-    /// is refused: the `typed` the hand-off carries stays true to what the shell got.
+    /// waits for it, so the `typed` the hand-off carries stays true to what the shell got. It
+    /// is not refused: keystrokes come without waiting for a reply (request ID 0), so a refusal
+    /// would drop them unseen. When the upgrade gives up, the input goes through and cancels
+    /// the resume.
     #[test]
     fn input_that_would_cancel_a_resume_waits_out_an_upgrade() {
         let dir = test_dir("upgrade-input");
@@ -6833,17 +6846,6 @@ mod tests {
                 },
             )
         };
-        daemon.set_upgrading(true);
-        assert!(input(waiting).is_err());
-        assert!(input(ticketed).is_err());
-        let paste = daemon.dispatch(
-            &client,
-            Request::Paste {
-                pane: waiting,
-                text: "a".into(),
-            },
-        );
-        assert!(paste.is_err());
         let key = thurm_proto::KeyEvent {
             key: thurm_proto::Key::Char('a'),
             mods: 0,
@@ -6852,36 +6854,59 @@ mod tests {
             shifted: None,
             base_layout: None,
         };
-        let typed = daemon.dispatch(
-            &client,
-            Request::Key {
-                pane: ticketed,
-                key,
-            },
-        );
-        assert!(typed.is_err());
-        assert!(!daemon.pane(waiting).unwrap().state.lock().typed);
-        assert!(!daemon.pane(ticketed).unwrap().state.lock().typed);
-        // Nothing to cancel in the others.
-        assert!(input(plain).is_ok());
-        // A resize types nothing: it goes through.
-        let size = PaneSize {
-            cols: 91,
-            rows: 27,
-            ..PaneSize::default()
-        };
-        for pane in [waiting, ticketed] {
-            let resized = daemon.dispatch(&client, Request::Resize { pane, size });
-            assert!(resized.is_ok(), "{resized:?}");
-            let p = daemon.pane(pane).unwrap();
-            let st = p.state.lock();
-            assert_eq!(st.info.size.cols, 91);
-            assert!(!st.typed);
-        }
-        // The upgrade gave up: input goes through again, and cancels the resume.
-        daemon.set_upgrading(false);
-        assert!(input(waiting).is_ok());
+        daemon.set_upgrading(true);
+        std::thread::scope(|s| {
+            let held = [
+                s.spawn(|| input(waiting)),
+                s.spawn(|| input(ticketed)),
+                s.spawn(|| {
+                    daemon.dispatch(
+                        &client,
+                        Request::Paste {
+                            pane: waiting,
+                            text: "a".into(),
+                        },
+                    )
+                }),
+                s.spawn(|| {
+                    daemon.dispatch(
+                        &client,
+                        Request::Key {
+                            pane: ticketed,
+                            key: key.clone(),
+                        },
+                    )
+                }),
+            ];
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(held.iter().all(|h| !h.is_finished()));
+            assert!(!daemon.pane(waiting).unwrap().state.lock().typed);
+            assert!(!daemon.pane(ticketed).unwrap().state.lock().typed);
+            // Nothing to cancel in the others.
+            assert!(input(plain).is_ok());
+            // A resize types nothing: it goes through.
+            let size = PaneSize {
+                cols: 91,
+                rows: 27,
+                ..PaneSize::default()
+            };
+            for pane in [waiting, ticketed] {
+                let resized = daemon.dispatch(&client, Request::Resize { pane, size });
+                assert!(resized.is_ok(), "{resized:?}");
+                let p = daemon.pane(pane).unwrap();
+                let st = p.state.lock();
+                assert_eq!(st.info.size.cols, 91);
+                assert!(!st.typed);
+            }
+            // The upgrade gave up: the held input goes through, and cancels the resume.
+            daemon.set_upgrading(false);
+            for h in held {
+                let done = h.join().unwrap();
+                assert!(done.is_ok(), "{done:?}");
+            }
+        });
         assert!(daemon.pane(waiting).unwrap().state.lock().typed);
+        assert!(daemon.pane(ticketed).unwrap().state.lock().typed);
         for id in [waiting, plain, ticketed] {
             daemon.close_pane(id);
         }
