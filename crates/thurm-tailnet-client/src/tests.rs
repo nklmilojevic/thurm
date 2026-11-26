@@ -321,6 +321,159 @@ fn plain_tailnet_fails_closed_without_active_tailscale_tunnel() {
     }
 }
 
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn plain_tailnet_binds_before_dial_rejects_bind_failure_and_upgrades_bound_socket() {
+    use std::net::{IpAddr, SocketAddr};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[cfg(target_vendor = "apple")]
+    let tun_name = "utun4";
+    #[cfg(target_os = "linux")]
+    let tun_name = "tailscale0";
+
+    let valid_ifaces = [
+        InterfaceAddr {
+            name: tun_name.into(),
+            index: 11,
+            addr: "100.64.0.1".parse().unwrap(),
+            point_to_point: true,
+        },
+        InterfaceAddr {
+            name: tun_name.into(),
+            index: 11,
+            addr: "fd7a:115c:a1e0::1".parse().unwrap(),
+            point_to_point: true,
+        },
+    ];
+    let expected_selected = SelectedTailnetIface {
+        name: tun_name.into(),
+        index: 11,
+        local_ip: "100.64.0.1".parse::<IpAddr>().unwrap(),
+    };
+
+    // 1. Bind failure prevents dialing and surfaces the tunnel interface name.
+    let dialed = Arc::new(AtomicBool::new(false));
+    let dialed_in_closure = dialed.clone();
+    let seen_iface = Arc::new(Mutex::new(None));
+    let seen_in_bind = seen_iface.clone();
+    let res = open_plain_via(
+        "ws://100.64.0.7:7297/v1/connect",
+        SHORT,
+        Some(&valid_ifaces),
+        move |_socket, iface| {
+            *seen_in_bind.lock().unwrap() = Some(iface.clone());
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "injected bind error",
+            ))
+        },
+        move |_socket, _addr| {
+            dialed_in_closure.store(true, Ordering::SeqCst);
+            async {
+                Err(std::io::Error::other(
+                    "dial must not run after bind failure",
+                ))
+            }
+        },
+    );
+    match res {
+        Err(ConnectError::Unreachable(msg)) => {
+            assert!(msg.contains(tun_name), "{msg}");
+            assert!(msg.contains("injected bind error"), "{msg}");
+        }
+        other => panic!("expected bind error, got: {:?}", other.map(|_| ())),
+    }
+    assert_eq!(*seen_iface.lock().unwrap(), Some(expected_selected.clone()));
+    assert!(
+        !dialed.load(Ordering::SeqCst),
+        "dial must not be invoked when binding fails"
+    );
+
+    // 2. Real production `open_plain_with` invokes `bind_to_tailnet_interface` and fails before
+    // dialing when the selected tunnel interface/source IP cannot be bound on this host.
+    #[cfg(target_vendor = "apple")]
+    let bogus_tun = "utun9999";
+    #[cfg(target_os = "linux")]
+    let bogus_tun = "tailscale9999";
+    let bogus_ifaces = [
+        InterfaceAddr {
+            name: bogus_tun.into(),
+            index: 999_999,
+            addr: "100.64.254.254".parse().unwrap(),
+            point_to_point: true,
+        },
+        InterfaceAddr {
+            name: bogus_tun.into(),
+            index: 999_999,
+            addr: "fd7a:115c:a1e0::ffff".parse().unwrap(),
+            point_to_point: true,
+        },
+    ];
+    match open_plain_with("ws://100.64.0.7:7297/v1/connect", SHORT, Some(&bogus_ifaces)) {
+        Err(ConnectError::Unreachable(msg)) => {
+            assert!(
+                msg.contains(&format!("binding plain tailnet socket to {bogus_tun}")),
+                "{msg}"
+            );
+        }
+        other => panic!(
+            "expected real bind_to_tailnet_interface failure, got: {:?}",
+            other.map(|_| ())
+        ),
+    }
+
+    // 3. Positive path: selected interface triggers bind before dial, and the bound socket
+    // performs the WebSocket upgrade and relays binary traffic end-to-end.
+    let server = server_rt();
+    let echo_url = echo_server(&server);
+    let echo_addr: SocketAddr = echo_url
+        .strip_prefix("ws://")
+        .unwrap()
+        .strip_suffix("/v1/connect")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let plain_url = format!("ws://100.64.0.7:{}/v1/connect", echo_addr.port());
+    let expected_target: SocketAddr = format!("100.64.0.7:{}", echo_addr.port()).parse().unwrap();
+
+    let steps = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let steps_bind = steps.clone();
+    let steps_dial = steps.clone();
+    let (mut stream, _session) = open_plain_via(
+        &plain_url,
+        LIMITS,
+        Some(&valid_ifaces),
+        move |socket, iface| {
+            assert_eq!(*iface, expected_selected);
+            steps_bind.lock().unwrap().push("bind");
+            socket.bind("127.0.0.1:0".parse().unwrap())
+        },
+        move |socket, target_addr| {
+            assert_eq!(target_addr, expected_target);
+            // The same socket must already be bound to a local loopback port before dialing.
+            let local = socket
+                .local_addr()
+                .expect("socket should be bound before dial");
+            assert_eq!(local.ip(), IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            assert_ne!(local.port(), 0);
+            steps_dial.lock().unwrap().push("dial");
+            async move { socket.connect(echo_addr).await }
+        },
+    )
+    .expect("bound plain socket should complete WebSocket upgrade");
+
+    assert_eq!(*steps.lock().unwrap(), vec!["bind", "dial"]);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"tailnet-ok").unwrap();
+    let mut got = [0u8; 10];
+    stream.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"TAILNET-OK");
+}
+
 #[test]
 fn errors_tell_what_to_check() {
     let e = ConnectError::Unreachable("connection refused".into()).to_string();

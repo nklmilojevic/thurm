@@ -668,6 +668,7 @@ fn race_candidates_waits_for_sibling_after_auth_error() {
         &[bad, good],
         Duration::from_millis(5),
         won,
+        Arc::new(AuthGate::new()),
         move |addr| {
             if addr == bad {
                 Err(SessionError::KeyRejected)
@@ -688,6 +689,7 @@ fn race_candidates_waits_for_sibling_after_auth_error() {
         &[bad, good],
         Duration::from_millis(5),
         won,
+        Arc::new(AuthGate::new()),
         move |addr| {
             if addr == bad {
                 Err(SessionError::KeyRejected)
@@ -774,15 +776,17 @@ fn racing_key_blocks_sibling_sign_until_auth_completes() {
     let won = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(AuthGate::new());
     let won_for_dial = won.clone();
+    let gate_for_dial = gate.clone();
     let res = race_candidates(
         "dual.example",
         &[first, second],
         Duration::from_millis(5),
         won,
+        gate,
         move |addr| {
             let racing = Arc::new(RacingKey::new(
                 counting.clone(),
-                gate.clone(),
+                gate_for_dial.clone(),
                 won_for_dial.clone(),
             ));
             if addr == first {
@@ -813,15 +817,17 @@ fn racing_key_blocks_sibling_sign_until_auth_completes() {
     let won = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(AuthGate::new());
     let won_for_dial = won.clone();
+    let gate_for_dial = gate.clone();
     let res = race_candidates(
         "dual.example",
         &[first, second],
         Duration::from_millis(5),
         won,
+        gate,
         move |addr| {
             let racing = Arc::new(RacingKey::new(
                 counting.clone(),
-                gate.clone(),
+                gate_for_dial.clone(),
                 won_for_dial.clone(),
             ));
             if addr == first {
@@ -839,4 +845,242 @@ fn racing_key_blocks_sibling_sign_until_auth_completes() {
     );
     assert_eq!(res.unwrap(), ("second-won", second.ip()));
     assert_eq!(signs.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn racing_key_sign_refusal_cancels_siblings_and_preserves_error() {
+    struct RefusingKey {
+        inner: Arc<TestKey>,
+        signs: Arc<AtomicU64>,
+        delay: Duration,
+        reason: &'static str,
+    }
+    impl DeviceKey for RefusingKey {
+        fn public_sec1(&self) -> Vec<u8> {
+            self.inner.public_sec1()
+        }
+        fn sign(&self, _data: &[u8]) -> Result<Vec<u8>, String> {
+            self.signs.fetch_add(1, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                std::thread::sleep(self.delay);
+            }
+            Err(self.reason.into())
+        }
+    }
+
+    // End-to-end against two real in-process SSH servers: both candidates reach authentication,
+    // the device key refuses signing once, the sibling never re-prompts, and connect returns the
+    // original signing refusal.
+    let real_key = TestKey::new(1);
+    let s1 = ssh_server(&real_key);
+    let s2 = ssh_server(&real_key);
+    let t1 = target(&s1);
+    let t2 = target(&s2);
+    let mut dt = direct_target(&s1, Mode::Ssh);
+    dt.host = "dual.example".into();
+    dt.host_keys = vec![t1.host_keys[0].clone(), t2.host_keys[0].clone()];
+    let addrs = [
+        SocketAddr::new(t1.host.parse().unwrap(), t1.port),
+        SocketAddr::new(t2.host.parse().unwrap(), t2.port),
+    ];
+
+    let signs = Arc::new(AtomicU64::new(0));
+    let refusing: Arc<dyn DeviceKey> = Arc::new(RefusingKey {
+        inner: real_key,
+        signs: signs.clone(),
+        delay: Duration::from_millis(80),
+        reason: "biometric cancelled",
+    });
+
+    let err = connect_addrs_with_stagger(&dt, &addrs, &refusing, Duration::from_millis(5))
+        .map(|_| ())
+        .expect_err("refusing key must fail connect");
+    match err {
+        DirectError::Failed(msg) => assert!(
+            msg.contains("biometric cancelled"),
+            "expected original signing refusal, got: {msg}"
+        ),
+        other => panic!("expected DirectError::Failed with signing refusal, got: {other:?}"),
+    }
+    // Give the sibling thread a moment to settle if it was still finishing handshake, and verify
+    // the underlying device key was still invoked only once.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(signs.load(Ordering::SeqCst), 1);
+
+    // Deterministic sibling check: sibling enters `racing.sign()` while first holds the gate,
+    // first refuses, and sibling returns the same refusal without calling `inner.sign()`.
+    let first: SocketAddr = "192.0.2.1:22".parse().unwrap();
+    let second: SocketAddr = "192.0.2.2:22".parse().unwrap();
+    let signs = Arc::new(AtomicU64::new(0));
+    let refusing: Arc<dyn DeviceKey> = Arc::new(RefusingKey {
+        inner: TestKey::new(1),
+        signs: signs.clone(),
+        delay: Duration::from_millis(40),
+        reason: "user declined",
+    });
+    let won = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(AuthGate::new());
+    let won_for_dial = won.clone();
+    let gate_for_dial = gate.clone();
+    let (sibling_done_tx, sibling_done_rx) = mpsc::channel();
+    let err = race_candidates::<&str, _, _>(
+        "dual.example",
+        &[first, second],
+        Duration::from_millis(5),
+        won,
+        gate,
+        move |addr| {
+            let racing = Arc::new(RacingKey::new(
+                refusing.clone(),
+                gate_for_dial.clone(),
+                won_for_dial.clone(),
+            ));
+            let res = racing.sign(b"auth");
+            racing.finish(false);
+            if addr == second {
+                let _ = sibling_done_tx.send(res.clone());
+            }
+            assert_eq!(res.unwrap_err(), "user declined");
+            Err(SessionError::KeyRejected)
+        },
+        |_| {},
+    )
+    .unwrap_err();
+    match err {
+        DirectError::Failed(msg) => assert!(msg.contains("user declined"), "{msg}"),
+        other => panic!("expected signing refusal, got: {other:?}"),
+    }
+    let sibling_res = sibling_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("sibling dial should finish promptly after refusal");
+    assert_eq!(sibling_res.unwrap_err(), "user declined");
+    assert_eq!(signs.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn wake_resockets_immediately_even_when_dns_stalls_or_fails() {
+    let key = TestKey::new(1);
+    let server = ssh_server(&key);
+    let mut t = direct_target(&server, Mode::Ssh);
+    let (_stream, direct) = super::serve(t.clone(), key).unwrap();
+    // Switch target host to a hostname so `wake()` exercises the hostname DNS-resolution path.
+    let server_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    server_udp
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+
+    let mosh_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let session =
+        MoshSession::start(mosh_rt.handle(), server_addr, [7u8; 16], (80, 24), |_| {}).unwrap();
+    let mut buf = [0u8; 4096];
+    let (_, initial_src) = server_udp
+        .recv_from(&mut buf)
+        .expect("mosh should send initial startup datagram");
+
+    t.host = "mosh.example".into();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let inner = Arc::new(Inner {
+        target: t,
+        key: TestKey::new(1),
+        session: Mutex::new(SessionSlot {
+            current: direct.inner.session.lock().current.clone(),
+            ip: server_addr.ip(),
+            connecting: false,
+        }),
+        session_ready: Condvar::new(),
+        panes: Mutex::new(HashMap::from([(
+            1,
+            Arc::new(Mutex::new(Pane {
+                id: 1,
+                term: new_terminal(size(80, 24)),
+                backend: Backend::Mosh {
+                    session,
+                    pid: None,
+                    current: 0,
+                    snapshots: BTreeMap::new(),
+                    status: Status::Connecting,
+                },
+                subscribed: false,
+                alive: true,
+                exit_code: None,
+                held_replies: Vec::new(),
+            })),
+        )])),
+        next_pane: AtomicU64::new(2),
+        closed: AtomicBool::new(false),
+        creating: Mutex::new(0),
+        created: Condvar::new(),
+        out: Mutex::new(theirs),
+        mosh_rt: Some(mosh_rt),
+    });
+    let _keep = ours;
+    let host_direct = Direct { inner };
+
+    // Stall DNS on a channel and prove the existing Mosh session moves to a fresh UDP socket
+    // immediately before DNS returns (and survives DNS failing afterward).
+    let (dns_started_tx, dns_started_rx) = mpsc::channel();
+    let (release_dns_tx, release_dns_rx) = mpsc::channel();
+    let worker = host_direct
+        .wake_with(move |_host, _port| {
+            let _ = dns_started_tx.send(());
+            let _ = release_dns_rx.recv();
+            Err(DirectError::Failed("dns unavailable".into()))
+        })
+        .expect("hostname wake should spawn background resolver");
+
+    dns_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("DNS worker should start");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let woken_src = loop {
+        assert!(
+            Instant::now() < deadline,
+            "Mosh session did not resocket while DNS was stalled (still at {initial_src})"
+        );
+        let (_, src) = server_udp
+            .recv_from(&mut buf)
+            .expect("expected datagram after immediate wake");
+        if src != initial_src {
+            break src;
+        }
+    };
+    assert_ne!(woken_src, initial_src);
+
+    // Unblock the stalled resolver so it fails; join and confirm clean completion.
+    let _ = release_dns_tx.send(());
+    worker.join().unwrap();
+
+    // Unchanged DNS IP: wake() moves the socket once immediately, then the worker sees the peer
+    // IP is unchanged and does not resocket a second time.
+    let (unchanged_tx, unchanged_rx) = mpsc::channel();
+    let (allow_unchanged_tx, allow_unchanged_rx) = mpsc::channel();
+    let worker = host_direct
+        .wake_with(move |_host, _port| {
+            let _ = unchanged_tx.send(());
+            let _ = allow_unchanged_rx.recv();
+            Ok(vec![server_addr])
+        })
+        .expect("hostname wake should spawn background resolver");
+    unchanged_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("second DNS worker should start");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let second_src = loop {
+        assert!(Instant::now() < deadline, "second immediate wake missing");
+        let (_, src) = server_udp.recv_from(&mut buf).unwrap();
+        if src != woken_src {
+            break src;
+        }
+    };
+    let _ = allow_unchanged_tx.send(());
+    worker.join().unwrap();
+    // Next datagram arrives from the same socket (unchanged DNS did not trigger a second wake).
+    let (_, after_unchanged_src) = server_udp.recv_from(&mut buf).unwrap();
+    assert_eq!(after_unchanged_src, second_src);
 }

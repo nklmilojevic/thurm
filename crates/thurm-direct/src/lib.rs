@@ -130,41 +130,49 @@ pub struct Direct {
 
 impl Direct {
     /// Every mosh session moves to a new socket at once (the network changed, or the app came
-    /// back from the background). Re-resolves DNS for hostnames so Wi-Fi IPv4 <-> cellular
-    /// NAT64 IPv6 transitions update the peer address.
+    /// back from the background). Existing sessions wake immediately so a stalled or failing DNS
+    /// lookup never delays UDP recovery; for hostnames, a background lookup then re-targets any
+    /// session whose peer IP changed (e.g. Wi-Fi IPv4 <-> cellular NAT64 IPv6).
     pub fn wake(&self) {
-        if self.inner.target.host.parse::<IpAddr>().is_ok() {
-            for pane in self.inner.panes.lock().values() {
-                if let Backend::Mosh { session, .. } = &pane.lock().backend {
-                    session.wake();
-                }
+        let _ = self.wake_with(resolve_addrs);
+    }
+
+    fn wake_with<F>(&self, resolve: F) -> Option<std::thread::JoinHandle<()>>
+    where
+        F: FnOnce(&str, u16) -> Result<Vec<SocketAddr>, DirectError> + Send + 'static,
+    {
+        let panes: Vec<_> = self.inner.panes.lock().values().cloned().collect();
+        for pane in panes {
+            if let Backend::Mosh { session, .. } = &pane.lock().backend {
+                session.wake();
             }
-            return;
+        }
+        if self.inner.target.host.parse::<IpAddr>().is_ok() {
+            return None;
         }
         let inner = self.inner.clone();
-        let spawned = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("thurm-direct-wake".into())
             .spawn(move || {
-                let addrs = resolve_addrs(&inner.target.host, inner.target.port).ok();
+                if inner.closed.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(addrs) = resolve(&inner.target.host, inner.target.port) else {
+                    return;
+                };
                 let panes: Vec<_> = inner.panes.lock().values().cloned().collect();
                 for pane in panes {
                     if let Backend::Mosh { session, .. } = &pane.lock().backend {
                         let actual_ip = session.peer_ip();
-                        let next_ip = addrs.as_deref().and_then(|a| pick_wake_ip(actual_ip, a));
-                        match next_ip {
-                            Some(ip) if ip != actual_ip => session.wake_at(ip),
-                            _ => session.wake(),
+                        if let Some(ip) =
+                            pick_wake_ip(actual_ip, &addrs).filter(|&ip| ip != actual_ip)
+                        {
+                            session.wake_at(ip);
                         }
                     }
                 }
-            });
-        if spawned.is_err() {
-            for pane in self.inner.panes.lock().values() {
-                if let Backend::Mosh { session, .. } = &pane.lock().backend {
-                    session.wake();
-                }
-            }
-        }
+            })
+            .ok()
     }
 }
 
@@ -263,16 +271,19 @@ fn pick_wake_ip(current: IpAddr, addrs: &[SocketAddr]) -> Option<IpAddr> {
     addrs.first().map(SocketAddr::ip)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum AuthState {
     Idle,
     InFlight,
     Won,
+    /// The local device key declined or failed to sign (e.g. user cancelled biometrics): stop
+    /// sibling candidates from re-prompting and preserve the original signing error.
+    SignRefused(String),
 }
 
 /// Serializes SSH authentication across concurrent Happy Eyeballs dials from `sign()` through
 /// `Session::connect_checked` completion so overlapping dials never trigger duplicate biometric
-/// prompts while an earlier candidate is awaiting `USERAUTH_SUCCESS`.
+/// prompts while an earlier candidate is awaiting `USERAUTH_SUCCESS` or after signing is declined.
 struct AuthGate {
     state: Mutex<AuthState>,
     cv: Condvar,
@@ -286,23 +297,32 @@ impl AuthGate {
         }
     }
 
-    fn acquire_for_sign(&self, won: &AtomicBool) -> bool {
+    fn acquire_for_sign(&self, won: &AtomicBool) -> Result<(), String> {
         let mut state = self.state.lock();
         loop {
-            if *state == AuthState::Won || won.load(Ordering::Acquire) {
-                return false;
+            match &*state {
+                AuthState::Won => return Err("cancelled".into()),
+                AuthState::SignRefused(msg) => return Err(msg.clone()),
+                AuthState::Idle => {
+                    if won.load(Ordering::Acquire) {
+                        return Err("cancelled".into());
+                    }
+                    *state = AuthState::InFlight;
+                    return Ok(());
+                }
+                AuthState::InFlight => {
+                    if won.load(Ordering::Acquire) {
+                        return Err("cancelled".into());
+                    }
+                    self.cv.wait(&mut state);
+                }
             }
-            if *state == AuthState::Idle {
-                *state = AuthState::InFlight;
-                return true;
-            }
-            self.cv.wait(&mut state);
         }
     }
 
     fn release_failed(&self) {
         let mut state = self.state.lock();
-        if *state == AuthState::InFlight {
+        if matches!(*state, AuthState::InFlight) {
             *state = AuthState::Idle;
             self.cv.notify_one();
         }
@@ -313,10 +333,25 @@ impl AuthGate {
         *state = AuthState::Won;
         self.cv.notify_all();
     }
+
+    fn mark_sign_refused(&self, err: String) {
+        let mut state = self.state.lock();
+        if matches!(*state, AuthState::Idle | AuthState::InFlight) {
+            *state = AuthState::SignRefused(err);
+            self.cv.notify_all();
+        }
+    }
+
+    fn sign_refused(&self) -> Option<String> {
+        match &*self.state.lock() {
+            AuthState::SignRefused(msg) => Some(msg.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// Wraps `DeviceKey` across concurrent Happy Eyeballs dials so only one candidate authenticates
-/// at a time and losing dials abort before invoking `sign()`.
+/// at a time and losing or declined dials abort before invoking `sign()`.
 struct RacingKey {
     inner: Arc<dyn DeviceKey>,
     gate: Arc<AuthGate>,
@@ -359,31 +394,42 @@ impl DeviceKey for RacingKey {
 
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String> {
         if !self.holding.load(Ordering::Acquire) {
-            if !self.gate.acquire_for_sign(&self.won) {
-                return Err("cancelled".into());
-            }
+            self.gate.acquire_for_sign(&self.won)?;
             self.holding.store(true, Ordering::Release);
         }
         match self.inner.sign(data) {
             Ok(sig) => Ok(sig),
             Err(e) => {
-                if self.holding.swap(false, Ordering::AcqRel) {
-                    self.gate.release_failed();
-                }
+                // Signing refusal comes from the local device key (e.g. cancelled biometric
+                // prompt), not the remote address: cancel sibling dials instead of re-prompting.
+                self.holding.store(false, Ordering::Release);
+                self.gate.mark_sign_refused(e.clone());
                 Err(e)
             }
         }
     }
 }
 
+fn sign_refused_error(err: Option<SessionError>, msg: &str) -> DirectError {
+    if let Some(SessionError::Ssh(s)) = err {
+        let text = s.to_string();
+        if text.contains(msg) {
+            return DirectError::Failed(text);
+        }
+    }
+    DirectError::Failed(format!("ssh: signing: {msg}"))
+}
+
 /// Races candidate addresses with Happy Eyeballs staggering. Prefers any winning connection;
 /// retains the first non-transport error (e.g. `KeyRejected`, `HostKeyChanged`) while draining
-/// remaining in-flight candidates rather than cancelling a valid sibling dial.
+/// remaining in-flight candidates rather than cancelling a valid sibling dial, except when the
+/// local device key refuses signing (which immediately ends the attempt with the signing error).
 fn race_candidates<S, F, D>(
     host: &str,
     addrs: &[SocketAddr],
     stagger: Duration,
     won: Arc<AtomicBool>,
+    gate: Arc<AuthGate>,
     dial: F,
     disconnect: D,
 ) -> Result<(S, IpAddr), DirectError>
@@ -430,6 +476,9 @@ where
 
     let mut idx = 0;
     while idx < addrs.len() {
+        if let Some(msg) = gate.sign_refused() {
+            return Err(sign_refused_error(None, &msg));
+        }
         if spawn_one(addrs[idx]) {
             in_flight += 1;
         }
@@ -437,14 +486,18 @@ where
         if idx < addrs.len() {
             match rx.recv_timeout(stagger) {
                 Ok(Ok(pair)) => return Ok(pair),
-                Ok(Err(SessionError::Ssh(e))) => {
-                    in_flight = in_flight.saturating_sub(1);
-                    last = DirectError::Failed(e.to_string());
-                }
                 Ok(Err(e)) => {
                     in_flight = in_flight.saturating_sub(1);
-                    if fatal.is_none() {
-                        fatal = Some(e.into());
+                    if let Some(msg) = gate.sign_refused() {
+                        return Err(sign_refused_error(Some(e), &msg));
+                    }
+                    match e {
+                        SessionError::Ssh(s) => last = DirectError::Failed(s.to_string()),
+                        other => {
+                            if fatal.is_none() {
+                                fatal = Some(other.into());
+                            }
+                        }
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout)
@@ -456,18 +509,25 @@ where
     while in_flight > 0 {
         match rx.recv() {
             Ok(Ok(pair)) => return Ok(pair),
-            Ok(Err(SessionError::Ssh(e))) => {
-                in_flight -= 1;
-                last = DirectError::Failed(e.to_string());
-            }
             Ok(Err(e)) => {
                 in_flight -= 1;
-                if fatal.is_none() {
-                    fatal = Some(e.into());
+                if let Some(msg) = gate.sign_refused() {
+                    return Err(sign_refused_error(Some(e), &msg));
+                }
+                match e {
+                    SessionError::Ssh(s) => last = DirectError::Failed(s.to_string()),
+                    other => {
+                        if fatal.is_none() {
+                            fatal = Some(other.into());
+                        }
+                    }
                 }
             }
             Err(_) => break,
         }
+    }
+    if let Some(msg) = gate.sign_refused() {
+        return Err(sign_refused_error(None, &msg));
     }
     Err(fatal.unwrap_or(last))
 }
@@ -480,6 +540,15 @@ fn connect(
     key: &Arc<dyn DeviceKey>,
 ) -> Result<(Session, IpAddr), DirectError> {
     let addrs = resolve_addrs(&target.host, target.port)?;
+    connect_addrs_with_stagger(target, &addrs, key, HAPPY_EYEBALLS_DELAY)
+}
+
+fn connect_addrs_with_stagger(
+    target: &DirectTarget,
+    addrs: &[SocketAddr],
+    key: &Arc<dyn DeviceKey>,
+    stagger: Duration,
+) -> Result<(Session, IpAddr), DirectError> {
     if addrs.is_empty() {
         return Err(DirectError::Failed(format!("{}: no address", target.host)));
     }
@@ -487,7 +556,7 @@ fn connect(
         let addr = addrs[0];
         let t = Target {
             host: addr.ip().to_string(),
-            port: target.port,
+            port: addr.port(),
             user: target.user.clone(),
             host_keys: target.host_keys.clone(),
             socket: None,
@@ -503,22 +572,24 @@ fn connect(
     let target = target.clone();
     let key = key.clone();
     let won_for_dial = won.clone();
+    let gate_for_dial = gate.clone();
     race_candidates(
         &target.host.clone(),
-        &addrs,
-        HAPPY_EYEBALLS_DELAY,
+        addrs,
+        stagger,
         won,
+        gate,
         move |addr| {
             let t = Target {
                 host: addr.ip().to_string(),
-                port: target.port,
+                port: addr.port(),
                 user: target.user.clone(),
                 host_keys: target.host_keys.clone(),
                 socket: None,
             };
             let racing = Arc::new(RacingKey::new(
                 key.clone(),
-                gate.clone(),
+                gate_for_dial.clone(),
                 won_for_dial.clone(),
             ));
             let res = Session::connect_checked(&t, racing.clone(), CONNECT_TIMEOUT);

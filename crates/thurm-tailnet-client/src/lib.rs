@@ -672,6 +672,27 @@ fn open_plain_with(
     limits: Limits,
     override_ifaces: Option<&[InterfaceAddr]>,
 ) -> Result<(UnixStream, Session), ConnectError> {
+    open_plain_via(
+        url,
+        limits,
+        override_ifaces,
+        bind_to_tailnet_interface,
+        |socket, addr| async move { socket.connect(addr).await },
+    )
+}
+
+fn open_plain_via<Bind, Dial, DialFut>(
+    url: &str,
+    limits: Limits,
+    override_ifaces: Option<&[InterfaceAddr]>,
+    bind: Bind,
+    dial: Dial,
+) -> Result<(UnixStream, Session), ConnectError>
+where
+    Bind: FnOnce(&tokio::net::TcpSocket, &SelectedTailnetIface) -> std::io::Result<()>,
+    Dial: FnOnce(tokio::net::TcpSocket, std::net::SocketAddr) -> DialFut,
+    DialFut: std::future::Future<Output = std::io::Result<tokio::net::TcpStream>>,
+{
     let target_addr = check_plain_tailnet_url(url)?;
     let owned_ifaces;
     let ifaces = match override_ifaces {
@@ -692,14 +713,14 @@ fn open_plain_with(
             std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
         }
         .map_err(|e| ConnectError::Unreachable(format!("creating socket: {e}")))?;
-        bind_to_tailnet_interface(&socket, &selected).map_err(|e| {
+        bind(&socket, &selected).map_err(|e| {
             ConnectError::Unreachable(format!(
                 "binding plain tailnet socket to {}: {e}",
                 selected.name
             ))
         })?;
         let left = deadline.saturating_duration_since(std::time::Instant::now());
-        let tcp = match tokio::time::timeout(left, socket.connect(target_addr)).await {
+        let tcp = match tokio::time::timeout(left, dial(socket, target_addr)).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return Err(ConnectError::Unreachable(e.to_string())),
             Err(_) => {

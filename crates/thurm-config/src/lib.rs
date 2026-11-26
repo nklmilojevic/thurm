@@ -729,7 +729,7 @@ pub struct TerminalConfig {
     pub kitty_keyboard: bool,
     /// Enable the kitty graphics protocol.
     pub kitty_graphics: bool,
-    /// Max memory for kitty graphics per pane, in MiB.
+    /// Max memory for kitty graphics per pane, in MiB (defaults to 320 on desktop, 64 on iOS).
     pub image_memory_mib: usize,
     /// Characters that end a word for double-click selection.
     pub word_separators: String,
