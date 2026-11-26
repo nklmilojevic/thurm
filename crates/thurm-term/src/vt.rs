@@ -1094,14 +1094,265 @@ impl Vt {
         if r != ffi::Result::SUCCESS {
             return String::new();
         }
-        let text = self.format_raw(
+        let format = |emit| {
+            let bytes =
+                self.try_format(emit, true, true, ffi::FORMATTER_EXTRAS_NONE, Some(&sel))?;
+            // Valid UTF-8 (always, from the formatter) becomes the string without a copy.
+            Some(
+                String::from_utf8(bytes)
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+            )
+        };
+        // Concealed cells (SGR 8, e.g. a password echoed hidden) are not shown, so they are not
+        // copied either. The plain formatter has no notion of them; the styled one marks them,
+        // over exactly the cells the copy has, in one pass along the pages. Without it, nothing
+        // says the plain text is safe to copy: nothing is copied. The styled text is read in the
+        // formatter's buffer and freed before the plain one is made, so a large copy holds one
+        // of the two at a time.
+        let concealed = self.try_format_with(
+            ffi::FormatterFormat::VT,
+            true,
+            true,
+            ffi::FORMATTER_EXTRAS_NONE,
+            Some(&sel),
+            |b| conceals(&String::from_utf8_lossy(b)),
+        );
+        let Some(concealed) = concealed else {
+            return String::new();
+        };
+        let Some(plain) = format(ffi::FormatterFormat::PLAIN) else {
+            return String::new();
+        };
+        if !concealed {
+            return plain;
+        }
+        // The plain text with each concealed character blanked as wide as its cells; should the
+        // two not line up, the styled output's text, which blanks every concealed character
+        // (as wide as the grid laid the concealed cells out, where it can tell).
+        #[cfg(test)]
+        let plain = if FALLBACK.with(|f| f.get()) {
+            String::from("\u{1}")
+        } else {
+            plain
+        };
+        if let Some(out) = self.blank_concealed(&sel, &plain) {
+            return out;
+        }
+        // The fallback (rare: the two did not line up) formats the styled text again, and
+        // measures concealed text by the concealed cells.
+        drop(plain);
+        let Some(styled) = format(ffi::FormatterFormat::VT) else {
+            return String::new();
+        };
+        let mut hidden: Vec<(Vec<char>, usize)> = Vec::new();
+        self.for_each_selected_cell(&sel, |text, concealed, width| {
+            if concealed {
+                hidden.push((text.to_vec(), width));
+            }
+            true
+        });
+        styled_text(&styled, self.mode(mode(2027, false)), &hidden)
+    }
+
+    /// Grid references to the rows `sy..=ey` (column 0), in order. A lookup by row walks the
+    /// pages from the top of the scrollback, so rather than one per row, each page's run of
+    /// rows is found with a few (the rows of a page are consecutive) and stepped through.
+    fn row_refs(&self, sy: u32, ey: u32) -> Option<Vec<GridRef>> {
+        let mut out = Vec::with_capacity((ey - sy + 1) as usize);
+        let mut y = sy;
+        while y <= ey {
+            let r = self.screen_ref(0, y)?;
+            // Whether row `y + k` is on `r`'s page, `k` rows below it.
+            let on_page = |k: u32| {
+                u16::try_from(u32::from(r.y) + k).is_ok_and(|py| {
+                    self.screen_ref(0, y + k)
+                        .is_some_and(|p| p.node == r.node && p.y == py)
+                })
+            };
+            // `last`: a row on the page; `past`: the first row known not to be (or past `ey`).
+            let (mut last, mut step) = (0, 1);
+            let mut past = loop {
+                let k = last + step;
+                if k > ey - y {
+                    break ey - y + 1;
+                }
+                if !on_page(k) {
+                    break k;
+                }
+                last = k;
+                step *= 2;
+            };
+            while past - last > 1 {
+                let mid = last + (past - last) / 2;
+                if on_page(mid) {
+                    last = mid;
+                } else {
+                    past = mid;
+                }
+            }
+            out.extend((0..=last).map(|k| GridRef {
+                y: r.y + k as u16,
+                ..r
+            }));
+            y += last + 1;
+        }
+        Some(out)
+    }
+
+    /// Call `f` with each selected cell with text, in the order the formatter copies them:
+    /// its characters, whether it is concealed, how many cells it takes; until `f` returns
+    /// false. Nothing is kept per cell. `None` when the selection's cells cannot be found.
+    fn for_each_selected_cell(
+        &self,
+        sel: &ffi::Selection,
+        mut f: impl FnMut(&[char], bool, usize) -> bool,
+    ) -> Option<()> {
+        let mut ordered = *sel;
+        let r = unsafe {
+            ffi::ghostty_terminal_selection_ordered(
+                self.raw,
+                sel,
+                ffi::SelectionOrder::FORWARD,
+                &mut ordered,
+            )
+        };
+        if r != ffi::Result::SUCCESS {
+            return None;
+        }
+        let (sx, sy) = self.screen_point_of(&ordered.start)?;
+        let (mut ex, mut ey) = self.screen_point_of(&ordered.end)?;
+        let cols = self.cols();
+        let rect = ordered.rectangle;
+        // A linear selection ending on the spacer a wide character left at a row's end (it
+        // moved to the next row) copies that character, as the formatter does.
+        if !rect && cell(&ordered.end).wide == SPACER_HEAD {
+            (ex, ey) = (0, ey + 1);
+        }
+        // The cell's characters (one buffer for them all).
+        let mut text: Vec<char> = Vec::new();
+        for (y, r0) in (sy..=ey).zip(self.row_refs(sy, ey)?) {
+            let (from, to) = match (rect, y == sy, y == ey) {
+                (true, ..) => (sx.min(ex), sx.max(ex)),
+                (false, first, last) => {
+                    (if first { sx } else { 0 }, if last { ex } else { cols - 1 })
+                }
+            };
+            // A range starting on a wide character's second half copies the character.
+            let from = if from > 0 && cell(&GridRef { x: from, ..r0 }).wide == SPACER_TAIL {
+                from - 1
+            } else {
+                from
+            };
+            // Whether each style of the row seen so far conceals (style ids are per page).
+            let mut styles: Vec<(u16, bool)> = Vec::new();
+            for x in from..=to.min(cols - 1) {
+                let r = GridRef { x, ..r0 };
+                let c = cell(&r);
+                if c.wide == SPACER_TAIL || c.wide == SPACER_HEAD {
+                    continue;
+                }
+                text.clear();
+                if c.tag == ffi::CellContentTag::CODEPOINT_GRAPHEME {
+                    text.extend(graphemes(&r));
+                } else {
+                    text.extend(char::from_u32(c.codepoint));
+                }
+                // Blank cells: the formatter's text has ASCII blanks there (or nothing). A cell
+                // whose character is a space is one, marks on it and all: the formatter blanks
+                // it by its first character.
+                if matches!(text.first(), None | Some('\0' | ' ')) {
+                    continue;
+                }
+                let hidden = c.has_styling
+                    && match styles.iter().find(|(id, _)| *id == c.style_id) {
+                        Some(&(_, h)) => h,
+                        None => {
+                            let h = style(&r).flags & ffi::STYLE_FLAG_INVISIBLE != 0;
+                            styles.push((c.style_id, h));
+                            h
+                        }
+                    };
+                if !f(&text, hidden, if c.wide == WIDE { 2 } else { 1 }) {
+                    return Some(());
+                }
+            }
+        }
+        Some(())
+    }
+
+    /// `plain` (the plain formatter's copy of `sel`) with the characters of concealed cells
+    /// turned into one blank per cell they take, trailing blanks of each line trimmed. `None`
+    /// when the selected cells' characters are not the ones `plain` has. The two are walked
+    /// together: what is held besides `plain` is the output.
+    fn blank_concealed(&self, sel: &ffi::Selection, plain: &str) -> Option<String> {
+        let mut out = String::with_capacity(plain.len());
+        // The formatter's blanks and line breaks at the start of `rest` (other spaces are
+        // cells' text) go to `out`; the rest of it is returned.
+        fn breaks<'a>(rest: &'a str, out: &mut String) -> &'a str {
+            let n = rest.len() - rest.trim_start_matches([' ', '\n', '\r']).len();
+            for c in rest[..n].chars() {
+                if c == '\n' {
+                    let kept = out.trim_end_matches(' ').len();
+                    out.truncate(kept);
+                }
+                out.push(c);
+            }
+            &rest[n..]
+        }
+        let mut rest = plain;
+        let mut lined_up = true;
+        self.for_each_selected_cell(sel, |text, hidden, width| {
+            rest = breaks(rest, &mut out);
+            let mut chars = rest.chars();
+            if !text.iter().all(|&c| chars.next() == Some(c)) {
+                lined_up = false;
+                return false;
+            }
+            rest = chars.as_str();
+            if hidden {
+                out.extend(std::iter::repeat_n(' ', width));
+            } else {
+                out.extend(text);
+            }
+            true
+        })?;
+        if !lined_up || !breaks(rest, &mut out).is_empty() {
+            return None;
+        }
+        let kept = out.trim_end_matches(' ').len();
+        out.truncate(kept);
+        Some(out)
+    }
+
+    /// The selected text as the plain formatter has it (what `selection_text` matches where
+    /// nothing is concealed), and as `blank_concealed` makes it of that.
+    #[cfg(test)]
+    pub(crate) fn selection_copies(&self) -> (String, Option<String>) {
+        let mut sel = ffi::Selection {
+            start: empty_ref(),
+            end: empty_ref(),
+            rectangle: false,
+        };
+        let r = unsafe {
+            ffi::ghostty_terminal_get(
+                self.raw,
+                ffi::TerminalData::SELECTION,
+                (&mut sel as *mut ffi::Selection).cast(),
+            )
+        };
+        if r != ffi::Result::SUCCESS {
+            return (String::new(), Some(String::new()));
+        }
+        let bytes = self.format_raw(
             ffi::FormatterFormat::PLAIN,
             true,
             true,
             ffi::FORMATTER_EXTRAS_NONE,
             Some(&sel),
         );
-        String::from_utf8_lossy(&text).into_owned()
+        let plain = String::from_utf8_lossy(&bytes).into_owned();
+        let blanked = self.blank_concealed(&sel, &plain);
+        (plain, blanked)
     }
 
     /// A mouse press starting a selection (`by`: what a click selects), with word boundaries.
@@ -1270,7 +1521,8 @@ impl Vt {
         self.format_raw(emit, unwrap, trim, extras.bits(), sel.as_ref())
     }
 
-    /// Format the active screen (or `sel`) with a formatter set to these options.
+    /// Format the active screen (or `sel`) with a formatter set to these options; empty
+    /// when formatting fails.
     fn format_raw(
         &self,
         emit: ffi::FormatterFormat::Type,
@@ -1279,11 +1531,42 @@ impl Vt {
         extras: ffi::FormatterExtras,
         sel: Option<&ffi::Selection>,
     ) -> Vec<u8> {
+        self.try_format(emit, unwrap, trim, extras, sel)
+            .unwrap_or_default()
+    }
+
+    /// Format the active screen (or `sel`) with a formatter set to these options; `None` when
+    /// formatting fails.
+    fn try_format(
+        &self,
+        emit: ffi::FormatterFormat::Type,
+        unwrap: bool,
+        trim: bool,
+        extras: ffi::FormatterExtras,
+        sel: Option<&ffi::Selection>,
+    ) -> Option<Vec<u8>> {
+        self.try_format_with(emit, unwrap, trim, extras, sel, <[u8]>::to_vec)
+    }
+
+    /// `try_format`, handing `read` the formatter's own buffer rather than a copy of it.
+    fn try_format_with<R>(
+        &self,
+        emit: ffi::FormatterFormat::Type,
+        unwrap: bool,
+        trim: bool,
+        extras: ffi::FormatterExtras,
+        sel: Option<&ffi::Selection>,
+        read: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
+        #[cfg(test)]
+        if FAIL_FORMAT.with(|f| f.get()) == Some(emit) {
+            return None;
+        }
         let mut f: ffi::Formatter = ptr::null_mut();
         if unsafe { ffi::ghostty_formatter_terminal_new(ptr::null(), &mut f, self.raw) }
             != ffi::Result::SUCCESS
         {
-            return Vec::new();
+            return None;
         }
         fn set<T>(f: ffi::Formatter, opt: ffi::FormatterOption::Type, value: &T) -> bool {
             let value = (value as *const T).cast();
@@ -1297,19 +1580,20 @@ impl Vt {
             && sel.is_none_or(|s| set(f, O::SELECTION, s));
         if !applied {
             unsafe { ffi::ghostty_formatter_free(f) };
-            return Vec::new();
+            return None;
         }
         let (mut out, mut len): (*mut u8, usize) = (ptr::null_mut(), 0);
         let r = unsafe { ffi::ghostty_formatter_format_alloc(f, ptr::null(), &mut out, &mut len) };
-        let bytes = if r == ffi::Result::SUCCESS && !out.is_null() {
-            let v = unsafe { std::slice::from_raw_parts(out, len) }.to_vec();
+        let res = (r == ffi::Result::SUCCESS).then(|| {
+            if out.is_null() {
+                return read(&[]);
+            }
+            let res = read(unsafe { std::slice::from_raw_parts(out, len) });
             unsafe { ffi::ghostty_free(ptr::null(), out, len) };
-            v
-        } else {
-            Vec::new()
-        };
+            res
+        });
         unsafe { ffi::ghostty_formatter_free(f) };
-        bytes
+        res
     }
 }
 
@@ -1824,4 +2108,252 @@ mod kitty_ffi {
     ) -> ffi::Result::Type {
         ffi::Result::NO_VALUE
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Formatting with this output format fails (to test what a failure leaves).
+    pub(crate) static FAIL_FORMAT: std::cell::Cell<Option<ffi::FormatterFormat::Type>> =
+        const { std::cell::Cell::new(None) };
+    /// A concealed copy takes the styled fallback, as when the plain text and the cells do
+    /// not line up.
+    pub(crate) static FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A piece of the formatter's styled (VT) output.
+enum Piece<'a> {
+    /// A character of the text, line breaks included.
+    Text(char),
+    /// SGR with these parameters.
+    Sgr(&'a str),
+    /// Cursor forward over this many cells (cells never written).
+    Forward(usize),
+}
+
+/// The pieces of styled output that make its text, in order; other escape sequences (private
+/// and intermediate CSI forms, OSC, DCS, SOS, PM, APC, nF and two-character escapes) are
+/// skipped whole.
+fn pieces(styled: &str, mut each: impl FnMut(Piece)) {
+    let mut chars = styled.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        if c != '\x1b' {
+            each(Piece::Text(c));
+            continue;
+        }
+        match chars.next().map(|(_, c)| c) {
+            // CSI: parameters, intermediates, final byte.
+            Some('[') => {
+                let start = chars.peek().map_or(styled.len(), |&(i, _)| i);
+                let mut end = start;
+                let mut intermediates = false;
+                let mut fin = None;
+                for (i, c) in chars.by_ref() {
+                    match c {
+                        '\x40'..='\x7e' => {
+                            fin = Some(c);
+                            break;
+                        }
+                        '\x20'..='\x2f' => intermediates = true,
+                        _ => end = i + c.len_utf8(),
+                    }
+                }
+                let params = &styled[start..end.max(start)];
+                // Private (`<=>?`-led) and intermediate forms are something else.
+                if intermediates || params.starts_with(['<', '=', '>', '?']) {
+                    continue;
+                }
+                match fin {
+                    Some('m') => each(Piece::Sgr(params)),
+                    Some('C') => {
+                        each(Piece::Forward(
+                            params.parse::<u16>().unwrap_or(1).max(1) as usize
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            // OSC (hyperlinks): up to BEL or ST. DCS, SOS, PM, APC: up to ST.
+            Some(k @ (']' | 'P' | 'X' | '^' | '_')) => {
+                while let Some((_, c)) = chars.next() {
+                    if (k == ']' && c == '\x07')
+                        || (c == '\x1b' && chars.next_if(|&(_, c)| c == '\\').is_some())
+                    {
+                        break;
+                    }
+                }
+            }
+            // nF (`ESC ( B` and the like): intermediates, then the final byte.
+            Some('\x20'..='\x2f') => {
+                while chars
+                    .next_if(|&(_, c)| ('\x20'..='\x2f').contains(&c))
+                    .is_some()
+                {}
+                chars.next();
+            }
+            // Two-character escapes.
+            _ => {}
+        }
+    }
+}
+
+/// Whether the styled output has a concealed character (SGR 8) other than a blank.
+pub(crate) fn conceals(styled: &str) -> bool {
+    let mut concealed = false;
+    let mut any = false;
+    pieces(styled, |p| match p {
+        Piece::Sgr(params) => concealed = sgr_conceals(params, concealed),
+        // Concealed blanks copy as blanks anyway; other spaces (U+3000) are text.
+        Piece::Text(c) if concealed && !matches!(c, ' ' | '\n' | '\r') => any = true,
+        _ => {}
+    });
+    any
+}
+
+/// The text of the formatter's styled (VT) output: escape sequences dropped, concealed
+/// characters (SGR 8) turned into blanks, trailing blanks of each line trimmed and lines
+/// ending in `\n`. The fallback for a concealed copy: the plain text, blanked by the cells, is
+/// what the copy should be. `grid`: the concealed cells' characters and widths as laid out, in
+/// order; concealed text is blanked as wide as those, and where they do not match it,
+/// measured with grapheme clustering (mode 2027) as `clustered` says it is now.
+pub(crate) fn styled_text(styled: &str, clustered: bool, grid: &[(Vec<char>, usize)]) -> String {
+    let mut out = String::with_capacity(styled.len());
+    let mut blanker = Blanker {
+        grid,
+        clustered,
+        hidden: Vec::new(),
+    };
+    let mut concealed = false;
+    // Line breaks and skipped cells after the last written cell (blanks too): kept only when
+    // a written cell follows, so rows with none (erased to a background color, say) at the
+    // end are not part of the text.
+    let mut pending = String::new();
+    // A carriage return waiting to see whether a line feed follows.
+    let mut cr = false;
+    pieces(styled, |p| {
+        if cr && !matches!(p, Piece::Text('\n')) {
+            pending.push('\r');
+        }
+        cr = false;
+        match p {
+            Piece::Text(c @ ('\r' | '\n')) => {
+                blanker.flush(&mut out);
+                let kept = pending.trim_end_matches(' ').len();
+                pending.truncate(kept);
+                if pending.is_empty() {
+                    let kept = out.trim_end_matches(' ').len();
+                    out.truncate(kept);
+                }
+                if c == '\r' {
+                    cr = true;
+                } else {
+                    // CRLF (the VT formatter's line end) copies as LF.
+                    pending.push('\n');
+                }
+            }
+            Piece::Text(c) => {
+                if concealed {
+                    out.push_str(&pending);
+                    pending.clear();
+                    blanker.hidden.push(c as u32);
+                } else {
+                    blanker.flush(&mut out);
+                    out.push_str(&pending);
+                    pending.clear();
+                    out.push(c);
+                }
+            }
+            Piece::Sgr(params) => {
+                let now = sgr_conceals(params, concealed);
+                if concealed && !now {
+                    blanker.flush(&mut out);
+                }
+                concealed = now;
+            }
+            Piece::Forward(n) => {
+                blanker.flush(&mut out);
+                pending.extend(std::iter::repeat_n(' ', n));
+            }
+        }
+    });
+    blanker.flush(&mut out);
+    let kept = out.trim_end_matches(' ').len();
+    out.truncate(kept);
+    out
+}
+
+/// Concealed characters waiting to be blanked, and the grid's concealed cells to measure them
+/// by.
+struct Blanker<'a> {
+    grid: &'a [(Vec<char>, usize)],
+    clustered: bool,
+    /// Measured together, so a cluster split by a color change still counts once.
+    hidden: Vec<u32>,
+}
+
+impl Blanker<'_> {
+    /// Append one blank per cell the waiting concealed characters cover, and clear them.
+    fn flush(&mut self, out: &mut String) {
+        let mut cells = 0;
+        let mut rest = &self.hidden[..];
+        while !rest.is_empty() {
+            match self.grid.split_first() {
+                // The grid's next concealed cell (none starts with a blank: a cell whose
+                // character is a space is a blank one, marks and all).
+                Some(((text, w), next))
+                    if rest.len() >= text.len()
+                        && text.iter().zip(rest).all(|(&c, &h)| c as u32 == h) =>
+                {
+                    cells += w;
+                    rest = &rest[text.len()..];
+                    self.grid = next;
+                }
+                // An ASCII blank (a written space, or the formatter's own for an empty cell)
+                // is one cell and none of the grid's cells with text, with any zero-width
+                // marks the terminal put on it (the VT formatter writes them along).
+                _ if rest[0] == u32::from(' ') => {
+                    let marks = rest[1..]
+                        .iter()
+                        .take_while(|&&c| unsafe { ffi::ghostty_unicode_codepoint_width(c) } == 0)
+                        .count();
+                    cells += 1;
+                    rest = &rest[1 + marks..];
+                }
+                _ => {
+                    // Off the grid's cells: measure the rest, and leave the grid be.
+                    self.grid = &[];
+                    let (n, w) = cluster_width(rest, self.clustered);
+                    cells += w;
+                    rest = &rest[n..];
+                }
+            }
+        }
+        out.extend(std::iter::repeat_n(' ', cells));
+        self.hidden.clear();
+    }
+}
+
+/// Whether text is concealed after the SGR sequence with these parameters.
+fn sgr_conceals(params: &str, mut concealed: bool) -> bool {
+    let mut ps = params.split(';');
+    while let Some(p) = ps.next() {
+        // Only the first `:` field names the attribute.
+        match p.split(':').next().unwrap_or("") {
+            "" | "0" | "28" => concealed = false,
+            "8" => concealed = true,
+            // Extended colors: skip their arguments (`38;5;8` is not SGR 8).
+            "38" | "48" | "58" if !p.contains(':') => match ps.next() {
+                Some("5") => {
+                    ps.next();
+                }
+                Some("2") => {
+                    ps.next();
+                    ps.next();
+                    ps.next();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    concealed
 }

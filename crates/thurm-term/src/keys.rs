@@ -79,7 +79,13 @@ impl Encoders {
         let had_text = !ev.text.is_empty() && !ev.text.chars().all(char::is_control);
         // The key's text as the encoder wants it: use `ev.text` when printable, else `ev.shifted`
         // when Shift (without Ctrl) is held and the caller omitted `text`, else the key itself
-        // (Ctrl combinations).
+        // (Ctrl combinations). Keypad keys that make no text (Enter's "\r", the navigation
+        // keys) are reported as keypad keys under the kitty protocol, which the encoder only
+        // does without text; keypad keys that make text ("5" with NumLock on) send it, until
+        // "report all keys as escape codes", where every key is an escape code already and the
+        // text goes along as associated text.
+        let flags = if kitty { vt.kitty_flags() } else { 0 };
+        let kitty_active = flags != 0 && flags & KITTY_REPORT_ALL == 0;
         let text = match ev.key {
             Key::Char(c) if !had_text => {
                 if ev.mods & mods::SHIFT != 0 && ev.mods & mods::CTRL == 0 {
@@ -88,6 +94,7 @@ impl Encoders {
                     c.to_string()
                 }
             }
+            Key::Named(k) if kitty_active && !had_text && is_keypad(k) => String::new(),
             _ => ev.text.clone(),
         };
         // Shift is used up producing a shifted character ("A", "!"); the encoder reports it
@@ -434,6 +441,46 @@ fn physical_key(c: char) -> ffi::Key::Type {
         ' ' => K::SPACE,
         _ => K::UNIDENTIFIED,
     }
+}
+
+/// The kitty keyboard flag "report all keys as escape codes".
+const KITTY_REPORT_ALL: u8 = 8;
+
+/// Keys on the numeric keypad (digits, operators, Enter and its navigation keys).
+fn is_keypad(k: NamedKey) -> bool {
+    use NamedKey as N;
+    matches!(
+        k,
+        N::Kp0
+            | N::Kp1
+            | N::Kp2
+            | N::Kp3
+            | N::Kp4
+            | N::Kp5
+            | N::Kp6
+            | N::Kp7
+            | N::Kp8
+            | N::Kp9
+            | N::KpDecimal
+            | N::KpDivide
+            | N::KpMultiply
+            | N::KpSubtract
+            | N::KpAdd
+            | N::KpEnter
+            | N::KpEqual
+            | N::KpSeparator
+            | N::KpLeft
+            | N::KpRight
+            | N::KpUp
+            | N::KpDown
+            | N::KpPageUp
+            | N::KpPageDown
+            | N::KpHome
+            | N::KpEnd
+            | N::KpInsert
+            | N::KpDelete
+            | N::KpBegin
+    )
 }
 
 fn named_key(k: NamedKey) -> ffi::Key::Type {
