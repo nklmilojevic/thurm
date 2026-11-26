@@ -568,6 +568,10 @@ pub struct PaneState {
     /// without the integration hook): at the shell's first prompt, or when due if the shell
     /// is in the foreground and nobody `typed`.
     pending_input: Option<(Instant, Vec<u8>)>,
+    /// How many times `pending_input` came due while the shell wasn't in the foreground yet
+    /// (its startup files still running): it waits a second more each time, up to
+    /// [`PENDING_INPUT_WAITS`].
+    pending_waits: u32,
     /// A client typed or pasted into the pane.
     typed: bool,
     shell_integration_seen: bool,
@@ -615,8 +619,14 @@ enum RestoreLaunch<'a> {
         exec: &'a Path,
         ticket: &'a str,
         title: String,
+        /// Started instead when the resume fails, so the pane stays with the reason.
+        shell: &'a str,
     },
 }
+
+/// How many seconds a pending resume line waits, past its due time, for a slow shell to come
+/// up before it is given up.
+const PENDING_INPUT_WAITS: u32 = 30;
 
 /// A restored pane's saved program, waiting for the pane's shell to redeem `ticket`
 /// ([`Request::TakeResume`]).
@@ -1118,11 +1128,14 @@ impl Daemon {
                 exec,
                 ticket,
                 title,
+                shell,
             } => (
                 Some(vec![
                     exec.display().to_string(),
                     "--exec-resume".into(),
                     ticket.to_owned(),
+                    "--or-shell".into(),
+                    shell.to_owned(),
                 ]),
                 None,
                 Some(title),
@@ -1222,6 +1235,7 @@ impl Daemon {
                 carry: p.carry,
                 forwarded_carry: p.forwarded_carry,
                 pending_input: None,
+                pending_waits: 0,
                 typed: false,
                 shell_integration_seen: p.shell_integration_seen,
                 git_probe: None,
@@ -2253,6 +2267,11 @@ impl Daemon {
                         });
                         if shell_waits && !st.typed {
                             pane.write(input);
+                        } else if !st.typed && st.pending_waits < PENDING_INPUT_WAITS {
+                            // The shell isn't up yet (slow startup files run something in the
+                            // foreground): wait for it, or for its first prompt.
+                            st.pending_waits += 1;
+                            st.pending_input = Some((Instant::now() + Duration::from_secs(1), input));
                         } else {
                             self.resume_tickets.lock().retain(|t| t.pane != pane.id);
                             st.term.print(
@@ -2764,6 +2783,19 @@ impl Daemon {
                 plans.push(None);
                 continue;
             }
+            // A job of the shell resumes only in the default shell, the one the hook and the
+            // typed line are made for: a pane made with another command (`thurm new -- bash`
+            // under zsh) is restored with that command, and its program isn't resumed.
+            if !rec.first_process
+                && p.command.as_ref().is_some_and(|c| {
+                    let base = |s: &str| s.rsplit('/').next().unwrap_or(s).to_owned();
+                    c.len() != 1 || c.first().map(|c| base(c)) != Some(base(&shell_prog))
+                })
+            {
+                skip("own_command");
+                plans.push(None);
+                continue;
+            }
             // A job of the shell runs from the shell's own first-prompt hook, or else is typed
             // into a POSIX shell once its startup files had time to run.
             if !rec.first_process
@@ -2875,11 +2907,8 @@ impl Daemon {
                         expires: Instant::now() + program_resume::TICKET_TTL,
                     });
                     let req = CreatePane {
-                        command: if plan.first_process {
-                            p.command.clone()
-                        } else {
-                            None
-                        },
+                        // The pane's own command (the default shell, for a job of it).
+                        command: p.command.clone(),
                         cwd: plan.cwd.clone(),
                         size: p.size.into(),
                         ..Default::default()
@@ -2889,6 +2918,7 @@ impl Daemon {
                             exec: exe,
                             ticket: &ticket,
                             title: plan.program_label.clone(),
+                            shell: &shell_prog,
                         }
                     } else if use_hook {
                         RestoreLaunch::Hook {
@@ -4344,9 +4374,20 @@ impl Daemon {
                     let pos = tickets.iter().position(|t| {
                         t.expires > now && program_resume::ticket_eq(&t.ticket, &ticket)
                     });
-                    pos.map(|i| tickets.swap_remove(i).spec)
+                    pos.map(|i| tickets.swap_remove(i))
                 };
-                let spec = spec.ok_or("unknown or used resume ticket")?;
+                let ResumeTicket { pane, spec, .. } =
+                    spec.ok_or("unknown or used resume ticket")?;
+                // Someone typed before the shell's first prompt: what they typed would go to
+                // the resumed program (or join its line), so it isn't resumed. Every shell's
+                // hook comes here; the typed line checks `typed` itself.
+                if let Some(pane) = self.pane(pane) {
+                    let mut st = pane.state.lock();
+                    if st.typed {
+                        st.term.print("\r\n[automatic resume skipped: the terminal was busy]\r\n");
+                        return Err("skipped: input was typed before the shell was ready".into());
+                    }
+                }
                 serde_json::to_string(&spec)
                     .map(Response::Text)
                     .map_err(|e| e.to_string())

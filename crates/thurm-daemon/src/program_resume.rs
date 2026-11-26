@@ -2204,12 +2204,13 @@ fn pinned_program(
 /// functions, and builtins, while inheriting the shell's full environment (`PATH`, `direnv`,
 /// etc.). A bare program name is looked up on `PATH` like `execvp` does, but a file the kernel
 /// cannot execute (no `#!` line) is refused instead of being run by `/bin/sh`.
-pub fn exec_resume(ticket: &str) -> ! {
+pub fn exec_resume(ticket: &str, fallback_shell: Option<&str>) -> ! {
+    let fail = |code: i32| -> ! { resume_failed(code, fallback_shell) };
     let spec = match take_resume(ticket) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("thurm: resume failed: {e}");
-            std::process::exit(1);
+            fail(1);
         }
     };
     if let Some(dir) = &spec.cwd
@@ -2221,7 +2222,7 @@ pub fn exec_resume(ticket: &str) -> ! {
             escape_display(&spec.argv[0]),
             escape_display(dir)
         );
-        std::process::exit(1);
+        fail(1);
     }
     let mut cstrings = Vec::with_capacity(spec.argv.len());
     for arg in &spec.argv {
@@ -2229,7 +2230,7 @@ pub fn exec_resume(ticket: &str) -> ! {
             Ok(c) => cstrings.push(c),
             Err(_) => {
                 eprintln!("thurm: resume argument contains NUL byte");
-                std::process::exit(1);
+                fail(1);
             }
         }
     }
@@ -2249,7 +2250,7 @@ pub fn exec_resume(ticket: &str) -> ! {
                     "thurm: cannot resume {}: {e}",
                     escape_display(&spec.argv[0])
                 );
-                std::process::exit(127);
+                fail(127);
             }
         }
     };
@@ -2270,6 +2271,24 @@ pub fn exec_resume(ticket: &str) -> ! {
         "thurm: cannot resume {}: {err}",
         escape_display(&spec.argv[0])
     );
+    fail(code);
+}
+
+/// A resume that failed: ends with `code`, or, for a pane whose only process this is
+/// (`fallback_shell`), starts that shell instead so the pane and the reason above stay.
+fn resume_failed(code: i32, fallback_shell: Option<&str>) -> ! {
+    if let Some(shell) = fallback_shell
+        && let Ok(prog) = CString::new(shell.as_bytes())
+    {
+        eprintln!("thurm: starting {} instead", escape_display(shell));
+        let argv = [prog.as_ptr(), std::ptr::null()];
+        unsafe { libc::execvp(prog.as_ptr(), argv.as_ptr()) };
+        eprintln!(
+            "thurm: cannot start {}: {}",
+            escape_display(shell),
+            std::io::Error::last_os_error()
+        );
+    }
     std::process::exit(code);
 }
 

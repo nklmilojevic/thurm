@@ -1368,14 +1368,21 @@ pub fn state_dir() -> PathBuf {
 /// `THURM_KEY_DIR` overrides it; with `THURM_STATE_DIR` set it is that directory's `-keys`
 /// sibling, else `~/Library/Application Support/Thurm Keys` on macOS and
 /// `~/.local/share/thurm/keys` elsewhere (the data directory, not the state or config one).
+/// `<state>-keys`, next to the state directory `state` and never inside it: a trailing
+/// separator (`/srv/thurm/state/`) would otherwise make it `<state>/-keys`, which copies of the
+/// state directory carry along with the evidence the key signs.
+fn keys_beside(state: &Path) -> PathBuf {
+    let mut name = state.components().collect::<PathBuf>().into_os_string();
+    name.push("-keys");
+    PathBuf::from(name)
+}
+
 pub fn resume_key_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("THURM_KEY_DIR") {
         return PathBuf::from(dir);
     }
     if let Some(dir) = std::env::var_os("THURM_STATE_DIR") {
-        let mut name = PathBuf::from(dir).into_os_string();
-        name.push("-keys");
-        return PathBuf::from(name);
+        return keys_beside(Path::new(&dir));
     }
     #[cfg(target_vendor = "apple")]
     {
@@ -2435,6 +2442,17 @@ fn migrate_config(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_key_directory_is_beside_the_state_directory() {
+        for state in ["/srv/thurm/state", "/srv/thurm/state/", "/srv/thurm/state//", "/srv/thurm/./state/"] {
+            assert_eq!(
+                keys_beside(Path::new(state)),
+                Path::new("/srv/thurm/state-keys"),
+                "{state}"
+            );
+        }
+    }
 
     #[test]
     fn an_unreadable_overlay_holds_nothing() {

@@ -87,6 +87,13 @@ if [[ -n "${_thurm_resume_ticket-}" && -n "${_thurm_resume_exec-}" ]]; then
   _thurm_resume_line_init() {
     add-zle-hook-widget -d line-init _thurm_resume_line_init
     [[ -n "${_thurm_resume_ticket-}" ]] || return 0
+    # Typed ahead of this prompt: that line is the user's, and the resume is dropped (the
+    # daemon refuses the ticket after typing anyway).
+    if (( ${PENDING:-0} || ${KEYS_QUEUED_COUNT:-0} )); then
+      _thurm_resume_ticket=""
+      _thurm_resume_exec=""
+      return 0
+    fi
     # Only the helper's path and the single-use ticket, never the program's arguments; the
     # leading space and the history hook keep it out of history.
     BUFFER=" command ${(q)_thurm_resume_exec} --exec-resume ${_thurm_resume_ticket} || :"
