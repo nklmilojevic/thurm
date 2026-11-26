@@ -332,14 +332,14 @@ impl Pusher {
     }
 
     /// Forgets every device registered under the phone name `name` (spaces as dashes, as its
-    /// device key's comment has it) or matching `device` id directly, and its activities.
-    /// Returns their ids.
+    /// device key's comment has it), and its activities. Returns their ids. Use [`Self::unregister`]
+    /// to remove a specific registration by device id.
     pub fn revoke_named(&self, name: &str) -> Result<Vec<String>, String> {
         let gone: Vec<String> = self
             .devices
             .lock()
             .iter()
-            .filter(|d| d.name.replace(' ', "-") == name || d.device == name)
+            .filter(|d| d.name.replace(' ', "-") == name)
             .map(|d| d.device.clone())
             .collect();
         if !gone.is_empty() {
@@ -775,7 +775,7 @@ pub fn body(device: &Device, notice: &Notice, seq: u64) -> String {
         Some(NoticeKind::Error) => "failed",
         None => "needs your attention",
     };
-    let mut payload = serde_json::json!({
+    serde_json::json!({
         "device": device.device,
         "host": device.host,
         "pane": notice.pane,
@@ -783,12 +783,8 @@ pub fn body(device: &Device, notice: &Notice, seq: u64) -> String {
         "body": text,
         "permission": notice.permission,
         "seq": seq,
-        "thread_id": format!("{}/{}", device.host, notice.pane),
-    });
-    if let Some(k) = kind {
-        payload["kind"] = serde_json::json!(k);
-    }
-    payload.to_string()
+    })
+    .to_string()
 }
 
 /// The request body the relay gets when `pane` was read, up to its notice `seq`, for `device`.
@@ -1090,17 +1086,17 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(b["body"], "asks for permission");
-        assert_eq!(b["kind"], "permission");
         assert!(b.get("topic").is_none(), "relay notices must not carry session topics");
-        assert_eq!(b["thread_id"], "studio/3");
+        assert!(b.get("kind").is_none(), "relay payload stays on agreed wire schema");
+        assert!(b.get("thread_id").is_none(), "relay payload stays on agreed wire schema");
         assert_eq!(b["seq"], 42);
         assert_eq!(b["host"], "studio");
         assert_eq!(b["permission"], 9);
 
-        for (kind, expected_kind, expected_body) in [
-            (NoticeKind::NeedsInput, "needs_input", "is waiting for input"),
-            (NoticeKind::Done, "done", "finished"),
-            (NoticeKind::Error, "error", "failed"),
+        for (kind, expected_body) in [
+            (NoticeKind::NeedsInput, "is waiting for input"),
+            (NoticeKind::Done, "finished"),
+            (NoticeKind::Error, "failed"),
         ] {
             let b: serde_json::Value = serde_json::from_str(&body(
                 &d,
@@ -1114,9 +1110,9 @@ mod tests {
             ))
             .unwrap();
             assert_eq!(b["body"], expected_body);
-            assert_eq!(b["kind"], expected_kind);
-            assert_eq!(b["thread_id"], "studio/5");
             assert!(b.get("topic").is_none());
+            assert!(b.get("kind").is_none());
+            assert!(b.get("thread_id").is_none());
         }
     }
 
@@ -1163,8 +1159,9 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
-        // Revoking by device id removes only that device; revoking by name removes matching names.
-        assert_eq!(p.revoke_named("d2").unwrap(), ["d2"]);
+        // Unregistering by device id removes only that device without touching same-name devices.
+        p.unregister("d2").unwrap();
+        assert_eq!(p.devices.lock().len(), 2);
         p.unregister("d1").unwrap();
         p.unregister("d3").unwrap();
         assert!(Pusher::new(&dir, true).devices.lock().is_empty());
@@ -1384,6 +1381,8 @@ mod tests {
             ("d1", "studio", "Nikola's iPhone"),
             ("d2", "laptop", "Nikola's iPhone"),
             ("d3", "studio", "iPad"),
+            // Unrelated device whose device ID happens to match the revoked phone's name.
+            ("Nikola's-iPhone", "studio", "Work Phone"),
         ] {
             p.register(Device {
                 device: id.into(),
@@ -1401,20 +1400,25 @@ mod tests {
             since: 1,
             permission: None,
         };
-        p.follow("d1", 4, "aa".into(), Some(working)).unwrap();
-        assert_eq!(p.follows.lock().len(), 1);
+        p.follow("d1", 4, "aa".into(), Some(working.clone()))
+            .unwrap();
+        p.follow("Nikola's-iPhone", 5, "bb".into(), Some(working))
+            .unwrap();
+        assert_eq!(p.follows.lock().len(), 2);
         let mut gone = p.revoke_named("Nikola's-iPhone").unwrap();
         gone.sort();
         assert_eq!(gone, ["d1", "d2"]);
         let again = Pusher::new(&dir, true);
-        let left: Vec<String> = again
+        let mut left: Vec<String> = again
             .devices
             .lock()
             .iter()
             .map(|d| d.device.clone())
             .collect();
-        assert_eq!(left, ["d3"]);
-        assert!(again.follows.lock().is_empty());
+        left.sort();
+        assert_eq!(left, ["Nikola's-iPhone", "d3"]);
+        assert_eq!(again.follows.lock().len(), 1);
+        assert_eq!(again.follows.lock()[0].device, "Nikola's-iPhone");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

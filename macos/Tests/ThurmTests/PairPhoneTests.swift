@@ -166,6 +166,46 @@ final class PairPhoneTests: XCTestCase {
         XCTAssertFalse(PhonePairing.canPair(host: "studio", hostKeys: [], tailnet: ""))
     }
 
+    func testRejectsInvalidDeviceNamesAndInvalidLocalSSHPorts() throws {
+        let keyPrefix = deviceKey.split(separator: " ").prefix(2).joined(separator: " ") + " "
+        // Reject empty, overlong (>128), non-ASCII, and punctuation outside [A-Za-z0-9._-].
+        for bad in [
+            "",
+            String(repeating: "a", count: 129),
+            "café",
+            "phone/name",
+            "phone:1",
+            "phone@home",
+            "phone$1",
+        ] {
+            XCTAssertNil(PhonePairing.validDeviceKey("\(keyPrefix)thurm-ios:\(bad)"), "expected rejection for '\(bad)'")
+        }
+        // Accept valid 128-char boundary and allowed punctuation.
+        let maxValid = String(repeating: "a", count: 128)
+        XCTAssertEqual(PhonePairing.validDeviceKey("\(keyPrefix)thurm-ios:\(maxValid)")?.device, maxValid)
+        XCTAssertEqual(PhonePairing.validDeviceKey("\(keyPrefix)thurm-ios:iPhone-15_Pro.local")?.device,
+                       "iPhone-15_Pro.local")
+
+        // Local SSH port validation boundaries in canPair.
+        XCTAssertFalse(PhonePairing.canPair(host: "studio", port: 0, hostKeys: ["SHA256:abc"], tailnet: nil))
+        XCTAssertTrue(PhonePairing.canPair(host: "studio", port: 1, hostKeys: ["SHA256:abc"], tailnet: nil))
+        XCTAssertTrue(PhonePairing.canPair(host: "studio", port: 65535, hostKeys: ["SHA256:abc"], tailnet: nil))
+        XCTAssertFalse(PhonePairing.canPair(host: "studio", port: 65536, hostKeys: ["SHA256:abc"], tailnet: nil))
+        XCTAssertTrue(PhonePairing.canPair(host: "studio", port: 0, hostKeys: ["SHA256:abc"],
+                                           tailnet: "wss://thurm.tail1234.ts.net/v1/connect"))
+
+        // Invalid local SSH ports must strip host_keys from payload even when a tailnet route exists.
+        for badPort in [0, -1, 65536] {
+            let link = PhonePairing.payload(name: "studio", host: "studio.tail.ts.net", port: badPort,
+                                            user: "me", hostKeys: ["SHA256:abc"], relay: nil, code: nil,
+                                            tailnet: "wss://thurm.tail1234.ts.net/v1/connect")
+            let d = try decode(link)
+            XCTAssertEqual(d["host_keys"] as? [String], [], "invalid port \(badPort) must omit SSH host_keys")
+            XCTAssertEqual(d["port"] as? Int, 22)
+            XCTAssertNotNil(d["tailnet"])
+        }
+    }
+
     func testTailscaleStatusPairsOnlyOnceServingHTTPS() throws {
         var json: [String: Any] = [
             "state": "running", "hostname": "thurm", "dns_name": "thurm.tail1234.ts.net",

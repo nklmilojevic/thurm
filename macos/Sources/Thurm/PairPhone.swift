@@ -377,6 +377,8 @@ struct PairPhoneSheet: View {
     @State private var devices = PhonePairing.devices()
     @State private var message: String?
     @State private var remoteLogin: Bool?
+    @State private var remoteLoginProbe: NWConnection?
+    @State private var remoteLoginGeneration = 0
     /// Whether this Mac's `thurm` is found, and speaks our protocol, where sshd logins look.
     @State private var cliReady: Bool?
     /// The `[[remote]]` hosts (`pairing_hosts`), with what the sheet changed.
@@ -553,6 +555,11 @@ struct PairPhoneSheet: View {
             loadRemoteHosts()
             tailscale.refresh()
         }
+        .onDisappear {
+            remoteLoginGeneration &+= 1
+            remoteLoginProbe?.cancel()
+            remoteLoginProbe = nil
+        }
     }
 
     private var deviceKeyInputRow: some View {
@@ -608,10 +615,10 @@ struct PairPhoneSheet: View {
 
     private func state(of h: PhonePairing.RemoteHost) -> String {
         if h.tailnet != nil {
-            return h.hasSSH ? "Over Tailscale, ssh as the fallback" : "Over Tailscale"
+            return h.phoneSSH ? "Over Tailscale, ssh as the fallback" : "Over Tailscale"
         }
         if !h.plain.isEmpty {
-            return h.hasSSH ? "Over tailnet, ssh as the fallback" : "Over tailnet"
+            return h.phoneSSH ? "Over tailnet, ssh as the fallback" : "Over tailnet"
         }
         if let error = h.error {
             return error.hasPrefix("no known host key") ? "Connect to it from this Mac once" : error
@@ -815,21 +822,35 @@ struct PairPhoneSheet: View {
         }
     }
 
-    /// Whether sshd answers on this Mac (Remote Login).
+    /// Whether sshd answers on this Mac (Remote Login). Cancels any earlier probe so superseded
+    /// port checks cannot overwrite `remoteLogin` out of order.
     private func checkRemoteLogin() {
+        remoteLoginProbe?.cancel()
+        remoteLoginProbe = nil
+        remoteLoginGeneration &+= 1
+        let gen = remoteLoginGeneration
         guard validPort, let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
             remoteLogin = nil
             return
         }
         let conn = NWConnection(host: "127.0.0.1", port: nwPort, using: .tcp)
+        remoteLoginProbe = conn
         conn.stateUpdateHandler = { state in
             switch state {
             case .ready:
-                DispatchQueue.main.async { remoteLogin = true }
                 conn.cancel()
+                DispatchQueue.main.async {
+                    guard remoteLoginGeneration == gen else { return }
+                    remoteLogin = true
+                    remoteLoginProbe = nil
+                }
             case .failed, .waiting:
-                DispatchQueue.main.async { remoteLogin = false }
                 conn.cancel()
+                DispatchQueue.main.async {
+                    guard remoteLoginGeneration == gen else { return }
+                    remoteLogin = false
+                    remoteLoginProbe = nil
+                }
             default:
                 break
             }

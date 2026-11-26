@@ -5691,7 +5691,6 @@ mod tests {
         assert!(json.get("topic").is_none(), "relay payload leaked topic: {raw}");
         assert!(!raw.contains("supersecret"), "relay payload leaked secret: {raw}");
         assert!(!raw.contains("previous-secret-shell-title"), "relay payload leaked pane title: {raw}");
-        assert_eq!(json["kind"], "permission");
         assert_eq!(json["body"], "asks for permission");
 
         daemon.close_pane(pane);
