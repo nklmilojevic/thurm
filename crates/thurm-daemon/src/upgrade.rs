@@ -641,9 +641,24 @@ mod tests {
             },
             remaining_ms: 1000,
         });
-        write_private(&path, &serde_json::to_vec(&old).unwrap()).unwrap();
+        // A pane with a line waiting to be typed into its shell, and a resume token.
+        let mut value = serde_json::to_value(&old).unwrap();
+        value["panes"] = serde_json::json!([{
+            "id": 1, "fd": 9, "pid": 42,
+            "size": {"cols": 80, "rows": 24, "cell_width": 0, "cell_height": 0},
+            "title": "zsh", "cwd": "/tmp", "command": null, "hold": false, "restored": true,
+            "exited": null, "osc_cwd": null, "shell_integration_seen": true, "state": "",
+            "pending_input": [500, "dG91Y2ggL3RtcC9wbGFpbi1oYW5kb2ZmLW1hcmtlcg=="],
+            "resume_token": "cd".repeat(32),
+        }]);
+        write_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
         let h = load(&path, None).unwrap();
         assert_eq!(h.version, 1);
         assert!(h.resume_tickets.is_empty());
+        // The pane stays; what it would have typed or redeemed does not.
+        assert_eq!(h.panes.len(), 1);
+        assert_eq!((h.panes[0].id, h.panes[0].title.as_str()), (1, "zsh"));
+        assert!(h.panes[0].pending_input.is_none());
+        assert!(h.panes[0].resume_token.is_none());
     }
 }
