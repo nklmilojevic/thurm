@@ -437,7 +437,11 @@ fn concealed_cluster_starting_with_a_blank() {
         t.vt.selection_copies().1.is_some(),
         "plain and cells line up"
     );
-    assert_eq!(t.selection_text(), "a  b");
+    assert_eq!(t.selection_text(), "a  b"); // The styled fallback too: the VT formatter writes the mark with the space.
+    crate::vt::FALLBACK.with(|f| f.set(true));
+    let text = t.selection_text();
+    crate::vt::FALLBACK.with(|f| f.set(false));
+    assert_eq!(text, "a  b");
 }
 
 /// Concealed spaces other than the ASCII one are text: blanked by their cells.
@@ -499,6 +503,12 @@ fn styled_text_parses_escapes() {
     // A concealed ASCII blank is one cell of its own: the grid's cells still line up after it.
     let grid = [(vec!['a'], 1), (vec!['👍'], 2), (vec!['🏽'], 2)];
     assert_eq!(styled_text("\x1b[8ma 👍🏽\x1b[28m|", true, &grid), "      |");
+    // Marks on a concealed blank are part of its one cell: the grid's cells still line up.
+    let grid = [(vec!['👍'], 2), (vec!['🏽'], 2)];
+    assert_eq!(
+        styled_text("\x1b[8m \u{301}👍🏽\x1b[28m|", true, &grid),
+        "     |"
+    );
     // Every trailing row without written cells is dropped, its blanks too.
     assert_eq!(s("a\r\n\x1b[44m\x1b[K\r\n\x1b[K\r\n\x1b[5C\x1b[m"), "a");
     // Skipped cells before a written one stay; a row of written blanks keeps its line.

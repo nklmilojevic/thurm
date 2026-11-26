@@ -2276,10 +2276,15 @@ impl Blanker<'_> {
                     self.grid = next;
                 }
                 // An ASCII blank (a written space, or the formatter's own for an empty cell)
-                // is one cell and none of the grid's cells with text.
+                // is one cell and none of the grid's cells with text, with any zero-width
+                // marks the terminal put on it (the VT formatter writes them along).
                 _ if rest[0] == u32::from(' ') => {
+                    let marks = rest[1..]
+                        .iter()
+                        .take_while(|&&c| unsafe { ffi::ghostty_unicode_codepoint_width(c) } == 0)
+                        .count();
                     cells += 1;
-                    rest = &rest[1..];
+                    rest = &rest[1 + marks..];
                 }
                 _ => {
                     // Off the grid's cells: measure the rest, and leave the grid be.
