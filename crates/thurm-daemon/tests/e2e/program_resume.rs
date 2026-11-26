@@ -1048,7 +1048,10 @@ fn fish_integration_resume_uses_startup_path_and_bypasses_functions() {
         .unwrap();
         std::thread::sleep(Duration::from_millis(300));
         let shown = capture(&c2, pane);
-        assert!(shown.contains("FISH_RESUMED_OK"), "after resize to {cols}: {shown}");
+        assert!(
+            shown.contains("FISH_RESUMED_OK"),
+            "after resize to {cols}: {shown}"
+        );
     }
     run_line(&c2, pane, "typed");
     wait_match(&c2, pane, "FISH_GOT_typed_END");
