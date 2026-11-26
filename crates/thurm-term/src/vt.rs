@@ -1129,27 +1129,28 @@ impl Vt {
         // The plain text with each concealed character blanked as wide as its cells; should the
         // two not line up, the styled output's text, which blanks every concealed character
         // (as wide as the grid laid the concealed cells out, where it can tell).
-        let cells = self.selected_cells(&sel);
         #[cfg(test)]
         let plain = if FALLBACK.with(|f| f.get()) {
             String::from("\u{1}")
         } else {
             plain
         };
-        if let Some(out) = cells.as_deref().and_then(|c| blank_concealed(c, &plain)) {
+        if let Some(out) = self.blank_concealed(&sel, &plain) {
             return out;
         }
-        // The fallback (rare: the two did not line up) formats the styled text again.
+        // The fallback (rare: the two did not line up) formats the styled text again, and
+        // measures concealed text by the concealed cells.
         drop(plain);
         let Some(styled) = format(ffi::FormatterFormat::VT) else {
             return String::new();
         };
-        let hidden: Vec<(Vec<char>, usize)> = cells
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| c.hidden)
-            .map(|c| (c.text, c.width))
-            .collect();
+        let mut hidden: Vec<(Vec<char>, usize)> = Vec::new();
+        self.for_each_selected_cell(&sel, |text, concealed, width| {
+            if concealed {
+                hidden.push((text.to_vec(), width));
+            }
+            true
+        });
         styled_text(&styled, self.mode(mode(2027, false)), &hidden)
     }
 
@@ -1198,9 +1199,14 @@ impl Vt {
         Some(out)
     }
 
-    /// The selected cells with text, in the order the formatter copies them. `None` when the
-    /// selection's cells cannot be found.
-    fn selected_cells(&self, sel: &ffi::Selection) -> Option<Vec<SelCell>> {
+    /// Call `f` with each selected cell with text, in the order the formatter copies them:
+    /// its characters, whether it is concealed, how many cells it takes; until `f` returns
+    /// false. Nothing is kept per cell. `None` when the selection's cells cannot be found.
+    fn for_each_selected_cell(
+        &self,
+        sel: &ffi::Selection,
+        mut f: impl FnMut(&[char], bool, usize) -> bool,
+    ) -> Option<()> {
         let mut ordered = *sel;
         let r = unsafe {
             ffi::ghostty_terminal_selection_ordered(
@@ -1222,7 +1228,8 @@ impl Vt {
         if !rect && cell(&ordered.end).wide == SPACER_HEAD {
             (ex, ey) = (0, ey + 1);
         }
-        let mut cells: Vec<SelCell> = Vec::new();
+        // The cell's characters (one buffer for them all).
+        let mut text: Vec<char> = Vec::new();
         for (y, r0) in (sy..=ey).zip(self.row_refs(sy, ey)?) {
             let (from, to) = match (rect, y == sy, y == ey) {
                 (true, ..) => (sx.min(ex), sx.max(ex)),
@@ -1244,11 +1251,12 @@ impl Vt {
                 if c.wide == SPACER_TAIL || c.wide == SPACER_HEAD {
                     continue;
                 }
-                let text: Vec<char> = if c.tag == ffi::CellContentTag::CODEPOINT_GRAPHEME {
-                    graphemes(&r)
+                text.clear();
+                if c.tag == ffi::CellContentTag::CODEPOINT_GRAPHEME {
+                    text.extend(graphemes(&r));
                 } else {
-                    char::from_u32(c.codepoint).into_iter().collect()
-                };
+                    text.extend(char::from_u32(c.codepoint));
+                }
                 // Blank cells: the formatter's text has ASCII blanks there (or nothing). A cell
                 // whose character is a space is one, marks on it and all: the formatter blanks
                 // it by its first character.
@@ -1264,14 +1272,56 @@ impl Vt {
                             h
                         }
                     };
-                cells.push(SelCell {
-                    text,
-                    hidden,
-                    width: if c.wide == WIDE { 2 } else { 1 },
-                });
+                if !f(&text, hidden, if c.wide == WIDE { 2 } else { 1 }) {
+                    return Some(());
+                }
             }
         }
-        Some(cells)
+        Some(())
+    }
+
+    /// `plain` (the plain formatter's copy of `sel`) with the characters of concealed cells
+    /// turned into one blank per cell they take, trailing blanks of each line trimmed. `None`
+    /// when the selected cells' characters are not the ones `plain` has. The two are walked
+    /// together: what is held besides `plain` is the output.
+    fn blank_concealed(&self, sel: &ffi::Selection, plain: &str) -> Option<String> {
+        let mut out = String::with_capacity(plain.len());
+        // The formatter's blanks and line breaks at the start of `rest` (other spaces are
+        // cells' text) go to `out`; the rest of it is returned.
+        fn breaks<'a>(rest: &'a str, out: &mut String) -> &'a str {
+            let n = rest.len() - rest.trim_start_matches([' ', '\n', '\r']).len();
+            for c in rest[..n].chars() {
+                if c == '\n' {
+                    let kept = out.trim_end_matches(' ').len();
+                    out.truncate(kept);
+                }
+                out.push(c);
+            }
+            &rest[n..]
+        }
+        let mut rest = plain;
+        let mut lined_up = true;
+        self.for_each_selected_cell(sel, |text, hidden, width| {
+            rest = breaks(rest, &mut out);
+            let mut chars = rest.chars();
+            if !text.iter().all(|&c| chars.next() == Some(c)) {
+                lined_up = false;
+                return false;
+            }
+            rest = chars.as_str();
+            if hidden {
+                out.extend(std::iter::repeat_n(' ', width));
+            } else {
+                out.extend(text);
+            }
+            true
+        })?;
+        if !lined_up || !breaks(rest, &mut out).is_empty() {
+            return None;
+        }
+        let kept = out.trim_end_matches(' ').len();
+        out.truncate(kept);
+        Some(out)
     }
 
     /// The selected text as the plain formatter has it (what `selection_text` matches where
@@ -1301,9 +1351,7 @@ impl Vt {
             Some(&sel),
         );
         let plain = String::from_utf8_lossy(&bytes).into_owned();
-        let blanked = self
-            .selected_cells(&sel)
-            .and_then(|c| blank_concealed(&c, &plain));
+        let blanked = self.blank_concealed(&sel, &plain);
         (plain, blanked)
     }
 
@@ -2159,54 +2207,6 @@ pub(crate) fn conceals(styled: &str) -> bool {
         _ => {}
     });
     any
-}
-
-/// A selected cell with text: its characters, whether it is concealed, how many cells it takes.
-pub(crate) struct SelCell {
-    text: Vec<char>,
-    hidden: bool,
-    width: usize,
-}
-
-/// `plain` (the plain formatter's copy of the selection whose cells are `cells`) with the
-/// characters of concealed cells turned into one blank per cell they take, trailing blanks of
-/// each line trimmed. `None` when the cells' characters are not the ones `plain` has.
-fn blank_concealed(cells: &[SelCell], plain: &str) -> Option<String> {
-    // Line the plain text's characters up with the cells': blanks and line breaks are the
-    // formatter's own.
-    let chars: Vec<char> = plain.chars().collect();
-    let mut out = String::with_capacity(plain.len());
-    let (mut i, mut k) = (0, 0);
-    while i < chars.len() {
-        let c = chars[i];
-        // The formatter's blanks and line breaks (other spaces are cells' text).
-        if matches!(c, ' ' | '\n' | '\r') {
-            if c == '\n' {
-                let kept = out.trim_end_matches(' ').len();
-                out.truncate(kept);
-            }
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        let cell = cells.get(k)?;
-        if !chars[i..].starts_with(&cell.text) {
-            return None;
-        }
-        if cell.hidden {
-            out.extend(std::iter::repeat_n(' ', cell.width));
-        } else {
-            out.extend(&cell.text);
-        }
-        i += cell.text.len();
-        k += 1;
-    }
-    if k != cells.len() {
-        return None;
-    }
-    let kept = out.trim_end_matches(' ').len();
-    out.truncate(kept);
-    Some(out)
 }
 
 /// The text of the formatter's styled (VT) output: escape sequences dropped, concealed
