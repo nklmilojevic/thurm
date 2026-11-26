@@ -3835,6 +3835,9 @@ impl Daemon {
             }
             Request::Input { pane, data } => {
                 self.with_input_pane(client.id, pane, |p, st| {
+                    if !data.is_empty() {
+                        self.typing_frozen(pane, st)?;
+                    }
                     self.used_by(client, st);
                     if !data.is_empty() {
                         st.typed = true;
@@ -3846,19 +3849,23 @@ impl Daemon {
                         self.pane_read(pane);
                     }
                     p.write(data);
-                })?;
+                    Ok::<_, String>(())
+                })??;
                 Ok(Response::Ok)
             }
             Request::Paste { pane, text } => {
                 self.with_input_pane(client.id, pane, |p, st| {
                     self.paste_text(client, pane, p, st, &text)
-                })?;
+                })??;
                 Ok(Response::Ok)
             }
             Request::Key { pane, key } => {
                 self.with_input_pane(client.id, pane, |p, st| {
-                    self.used_by(client, st);
+                    // Before encoding it (which scrolls and clears the selection): even a key
+                    // that types nothing waits out the hand-off.
+                    self.typing_frozen(pane, st)?;
                     let bytes = st.term.key(&key);
+                    self.used_by(client, st);
                     if !bytes.is_empty() {
                         st.typed = true;
                         st.agent.prompt.interrupted();
@@ -3867,7 +3874,8 @@ impl Daemon {
                         self.pane_read(pane);
                         p.write(bytes);
                     }
-                })?;
+                    Ok::<_, String>(())
+                })??;
                 Ok(Response::Ok)
             }
             Request::Mouse { pane, event } => {
@@ -4646,8 +4654,7 @@ impl Daemon {
             if !st.info.alive {
                 return Err("This terminal has closed.".to_owned());
             }
-            self.paste_text(&asker, pane, p, st, text);
-            Ok(())
+            self.paste_text(&asker, pane, p, st, text)
         })?
     }
 
@@ -4660,7 +4667,10 @@ impl Daemon {
         p: &Arc<Pane>,
         st: &mut PaneState,
         text: &str,
-    ) {
+    ) -> Result<(), String> {
+        if !text.is_empty() {
+            self.typing_frozen(pane, st)?;
+        }
         self.used_by(client, st);
         if !text.is_empty() {
             st.typed = true;
@@ -4672,6 +4682,7 @@ impl Daemon {
             self.pane_read(pane);
         }
         p.write(st.term.paste(text));
+        Ok(())
     }
 
     /// [`Request::Ext`]: a method of the extension API, its parameters and result as JSON text.
@@ -6828,9 +6839,48 @@ mod tests {
         daemon.set_upgrading(true);
         assert!(input(waiting).is_err());
         assert!(input(ticketed).is_err());
+        let paste = daemon.dispatch(
+            &client,
+            Request::Paste {
+                pane: waiting,
+                text: "a".into(),
+            },
+        );
+        assert!(paste.is_err());
+        let key = thurm_proto::KeyEvent {
+            key: thurm_proto::Key::Char('a'),
+            mods: 0,
+            action: thurm_proto::KeyAction::Press,
+            text: "a".into(),
+            shifted: None,
+            base_layout: None,
+        };
+        let typed = daemon.dispatch(
+            &client,
+            Request::Key {
+                pane: ticketed,
+                key,
+            },
+        );
+        assert!(typed.is_err());
         assert!(!daemon.pane(waiting).unwrap().state.lock().typed);
+        assert!(!daemon.pane(ticketed).unwrap().state.lock().typed);
         // Nothing to cancel in the others.
         assert!(input(plain).is_ok());
+        // A resize types nothing: it goes through.
+        let size = PaneSize {
+            cols: 91,
+            rows: 27,
+            ..PaneSize::default()
+        };
+        for pane in [waiting, ticketed] {
+            let resized = daemon.dispatch(&client, Request::Resize { pane, size });
+            assert!(resized.is_ok(), "{resized:?}");
+            let p = daemon.pane(pane).unwrap();
+            let st = p.state.lock();
+            assert_eq!(st.info.size.cols, 91);
+            assert!(!st.typed);
+        }
         // The upgrade gave up: input goes through again, and cancels the resume.
         daemon.set_upgrading(false);
         assert!(input(waiting).is_ok());
