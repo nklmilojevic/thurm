@@ -190,6 +190,9 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
             principal.via.as_deref().unwrap_or("?")
         );
     }
+    if principal.kind == thurm_proto::PrincipalKind::Peer {
+        *client.peer_pid.lock() = thurm_config::peer_pid(&stream);
+    }
     *client.principal.lock() = Some(principal);
     *client.socket.lock() = stream.try_clone().ok();
     let write_stream = match stream.try_clone() {

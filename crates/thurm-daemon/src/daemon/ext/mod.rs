@@ -1420,7 +1420,7 @@ pub fn verifies_its_app() -> bool {
 /// Whether a desktop UI whose app cannot be identified (a daemon outside an app bundle: a
 /// development build, the tests) may still be asked what plugins ask: only when whoever
 /// started the daemon said so, with `THURM_TRUST_UI_CLIENTS=1`. Otherwise no client is.
-fn unverified_ui_allowed() -> bool {
+pub(crate) fn unverified_ui_allowed() -> bool {
     std::env::var_os("THURM_TRUST_UI_CLIENTS").is_some_and(|v| v == "1")
 }
 

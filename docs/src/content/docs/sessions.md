@@ -141,7 +141,9 @@ until it loads.
 To disable a built-in rule, add an entry with its `name` and `enabled = false`. Set
 `session.resume_programs = "all"` to trust any verified report from an unwrapped process,
 or `"off"` to disable OSC 7577 resumption. Inspect held records and their trust status
-with `thurm resume` (or `thurm resume --all --json`).
+with `thurm resume` (or `thurm resume --all --json`). The records hold the programs'
+arguments, so the daemon answers only the `thurm` command run on the same machine as the
+same user: not the phone app, a tailnet device, or a connection forwarded over SSH.
 
 ## Daemon controls
 

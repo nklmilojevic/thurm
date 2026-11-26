@@ -253,7 +253,9 @@ impl Store {
                 .recursive(true)
                 .mode(0o700)
                 .create(&self.dir)?;
-        } else {
+        } else if snap.panes.iter().any(|p| p.program_resume.is_some()) {
+            // Only for resume records (trusted on the next start only from a private
+            // directory): a snapshot without them leaves the directory's access as it is.
             make_private(&self.dir);
         }
         let mut value = serde_json::to_value(snap).map_err(std::io::Error::other)?;
@@ -786,6 +788,15 @@ mod tests {
         store.save(&snap).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
         assert!(store.load().unwrap().panes[0].program_resume.is_none());
+        // A snapshot without records leaves the directory's access as it is (program resume
+        // off, or nothing reported).
+        let mut plain = snap.clone();
+        for p in &mut plain.panes {
+            p.program_resume = None;
+        }
+        store.save(&plain).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o775);
         store.save(&snap).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);

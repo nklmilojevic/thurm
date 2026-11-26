@@ -1646,6 +1646,47 @@ pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
     }
 }
 
+/// The pid of the process at the other end of `stream`, where the system says it (Linux's
+/// `SO_PEERCRED`, Apple's `LOCAL_PEERPID`).
+#[cfg(unix)]
+pub fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        (libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        ) == 0
+            && cred.pid > 0)
+            .then_some(cred.pid as u32)
+    }
+    #[cfg(target_vendor = "apple")]
+    unsafe {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        (libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        ) == 0
+            && pid > 0)
+            .then_some(pid as u32)
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
 /// Where the app keeps its end of each remote tunnel (`<name>.sock`) and the tunnel's state
 /// (`<name>.state`, read by `thurm --remote`): `~/Library/Caches/Thurm/remote` on macOS,
 /// `$XDG_CACHE_HOME/thurm/remote` elsewhere. `THURM_REMOTE_DIR` overrides it.

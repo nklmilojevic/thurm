@@ -365,6 +365,8 @@ pub struct Client {
     pub push_device: Mutex<Option<String>>,
     /// The connection, to drop it from outside its reader (a revoked phone).
     pub socket: Mutex<Option<std::os::unix::net::UnixStream>>,
+    /// The connecting process, for a local peer (see [`Client::is_local_cli`]).
+    pub peer_pid: Mutex<Option<u32>>,
     /// Dropped by `RevokePhone`: it may no longer register for push or follow an agent.
     pub revoked: AtomicBool,
     /// Its panes follow the active client's size ([`thurm_proto::CAP_ACTIVE_SIZE`]).
@@ -498,6 +500,24 @@ impl Client {
         self.principal.lock().as_ref().is_none_or(|p| {
             p.kind == thurm_proto::PrincipalKind::Peer && p.uid == Some(unsafe { libc::getuid() })
         })
+    }
+
+    /// Whether this is the `thurm` CLI of this user on this machine: a local peer whose
+    /// executable is named `thurm`. What only the CLI asks for and carries programs' arguments
+    /// ([`Request::ResumeRecords`]) is for it alone: a same-user socket forward over SSH comes
+    /// from `sshd`, whose caller may have no shell here. (A process of the user here could pose
+    /// as the CLI, but it can already type into the panes.) Unknown: not the CLI. A daemon
+    /// started with `THURM_TRUST_UI_CLIENTS=1` (tests) takes any local peer.
+    pub fn is_local_cli(&self) -> bool {
+        if !self.is_local_peer() {
+            return false;
+        }
+        if crate::daemon::ext::unverified_ui_allowed() {
+            return true;
+        }
+        let pid = *self.peer_pid.lock();
+        pid.and_then(crate::procinfo::exe_path)
+            .is_some_and(|exe| is_cli_executable(&exe))
     }
 
     /// `n` clipboard bytes left the queue. Never below zero: after [`Client::writer_ended`]
@@ -716,6 +736,11 @@ pub(crate) struct ResumeTicket {
     /// [`resume_policy`] of the configuration that let the program resume: redeemed only while
     /// the configuration still says the same.
     pub policy: String,
+}
+
+/// Whether `exe` is the `thurm` CLI (by name: see [`Client::is_local_cli`]).
+fn is_cli_executable(exe: &std::path::Path) -> bool {
+    exe.file_name().is_some_and(|n| n == "thurm")
 }
 
 /// A digest of what decides which programs resume (`resume_programs` and the effective
@@ -1099,6 +1124,7 @@ impl Daemon {
             exit: parking_lot::ReentrantMutex::new(()),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
+            peer_pid: Mutex::new(None),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),
@@ -4529,9 +4555,9 @@ impl Daemon {
             }),
             Request::ResumeRecords { pane } => {
                 // The records hold programs' arguments, which can carry credentials (sealed on
-                // disk for that reason): only this user's own processes on this machine (the
-                // `thurm resume` CLI), never a remote or mobile client.
-                if !client.is_local_peer() {
+                // disk for that reason): only for the `thurm resume` CLI of this user on this
+                // machine, never a remote, mobile or SSH-forwarded client.
+                if !client.is_local_cli() {
                     return Err("not allowed".into());
                 }
                 let (mode, rules) = {
@@ -5835,6 +5861,7 @@ mod tests {
             exit: parking_lot::ReentrantMutex::new(()),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
+            peer_pid: Mutex::new(None),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),
@@ -6692,10 +6719,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The resume records hold programs' arguments (credentials too): only a local process of
-    /// this user may list them, not a tailnet or mobile client.
+    /// The resume records hold programs' arguments (credentials too): only the `thurm` CLI of
+    /// this user on this machine may list them; not a tailnet or mobile client, nor a same-user
+    /// connection from another program (an SSH socket forward comes from `sshd`).
     #[test]
-    fn resume_records_are_for_local_peers_only() {
+    fn resume_records_are_for_the_local_cli_only() {
+        use std::path::Path;
+        assert!(is_cli_executable(Path::new("/usr/local/bin/thurm")));
+        assert!(is_cli_executable(Path::new(
+            "/Applications/Thurm.app/Contents/MacOS/thurm"
+        )));
+        assert!(!is_cli_executable(Path::new("/usr/sbin/sshd")));
+        assert!(!is_cli_executable(Path::new("/usr/libexec/sshd-session")));
+        assert!(!is_cli_executable(Path::new("/opt/thurm/thurmd")));
+
         let dir = test_dir("records-local");
         let daemon = Daemon::new(
             Config::default(),
@@ -6703,16 +6740,23 @@ mod tests {
             dir.join("state"),
             Arc::new(AtomicBool::new(false)),
         );
-        let (local, _rx) = daemon.add_client();
-        let got = daemon.dispatch(&local, Request::ResumeRecords { pane: None });
-        assert!(matches!(&got, Ok(Response::ResumeRecords(_))), "{got:?}");
-        let (remote, _rx2) = daemon.add_client();
+        let records =
+            |client: &Arc<Client>| daemon.dispatch(client, Request::ResumeRecords { pane: None });
+        let refused = |got: &Result<Response, String>| matches!(got, Err(e) if e == "not allowed");
+        // A local peer whose process is unknown, or is not the CLI (this test binary).
+        let (unknown, _rx) = daemon.add_client();
+        assert!(refused(&records(&unknown)));
+        let (other, _rx2) = daemon.add_client();
+        *other.peer_pid.lock() = Some(std::process::id());
+        assert!(refused(&records(&other)));
+        // A tailnet caller, whatever its process.
+        let (remote, _rx3) = daemon.add_client();
         *remote.principal.lock() = Some(thurm_proto::Principal {
             kind: thurm_proto::PrincipalKind::Tailscale,
             ..Default::default()
         });
-        let got = daemon.dispatch(&remote, Request::ResumeRecords { pane: None });
-        assert!(matches!(&got, Err(e) if e == "not allowed"), "{got:?}");
+        *remote.peer_pid.lock() = Some(std::process::id());
+        assert!(refused(&records(&remote)));
         let _ = std::fs::remove_dir_all(dir);
     }
 
