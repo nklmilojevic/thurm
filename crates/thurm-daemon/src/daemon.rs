@@ -677,8 +677,10 @@ enum RestoreLaunch<'a> {
 }
 
 /// Whether the pane command `cmd` starts the same program with the same arguments as `program`
-/// `args` (the configured shell): the same file, whether named by path or looked up on `PATH`.
+/// `args` (the configured shell): the same file, whether named by path or looked up on `PATH`,
+/// by the same name (a shell reads its name: `sh` linked to Bash runs Bash as a POSIX shell).
 fn same_invocation(cmd: &[String], program: &str, args: &[String]) -> bool {
+    let name = |prog: &str| Path::new(prog).file_name().map(|n| n.to_owned());
     let resolve = |prog: &str| -> Option<std::path::PathBuf> {
         let found = if prog.contains('/') {
             std::path::PathBuf::from(prog)
@@ -693,7 +695,10 @@ fn same_invocation(cmd: &[String], program: &str, args: &[String]) -> bool {
     };
     match cmd.split_first() {
         Some((first, rest)) => {
-            rest == args && resolve(first).is_some_and(|a| resolve(program) == Some(a))
+            rest == args
+                && name(first).is_some()
+                && name(first) == name(program)
+                && resolve(first).is_some_and(|a| resolve(program) == Some(a))
         }
         None => false,
     }
@@ -6568,6 +6573,14 @@ mod tests {
         assert!(same_invocation(std::slice::from_ref(&a_s), &a_s, &[]));
         // The same file by another path.
         assert!(same_invocation(&[s(&dir.join("c/sh"))], &a_s, &[]));
+        // The same file by another name (`sh` linked to `bash`): it may run differently.
+        std::os::unix::fs::symlink(&a, dir.join("c/bash")).unwrap();
+        assert!(!same_invocation(&[s(&dir.join("c/bash"))], &a_s, &[]));
+        assert!(!same_invocation(
+            std::slice::from_ref(&a_s),
+            &s(&dir.join("c/bash")),
+            &[]
+        ));
         assert!(!same_invocation(&[s(&b)], &a_s, &[]));
         // The configured arguments must come along, and nothing else.
         assert!(!same_invocation(
