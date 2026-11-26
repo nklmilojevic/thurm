@@ -14,6 +14,7 @@ mod path_search;
 mod persist;
 mod ports;
 mod procinfo;
+mod program_resume;
 mod pty;
 mod push;
 mod server;
@@ -32,7 +33,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thurm_config::Config;
 
@@ -70,6 +71,21 @@ fn parse_args() -> Args {
                 upgrade::print_check();
                 std::process::exit(0);
             }
+            "--exec-resume" => {
+                let Some(ticket) = it.next() else {
+                    eprintln!("thurmd: --exec-resume requires a ticket");
+                    std::process::exit(2);
+                };
+                // `--or-shell PROGRAM [ARGS...]` (the rest of the arguments): what to start
+                // when the resume fails, for a pane whose only process this is (it would close,
+                // with the reason, otherwise).
+                let fallback: Vec<String> = if it.next().as_deref() == Some("--or-shell") {
+                    it.collect()
+                } else {
+                    Vec::new()
+                };
+                program_resume::exec_resume(&ticket, &fallback);
+            }
             "--socket" => args.socket = it.next().map(PathBuf::from),
             "--no-restore" => args.no_restore = true,
             "--version" | "-V" => {
@@ -95,11 +111,19 @@ fn parse_args() -> Args {
     args
 }
 
+/// How long a requested upgrade waits for restored programs to resume before cancelling the
+/// rest (well within the 15 s `thurm daemon upgrade` waits for the new daemon).
+const UPGRADE_RESUME_WAIT: Duration = Duration::from_secs(5);
+
 fn main() {
     let args = parse_args();
     let (config, config_warnings) = Config::load_with_warnings().unwrap_or_else(|e| {
         eprintln!("thurmd: config error, using defaults: {e}");
-        (Config::default(), Vec::new())
+        // The broken file may be the one that turned program resume (or a rule) off: the
+        // defaults must not run a saved command the user meant to stop.
+        let mut config = Config::default();
+        config.session.resume_programs = thurm_config::ResumeProgramsMode::Off;
+        (config, Vec::new())
     });
     let args_socket_default = args.socket.is_none() && std::env::var_os("THURM_SOCKET").is_none();
     let socket = args.socket.unwrap_or_else(thurm_config::socket_path);
@@ -242,6 +266,7 @@ fn main() {
     }
 
     // Main thread: wait for a shutdown request or a signal.
+    let mut upgrade_waiting: Option<Instant> = None;
     loop {
         std::thread::sleep(Duration::from_millis(100));
         if term.load(Ordering::Relaxed) {
@@ -254,7 +279,14 @@ fn main() {
             daemon.wait_clients_flushed(Duration::from_millis(500));
             break;
         }
-        if upgrade_requested.swap(false, Ordering::Relaxed) {
+        // A restored program still waiting to resume gets a moment to (its shell starting);
+        // what is left then is cancelled by the upgrade.
+        let resumes_wait = upgrade_requested.load(Ordering::Relaxed)
+            && daemon.resumes_pending()
+            && *upgrade_waiting.get_or_insert_with(Instant::now) + UPGRADE_RESUME_WAIT
+                > Instant::now();
+        if !resumes_wait && upgrade_requested.swap(false, Ordering::Relaxed) {
+            upgrade_waiting = None;
             // Returns only when the upgrade could not happen; we carry on as before.
             upgrade::perform(
                 &daemon,

@@ -15,6 +15,9 @@ mod layouts;
 #[path = "e2e/program_status.rs"]
 mod program_status;
 
+#[path = "e2e/program_resume.rs"]
+mod program_resume;
+
 #[path = "e2e/mobile.rs"]
 mod mobile;
 
@@ -149,6 +152,8 @@ impl Env {
     }
 
     fn connect(&self) -> (Arc<Client>, Receiver<Event>) {
+        // Where this test's resume records are asked for (see `program_resume::resume_records`).
+        program_resume::RECORDS_SOCKET.with(|s| *s.borrow_mut() = Some(self.socket.clone()));
         let (tx, rx) = unbounded();
         let c = Client::connect(
             ConnectOptions {

@@ -87,3 +87,71 @@ _thurm_precmd_last() {
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd _thurm_precmd_last
 add-zsh-hook preexec _thurm_preexec
+
+# One-shot program resume after a restart (Thurm session restore). It runs as the first
+# prompt's command line once zle starts: after every precmd hook .zshrc added (direnv, mise,
+# whatever their names), as an ordinary interactive job (Ctrl-Z, fg), and outside any hook,
+# so a failure neither skips the prompt marks nor ends the shell. The ticket is a bearer
+# secret: never expanded where xtrace (set by a startup file) would print it.
+if (( ${#${_thurm_resume_ticket-}} && ${#${_thurm_resume_exec-}} )); then
+  # The command line holds only this function's name: zsh redraws an accepted line, and
+  # preexec hooks (Thurm's command-line report among them) see it, so the single-use ticket
+  # and the helper's path stay in these private variables until it runs.
+  _thurm_resume_run() {
+    builtin setopt LOCAL_OPTIONS NO_XTRACE
+    builtin unfunction _thurm_resume_run
+    local exec="${_thurm_resume_exec-}" ticket="${_thurm_resume_ticket-}"
+    _thurm_resume_ticket=""
+    _thurm_resume_exec=""
+    [[ -n "$exec" && -n "$ticket" ]] || return 0
+    command "$exec" --exec-resume "$ticket" || :
+  }
+  _thurm_resume_line_init() {
+    add-zle-hook-widget -d line-init _thurm_resume_line_init
+    (( ${#${_thurm_resume_ticket-}} )) || return 0
+    # Typed ahead of this prompt: that line is the user's, and the resume is dropped (the
+    # daemon refuses the ticket after typing anyway).
+    if (( ${PENDING:-0} || ${KEYS_QUEUED_COUNT:-0} )); then
+      _thurm_resume_ticket=""
+      _thurm_resume_exec=""
+      builtin unfunction _thurm_resume_run 2>/dev/null
+      return 0
+    fi
+    # Never the program's arguments, the helper or the ticket: only a fixed name. The leading
+    # space and the history hook keep it out of history.
+    BUFFER=" _thurm_resume_run"
+    add-zsh-hook zshaddhistory _thurm_resume_nohist
+    zle .accept-line
+  }
+  _thurm_resume_nohist() {
+    add-zsh-hook -d zshaddhistory _thurm_resume_nohist
+    return 1
+  }
+  # Armed at the first prompt, once .zshrc defined its own zle hooks (kept and run too).
+  _thurm_resume_arm() {
+    # The precmd hooks after this one (those .zshrc added), which zsh runs after it this time.
+    local -a later=("${(@)precmd_functions[${precmd_functions[(ie)_thurm_resume_arm]}+1,-1]}")
+    add-zsh-hook -d precmd _thurm_resume_arm
+    if [[ -o zle ]]; then
+      autoload -Uz add-zle-hook-widget
+      zle -N _thurm_resume_line_init
+      add-zle-hook-widget line-init _thurm_resume_line_init
+      return 0
+    fi
+    # No line editor (.zshrc turned ZLE off): no command line to run it as, so it runs from
+    # this hook, after the startup files. zsh fixed this round's hook list before .zshrc's
+    # hooks could come ahead of this one, so they run here first (the program is looked up on
+    # the PATH they make), and again after it, as after any command. It is a command, not the
+    # prompt, while it runs (the prompt marks come again after it); the daemon refuses the
+    # ticket if anything was typed first.
+    local f
+    for f in "${(@)later:#_thurm_*}"; do
+      if (( ${+functions[$f]} )); then "$f" || :; fi
+    done
+    builtin printf '\e]133;C\a'
+    _thurm_executing=1
+    _thurm_resume_run
+    _thurm_precmd
+  }
+  add-zsh-hook precmd _thurm_resume_arm
+fi

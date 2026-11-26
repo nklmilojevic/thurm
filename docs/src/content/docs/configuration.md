@@ -70,7 +70,7 @@ settings override theme colors.
 | `colors` | Theme and individual colors |
 | `terminal` | Shell, scrollback, protocols, selection, and shell integration |
 | `terminal.env` | Environment variables for shell processes |
-| `session` | Saved sessions, quit behavior, and agent resume |
+| `session` | Saved sessions, quit behavior, program resume (OSC 7577), and agent resume |
 | `security` | Secure input and paste confirmation |
 | `notifications` | Agent, command, program, and bell notifications |
 | `agents` | Detection, launch presets, and custom definitions |

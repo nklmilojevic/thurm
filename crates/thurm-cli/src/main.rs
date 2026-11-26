@@ -515,6 +515,16 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<layouts::LayoutCmd>,
     },
+    /// Show Program Resume Protocol (OSC 7577) records held for panes and their trust status.
+    Resume {
+        /// Pane to inspect (defaults to the local `$THURM_PANE_ID`, except with `--remote`;
+        /// otherwise lists all panes).
+        #[arg(short, long)]
+        pane: Option<PaneId>,
+        /// Show records for every pane.
+        #[arg(short, long, conflicts_with = "pane")]
+        all: bool,
+    },
     /// Stream state changes as JSON Lines.
     Events {
         #[arg(long)]
@@ -1168,6 +1178,68 @@ fn run(cli: Cli) -> R {
 
 fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control() && *c != ';').collect()
+}
+
+/// Control and invisible/bidi formatting characters, escaped wherever OSC 7577 commands are
+/// displayed (a reported argument could otherwise hide text or visually reorder the command).
+fn resume_display_escaped(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0000}'..='\u{001F}'
+            | '\u{007F}'..='\u{009F}'
+            | '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
+}
+
+/// Escapes control and invisible/bidi formatting characters when displaying OSC 7577 commands.
+fn escape_resume_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if resume_display_escaped(c) {
+            out.push_str(&format!("\\u{{{:04X}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Serialized JSON with every [`resume_display_escaped`] character the serializer left literal
+/// written as a `\uXXXX` escape instead: the same JSON value, safe to view. The serializer
+/// escapes C0 controls inside strings itself, so the ones left are the layout's own whitespace;
+/// the rest can only occur inside strings (the structure is ASCII), and all are in the BMP.
+fn escape_resume_json(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c > '\u{001F}' && resume_display_escaped(c) {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// One resume argument for display, its boundaries visible: quoted shell-style unless it is
+/// non-empty and plain, with control and invisible characters escaped inside.
+fn quote_resume_arg(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if plain {
+        arg.to_owned()
+    } else {
+        format!("'{}'", escape_resume_display(&arg.replace('\'', "'\\''")))
+    }
 }
 
 fn daemon_cmd(action: &str, json: bool) -> R {
@@ -1916,6 +1988,64 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool, remote: Option<&str>) -> R {
                         format!("{:?}", i.kind),
                         i.description.as_deref().unwrap_or("")
                     );
+                }
+            }
+        }
+        Cmd::Resume { pane, all } => {
+            let target = if all {
+                None
+            } else {
+                pane.or_else(|| {
+                    (!remote_mode())
+                        .then(|| std::env::var(ENV_PANE_ID).ok()?.parse().ok())
+                        .flatten()
+                })
+            };
+            let Response::ResumeRecords(list) =
+                c.request(Request::ResumeRecords { pane: target })?
+            else {
+                return Err("unexpected response".into());
+            };
+            if json {
+                println!(
+                    "{}",
+                    escape_resume_json(&serde_json::to_string_pretty(&list)?)
+                );
+            } else {
+                let mut any = false;
+                println!(
+                    "{:<5} {:<7} {:<7} {:<18} COMMAND",
+                    "PANE", "PID", "CHOSEN", "TRUST"
+                );
+                for p in &list {
+                    for r in &p.records {
+                        any = true;
+                        let chosen = if r.chosen { "*" } else { "-" };
+                        let trust = if r.trusted {
+                            match &r.rule {
+                                Some(rule) => format!("trusted ({})", escape_resume_display(rule)),
+                                None => "trusted".into(),
+                            }
+                        } else {
+                            format!(
+                                "untrusted ({})",
+                                r.untrusted_reason.as_deref().unwrap_or("unknown")
+                            )
+                        };
+                        let cmd = r
+                            .argv
+                            .iter()
+                            .map(|a| quote_resume_arg(a))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        println!(
+                            "{:<5} {:<7} {:<7} {:<18} {cmd}",
+                            p.pane, r.pid, chosen, trust
+                        );
+                    }
+                }
+                if !any {
+                    println!("(no program resume records)");
                 }
             }
         }
@@ -2850,5 +2980,36 @@ mod tests {
                 .contains("can't tell yet")
         );
         assert!(same_tab(None, 1, 2).unwrap_err().contains("can't tell yet"));
+    }
+
+    #[test]
+    fn resume_all_conflicts_with_pane() {
+        assert!(Cli::try_parse_from(["thurm", "resume", "--all", "--pane", "3"]).is_err());
+        assert!(Cli::try_parse_from(["thurm", "resume", "-a"]).is_ok());
+        assert!(Cli::try_parse_from(["thurm", "resume", "-p", "3"]).is_ok());
+    }
+
+    #[test]
+    fn resume_json_escapes_bidi_and_c1_but_decodes_the_same() {
+        let argv = vec![
+            "vim".to_owned(),
+            "evil\u{202E}txt.\u{2066}sh\u{0085}\u{00AD}\u{FEFF}".to_owned(),
+            "tab\there \"quoted\" \u{00E9}".to_owned(),
+        ];
+        let json = escape_resume_json(&serde_json::to_string_pretty(&argv).unwrap());
+        assert!(
+            !json
+                .chars()
+                .any(|c| c > '\u{001F}' && resume_display_escaped(c)),
+            "{json}"
+        );
+        assert!(
+            json.contains("\\u202e") && json.contains("\\u0085"),
+            "{json}"
+        );
+        // Ordinary non-ASCII stays as it is.
+        assert!(json.contains('\u{00E9}'));
+        let back: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, argv);
     }
 }

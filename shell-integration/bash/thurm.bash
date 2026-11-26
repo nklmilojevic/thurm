@@ -1,5 +1,13 @@
 # Thurm bash integration: OSC 133 prompt marks, OSC 7 working directory.
 #
+# Capture and remove one-shot program resume handoff variables before user startup files run
+# so subshells or multiplexers launched from startup files never inherit them.
+if [[ -n "${THURM_RESUME_TICKET-}" && -n "${THURM_RESUME_EXEC-}" ]]; then
+  _thurm_resume_ticket="$THURM_RESUME_TICKET"
+  _thurm_resume_exec="$THURM_RESUME_EXEC"
+  builtin unset THURM_RESUME_TICKET THURM_RESUME_EXEC
+fi
+#
 # Bash is started as `bash --rcfile <this file> -i`. Emulate the usual startup files first.
 if [[ -n "${THURM_BASH_LOGIN-}" ]]; then
   builtin unset THURM_BASH_LOGIN
@@ -95,6 +103,24 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
     _thurm_executing=""
     builtin printf '\e]7;file://%s%s\a' "$HOSTNAME" "${PWD// /%20}"
     _thurm_report_path
+    # The ticket is a bearer secret: untraced under a `set -x` from .bashrc (tested by
+    # substitution, which a trace shows instead of the value). The helper runs in a subshell
+    # that turns tracing off for itself, so this shell's own xtrace is never touched: Ctrl-C
+    # on the resumed job unwinds this function, and nothing after the job would run to turn
+    # tracing back on. The ticket is marked used before the job starts; an interrupt leaves
+    # the clearing to the next prompt, which never tries it again.
+    if [[ -n "${_thurm_resume_ticket:+1}" && -n "${_thurm_resume_exec:+1}" ]]; then
+      if [[ -z "${_thurm_resume_started-}" ]]; then
+        _thurm_resume_started=1
+        # A failed resume (gone program, unreachable daemon) must not end the shell under
+        # `set -e`: the prompt still comes.
+        (
+          builtin set +x
+          builtin exec "$_thurm_resume_exec" --exec-resume "$_thurm_resume_ticket"
+        ) || :
+      fi
+      builtin unset _thurm_resume_ticket _thurm_resume_exec _thurm_resume_started
+    fi
     builtin printf '\e]133;A\a'
     if [[ "$PS1" != *'133;B'* ]]; then
       PS1="${PS1}"'\[\e]133;B\a\]'

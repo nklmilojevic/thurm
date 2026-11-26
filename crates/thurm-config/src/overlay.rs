@@ -32,6 +32,24 @@ pub fn read(overlay: &Path) -> io::Result<String> {
     }
 }
 
+/// Like [`read`], but only a missing file is empty: a symlink to a file that is missing (a
+/// volume not mounted, a dotfiles checkout not there yet) is an error, since the settings it
+/// points to may be ones the load must not go without. Writes still go through such a link
+/// (see [`crate::replace_file`]).
+pub fn read_for_load(overlay: &Path) -> io::Result<String> {
+    match std::fs::read_to_string(overlay) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match std::fs::symlink_metadata(overlay) {
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "links to a file that does not exist",
+            )),
+            Err(_) => Ok(String::new()),
+        },
+        Err(e) => Err(e),
+    }
+}
+
 /// Whether the overlay text sets `key` (a dotted path such as `font.size`).
 pub fn holds(overlay: &str, key: &str) -> bool {
     toml::from_str::<Table>(overlay)
@@ -47,6 +65,8 @@ pub struct Merged {
     pub warnings: Vec<String>,
     /// The overlay's settings that took effect, as dotted paths (a table's contents by path).
     pub applied: Vec<String>,
+    /// The overlay's settings left out, as dotted paths; `["*"]` when it did not parse at all.
+    pub rejected: Vec<String>,
 }
 
 /// `base` (the text of `config.toml`) with `overlay` merged over it. The overlay cannot fail a
@@ -63,6 +83,7 @@ pub fn merge(base: &str, overlay: &str) -> Result<Merged, String> {
                 text: base.to_owned(),
                 warnings: vec![format!("settings.toml ignored: {e}")],
                 applied: vec![],
+                rejected: vec!["*".to_owned()],
             });
         }
     };
@@ -75,6 +96,7 @@ pub fn merge(base: &str, overlay: &str) -> Result<Merged, String> {
             text: base.to_owned(),
             warnings,
             applied: vec![],
+            rejected: vec![],
         });
     }
     let mut merged = base_table.clone();
@@ -89,11 +111,13 @@ pub fn merge(base: &str, overlay: &str) -> Result<Merged, String> {
             text: whole,
             warnings,
             applied,
+            rejected: vec![],
         });
     }
     // Something in the overlay is wrong: keep every setting that works, one at a time.
     let mut current = base_table;
     let mut applied = Vec::new();
+    let mut rejected = Vec::new();
     for (path, value) in settings {
         let key = path.join(".");
         let mut alone = Table::new();
@@ -108,8 +132,14 @@ pub fn merge(base: &str, overlay: &str) -> Result<Merged, String> {
                 current = candidate;
                 applied.push(key);
             }
-            Ok(_) => warnings.push(format!("settings.toml: {key} is not a setting, ignored")),
-            Err(e) => warnings.push(format!("settings.toml: {key} ignored: {e}")),
+            Ok(_) => {
+                warnings.push(format!("settings.toml: {key} is not a setting, ignored"));
+                rejected.push(key);
+            }
+            Err(e) => {
+                warnings.push(format!("settings.toml: {key} ignored: {e}"));
+                rejected.push(key);
+            }
         }
     }
     let text = toml::to_string(&current).map_err(|e| e.to_string())?;
@@ -117,6 +147,7 @@ pub fn merge(base: &str, overlay: &str) -> Result<Merged, String> {
         text,
         warnings,
         applied,
+        rejected,
     })
 }
 

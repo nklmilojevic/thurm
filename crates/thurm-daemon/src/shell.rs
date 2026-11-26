@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use thurm_config::{Config, Osc52Mode};
-use thurm_proto::{ENV_CLIP_SHIMS, ENV_PANE_ID, ENV_SOCKET, PaneId, PaneSize};
+use thurm_proto::{ENV_CLIP_SHIMS, ENV_OSC7577_TOKEN, ENV_PANE_ID, ENV_SOCKET, PaneId, PaneSize};
 
 use crate::pty::SpawnOptions;
 
@@ -82,6 +82,128 @@ pub struct PaneLaunch<'a> {
     pub integration_dir: Option<&'a Path>,
     /// Passed to the shell integration, which puts it in front of its `$PATH` reports.
     pub token: &'a str,
+    /// Per-pane random token for the Program Resume Protocol (`OSC7577_TOKEN`), if enabled.
+    pub resume_token: Option<&'a str>,
+    /// `(thurmd_exe, ticket)` for the zsh/bash/fish integration to redeem at the first prompt
+    /// (see [`uses_hook_resume`]): the single-use ticket, never the command.
+    pub resume_hook: Option<(&'a Path, &'a str)>,
+}
+
+/// The shell program and args configured for interactive panes (with login shell fallback).
+pub fn interactive_shell(cfg: &Config) -> (String, Vec<String>) {
+    match &cfg.terminal.shell {
+        Some(v) if !v.is_empty() => (v[0].clone(), v[1..].to_vec()),
+        _ => (user_shell(), Vec::new()),
+    }
+}
+
+/// Whether zsh `args` leave its startup files on (`rcs`) and its line editor on (`zle`), as zsh
+/// reads its options: letters in `-`/`+` clusters (`-f` is `NO_RCS`, `+Z` turns ZLE off),
+/// `-o name`/`+o name` (separate or attached: `-onorcs`, `+ozle`) and `--name`, with names in any
+/// spelling zsh accepts (case, `_` and `-` ignored, a `no` prefix inverting), the last one
+/// winning. Options end at `--`, `-` or the first operand (a script).
+fn zsh_rcs_and_zle(args: &[String]) -> (bool, bool) {
+    let (mut rcs, mut zle) = (true, true);
+    let mut set = |name: &str, on: bool| {
+        let name: String = name
+            .chars()
+            .filter(|c| *c != '_' && *c != '-')
+            .flat_map(char::to_lowercase)
+            .collect();
+        let (name, on) = match name.strip_prefix("no") {
+            Some(rest) => (rest, !on),
+            None => (name.as_str(), on),
+        };
+        match name {
+            "rcs" => rcs = on,
+            "zle" => zle = on,
+            _ => {}
+        }
+    };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--" || a == "-" {
+            break;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            set(long, true);
+            continue;
+        }
+        let (on, letters) = match (a.strip_prefix('-'), a.strip_prefix('+')) {
+            (Some(l), _) => (true, l),
+            (_, Some(l)) => (false, l),
+            _ => break,
+        };
+        for (i, c) in letters.char_indices() {
+            match c {
+                // The rest of the cluster names the option, else the next argument does.
+                'o' => {
+                    let rest = &letters[i + 1..];
+                    let name = if rest.is_empty() {
+                        it.next().map(String::as_str)
+                    } else {
+                        Some(rest)
+                    };
+                    if let Some(name) = name {
+                        set(name, on);
+                    }
+                    break;
+                }
+                'f' => set("rcs", !on),
+                'Z' => set("zle", on),
+                _ => {}
+            }
+        }
+    }
+    (rcs, zle)
+}
+
+/// Whether `cfg` launches zsh, bash or fish with Thurm's shell integration loaded, so a
+/// restored foreground job can run from the shell's own first-prompt hook, once its startup
+/// files are done (nothing is typed into the terminal). Shells started with their startup
+/// files off (`zsh -f`, `fish --no-config`) never load the integration, and zsh without its
+/// line editor (`zsh --no-zle`) never runs the hook's widget: they get the typed line.
+pub fn uses_hook_resume(cfg: &Config, integration_dir: Option<&Path>) -> bool {
+    if !cfg.terminal.shell_integration || integration_dir.is_none() {
+        return false;
+    }
+    let (program, args) = interactive_shell(cfg);
+    let short_flag = |c: char| {
+        args.iter()
+            .any(|a| a.len() > 1 && a.starts_with('-') && !a.starts_with("--") && a.contains(c))
+    };
+    let long_flag = |names: &[&str]| args.iter().any(|a| names.contains(&a.as_str()));
+    match program.rsplit('/').next().unwrap_or(&program) {
+        "zsh" => zsh_rcs_and_zle(&args) == (true, true),
+        "bash" => args.is_empty(),
+        "fish" => !short_flag('N') && !long_flag(&["--no-config"]),
+        _ => false,
+    }
+}
+
+const ENV_RESUME_EXEC: &str = "THURM_RESUME_EXEC";
+const ENV_RESUME_TICKET: &str = "THURM_RESUME_TICKET";
+/// The fish integration script a restored fish sources from its `-C` command (a path as
+/// data, never interpolated into the command).
+const ENV_RESUME_INIT: &str = "THURM_RESUME_INIT";
+
+/// Sets `key` in `env` (replacing an earlier value).
+fn set_env(env: &mut [(String, String)], key: &str, value: String) {
+    if let Some(e) = env.iter_mut().find(|(k, _)| k == key) {
+        e.1 = value;
+    }
+}
+
+/// A resume ticket as the daemon makes them (32 lowercase hex): the only thing put into a
+/// shell command line besides fixed text.
+fn is_resume_ticket(t: &str) -> bool {
+    t.len() == 32 && t.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The basename of the interactive shell `cfg` starts.
+fn interactive_shell_name(cfg: &Config) -> String {
+    let (program, _) = interactive_shell(cfg);
+    program.rsplit('/').next().unwrap_or(&program).to_owned()
 }
 
 /// Ghostty release matching the pinned libghostty-vt (1.3.2-dev).
@@ -152,6 +274,32 @@ fn spawn_options_with(
         env.push((k.clone(), v.clone()));
     }
     env.extend(l.extra_env);
+    // OSC 7577 token is set after `[terminal.env]` and client `extra_env` so config/clients
+    // can never override or share a pane's per-terminal secret token.
+    env.retain(|(k, _)| k != ENV_OSC7577_TOKEN);
+    if let Some(tok) = l.resume_token {
+        env.push((ENV_OSC7577_TOKEN.into(), tok.to_owned()));
+    }
+    // The resume handoff the shell integration runs at its first prompt: only ever this
+    // daemon's, for a pane it restores. Always set (empty otherwise), so a value inherited from
+    // the daemon's environment, `[terminal.env]` or a client never reaches the shell.
+    env.retain(|(k, _)| k != ENV_RESUME_EXEC && k != ENV_RESUME_TICKET && k != ENV_RESUME_INIT);
+    let resume_hook = l
+        .resume_hook
+        .filter(|_| cfg.terminal.shell_integration && l.integration_dir.is_some())
+        .filter(|(_, ticket)| is_resume_ticket(ticket));
+    // fish runs its `-C` command after config.fish: the ticket goes there, never into the
+    // environment that config.fish's programs inherit.
+    let fish_hook = resume_hook.is_some() && interactive_shell_name(cfg) == "fish";
+    let (resume_exec, resume_ticket) = resume_hook
+        .map(|(exec, ticket)| {
+            let ticket = if fish_hook { "" } else { ticket };
+            (exec.display().to_string(), ticket.to_owned())
+        })
+        .unwrap_or_default();
+    env.push((ENV_RESUME_EXEC.into(), resume_exec));
+    env.push((ENV_RESUME_TICKET.into(), resume_ticket));
+    env.push((ENV_RESUME_INIT.into(), String::new()));
     // Last: on the PATH and display the pane ends up with, `[terminal.env]` and the client's
     // variables included.
     let shims = add_clip_shims(&mut env, shims, inherited);
@@ -192,6 +340,9 @@ fn spawn_options_with(
     if cfg.terminal.shell_integration
         && let Some(dir) = l.integration_dir
     {
+        // Absolute, so the shell finds its scripts whatever directory it starts in.
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let dir = dir.as_path();
         env.push(("THURM_SHELL_INTEGRATION".into(), dir.display().to_string()));
         env.push(("THURM_SHELL_TOKEN".into(), l.token.to_owned()));
         match name.as_str() {
@@ -222,6 +373,21 @@ fn spawn_options_with(
                     orig
                 };
                 env.push(("XDG_DATA_DIRS".into(), format!("{}:{base}", dir.display())));
+                // A system-wide fish setup may replace XDG_DATA_DIRS before fish reads it: the
+                // resume hook must load regardless (a second load does nothing).
+                if fish_hook && let Some((_, ticket)) = resume_hook {
+                    let script = dir.join("fish/vendor_conf.d/thurm.fish");
+                    set_env(&mut env, ENV_RESUME_INIT, script.display().to_string());
+                    // A fixed command: the ticket (checked hex) is its only data, the script
+                    // path comes from the environment.
+                    let init = format!(
+                        "set -g __thurm_resume_ticket {ticket}; set -l f $THURM_RESUME_INIT; \
+                         set -e THURM_RESUME_INIT; builtin source -- $f"
+                    );
+                    // Options go before a configured `--` (after it fish reads a script name).
+                    let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+                    args.splice(at..at, ["-C".to_owned(), init]);
+                }
             }
             _ => {}
         }
@@ -382,6 +548,8 @@ mod tests {
             socket: &sock,
             integration_dir: Some(&integ),
             token: "abc",
+            resume_token: Some("tok123"),
+            resume_hook: None,
         });
         assert_eq!(opts.program, "/bin/bash");
         assert!(
@@ -410,6 +578,8 @@ mod tests {
             socket: &sock,
             integration_dir: None,
             token: "",
+            resume_token: None,
+            resume_hook: None,
         })
         .env
     }
@@ -419,6 +589,149 @@ mod tests {
             .rev()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn resume_handoff_is_never_inherited() {
+        let sock = PathBuf::from("/tmp/s.sock");
+        let integ = PathBuf::from("/integration");
+        let mut cfg = Config::default();
+        cfg.terminal.shell = Some(vec!["/bin/zsh".into()]);
+        cfg.terminal
+            .env
+            .insert("THURM_RESUME_EXEC".into(), "/tmp/evil".into());
+        let launch = |hook: Option<(&Path, &str)>| {
+            spawn_options_with(
+                PaneLaunch {
+                    id: 1,
+                    command: None,
+                    cwd: None,
+                    extra_env: vec![("THURM_RESUME_TICKET".into(), "0".repeat(32))],
+                    size: PaneSize::default(),
+                    config: &cfg,
+                    socket: &sock,
+                    integration_dir: Some(&integ),
+                    token: "abc",
+                    resume_token: None,
+                    resume_hook: hook,
+                },
+                None,
+                |_| None,
+            )
+            .env
+        };
+        let values = |env: &[(String, String)], key: &str| {
+            env.iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>()
+        };
+        let plain = launch(None);
+        assert_eq!(values(&plain, "THURM_RESUME_EXEC"), [""]);
+        assert_eq!(values(&plain, "THURM_RESUME_TICKET"), [""]);
+        let restored = launch(Some((Path::new("/bin/thurmd"), "ab".repeat(16).as_str())));
+        assert_eq!(values(&restored, "THURM_RESUME_EXEC"), ["/bin/thurmd"]);
+        assert_eq!(values(&restored, "THURM_RESUME_TICKET"), ["ab".repeat(16)]);
+    }
+
+    #[test]
+    fn fish_gets_the_ticket_in_its_init_command_before_end_of_options() {
+        let sock = PathBuf::from("/tmp/s.sock");
+        let integ = PathBuf::from("/integration");
+        let mut cfg = Config::default();
+        cfg.terminal.shell = Some(vec!["/usr/bin/fish".into(), "-l".into(), "--".into()]);
+        let ticket = "ab".repeat(16);
+        let opts = spawn_options_with(
+            PaneLaunch {
+                id: 1,
+                command: None,
+                cwd: None,
+                extra_env: Vec::new(),
+                size: PaneSize::default(),
+                config: &cfg,
+                socket: &sock,
+                integration_dir: Some(&integ),
+                token: "abc",
+                resume_token: None,
+                resume_hook: Some((Path::new("/bin/thurmd"), &ticket)),
+            },
+            None,
+            |_| None,
+        );
+        let c = opts.args.iter().position(|a| a == "-C").expect("-C");
+        let end = opts.args.iter().position(|a| a == "--").expect("--");
+        assert!(c < end, "{:?}", opts.args);
+        assert_eq!(opts.args[0], "-l");
+        assert!(opts.args[c + 1].contains(&ticket));
+        assert!(opts.args[c + 1].contains("builtin source -- $f"));
+        let value = |key: &str| {
+            opts.env
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>()
+        };
+        // Never in the environment config.fish's programs inherit.
+        assert_eq!(value("THURM_RESUME_TICKET"), [""]);
+        assert_eq!(value("THURM_RESUME_EXEC"), ["/bin/thurmd"]);
+        assert_eq!(
+            value("THURM_RESUME_INIT"),
+            ["/integration/fish/vendor_conf.d/thurm.fish"]
+        );
+    }
+
+    #[test]
+    fn resume_hook_only_where_the_integration_loads() {
+        let dir = PathBuf::from("/integration");
+        let hook = |shell: &[&str], integration: bool| {
+            let mut cfg = Config::default();
+            cfg.terminal.shell = Some(shell.iter().map(|s| s.to_string()).collect());
+            cfg.terminal.shell_integration = integration;
+            uses_hook_resume(&cfg, Some(&dir))
+        };
+        assert!(hook(&["/bin/zsh"], true));
+        assert!(hook(&["/bin/zsh", "-l"], true));
+        assert!(hook(&["/usr/bin/fish"], true));
+        assert!(hook(&["/bin/bash"], true));
+        // Startup files off: Thurm's integration never runs.
+        assert!(!hook(&["/bin/zsh", "-f"], true));
+        assert!(!hook(&["/bin/zsh", "-lf"], true));
+        assert!(!hook(&["/bin/zsh", "--no-rcs"], true));
+        assert!(!hook(&["/bin/zsh", "--NO_RCS"], true));
+        assert!(!hook(&["/bin/zsh", "+o", "rcs"], true));
+        assert!(!hook(&["/bin/zsh", "-o", "no_rcs"], true));
+        assert!(!hook(&["/bin/zsh", "-o", "NoRcs"], true));
+        assert!(hook(&["/bin/zsh", "-o", "rcs"], true));
+        assert!(hook(&["/bin/zsh", "+o", "no_rcs"], true));
+        // Attached option names, and the last setting winning.
+        assert!(!hook(&["/bin/zsh", "-onorcs"], true));
+        assert!(!hook(&["/bin/zsh", "+orcs"], true));
+        assert!(!hook(&["/bin/zsh", "-lonorcs"], true));
+        assert!(!hook(&["/bin/zsh", "-lo", "norcs"], true));
+        assert!(hook(&["/bin/zsh", "-orcs"], true));
+        assert!(hook(&["/bin/zsh", "-f", "+f"], true));
+        assert!(hook(&["/bin/zsh", "-onoflowcontrol"], true));
+        // After the options: a script's own arguments.
+        assert!(hook(&["/bin/zsh", "-l", "--", "-f"], true));
+        // No line editor: no first-prompt widget to run the hook from.
+        assert!(!hook(&["/bin/zsh", "--no-zle"], true));
+        assert!(!hook(&["/bin/zsh", "--NOZLE"], true));
+        assert!(!hook(&["/bin/zsh", "+Z"], true));
+        assert!(!hook(&["/bin/zsh", "+lZ"], true));
+        assert!(!hook(&["/bin/zsh", "-o", "no_zle"], true));
+        assert!(!hook(&["/bin/zsh", "+o", "zle"], true));
+        assert!(!hook(&["/bin/zsh", "-onozle"], true));
+        assert!(!hook(&["/bin/zsh", "+ozle"], true));
+        assert!(hook(&["/bin/zsh", "-Z"], true));
+        assert!(hook(&["/bin/zsh", "+Z", "--zle"], true));
+        assert!(!hook(&["/usr/bin/fish", "--no-config"], true));
+        assert!(!hook(&["/usr/bin/fish", "-N"], true));
+        assert!(!hook(&["/bin/bash", "--norc"], true));
+        assert!(!hook(&["/bin/sh"], true));
+        assert!(!hook(&["/bin/zsh"], false));
+        let mut cfg = Config::default();
+        cfg.terminal.shell = Some(vec!["/bin/zsh".into()]);
+        assert!(!uses_hook_resume(&cfg, None));
     }
 
     #[test]
@@ -484,6 +797,8 @@ mod tests {
                 socket: &sock,
                 integration_dir: None,
                 token: "",
+                resume_token: None,
+                resume_hook: None,
             },
             Some(PathBuf::from("/s")),
             |k| {

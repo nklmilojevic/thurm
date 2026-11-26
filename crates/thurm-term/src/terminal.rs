@@ -137,6 +137,8 @@ pub enum TermEvent {
     Progress(Option<proto::Progress>),
     /// The program status records (OSC 7501) changed; these are all of them now.
     ProgramStatus(Vec<proto::ProgramRecord>),
+    /// A Program Resume Protocol (OSC 7577) report received whole (daemon-only).
+    ProgramResume { body: Vec<u8>, total_len: usize },
     ImageFreed(u32),
 }
 
@@ -748,6 +750,10 @@ impl Terminal {
                     self.vt.write(&b);
                     self.collect_events();
                 }
+                Chunk::ProgramResume { body, total_len } => {
+                    self.events
+                        .push(TermEvent::ProgramResume { body, total_len });
+                }
                 Chunk::Osc(body) => {
                     self.handle_osc(&body);
                     // A shared OSC (52) follows as a Pass chunk too: forward it once.
@@ -1190,6 +1196,16 @@ impl Terminal {
     /// Accept `$PATH` reports carrying `token` (see `OscEvent::ShellPath`).
     pub fn set_shell_token(&mut self, token: Option<String>) {
         self.shell_token = token;
+    }
+
+    /// See [`StreamFilter::osc_7577_discard`]: for an in-place upgrade.
+    pub fn osc_7577_discard(&self) -> u8 {
+        self.filter.osc_7577_discard()
+    }
+
+    /// See [`StreamFilter::restore_osc_7577_discard`]: after the replay, before new output.
+    pub fn restore_osc_7577_discard(&mut self, state: u8) {
+        self.filter.restore_osc_7577_discard(state);
     }
 
     pub fn shell_token(&self) -> Option<&str> {

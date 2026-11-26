@@ -104,6 +104,7 @@ const ANIMATION_SPEED: &[&str] = &["normal", "slow", "slower"];
 const CURSOR_STYLE: &[&str] = &["block", "beam", "underline"];
 const OSC52: &[&str] = &["disabled", "copy", "paste", "copy-paste"];
 const QUIT: &[&str] = &["detach", "terminate"];
+const RESUME_PROGRAMS: &[&str] = &["off", "rules", "all"];
 const UPDATE_CHANNEL: &[&str] = &["auto", "release", "tip"];
 const QUICK_POSITION: &[&str] = &["top", "bottom", "left", "right", "center"];
 const QUICK_SCREEN: &[&str] = &["mouse", "main"];
@@ -320,6 +321,21 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
         "session.resume_agents",
         "Resume agents after restart",
         Kind::Bool,
+    ),
+    (
+        "session.resume_programs",
+        "Resume programs (OSC 7577)",
+        Kind::Enum(RESUME_PROGRAMS),
+    ),
+    (
+        "session.resume_default_rules",
+        "Built-in program resume rules",
+        Kind::Bool,
+    ),
+    (
+        "session.resume_rules",
+        "Program resume trust rules",
+        Kind::Table,
     ),
     (
         "session.daemon_idle_exit_secs",

@@ -16,6 +16,7 @@ const INTERCEPTED_OSC: &[u32] = &[
     633,  // VS Code shell integration (same semantics as 133 for our purposes)
     3008, // context signalling (OSC 3008) – swallowed
     7501, // program status
+    7577, // program resume (daemon-only; never forwarded to clients or libghostty-vt)
 ];
 
 /// Intercepted OSC numbers libghostty-vt gets too (it handles other parts of them).
@@ -84,6 +85,10 @@ fn title_start(bytes: &[u8]) -> bool {
 
 /// Longest OSC we buffer before giving up and passing it through untouched.
 const MAX_OSC: usize = 8 * 1024 * 1024;
+/// Longest OSC 7577 body we buffer before discarding until its terminator (ignored per spec).
+/// Well above the spec's 2048-byte minimum and the daemon's 64 KiB protocol limit so oversized
+/// reports up to 128 KiB can still be MAC-verified and rejected, while huge streams stay bounded.
+const MAX_OSC_7577: usize = 128 * 1024;
 /// Longest APC we accept (kitty chunks are ≤ 4 KiB, but be generous).
 const MAX_APC: usize = 64 * 1024 * 1024;
 
@@ -97,6 +102,9 @@ pub enum Chunk<'a> {
     Osc(Vec<u8>),
     /// A whole OSC for the VT parser, not to forward (see `PRIVATE_OSC`).
     Private(Vec<u8>),
+    /// Program Resume Protocol (OSC 7577) body after `7577;` and the full sequence byte length
+    /// (including `ESC ]`, `7577;`, body, and BEL/ST). Daemon-only: never forwarded or sent to VT.
+    ProgramResume { body: Vec<u8>, total_len: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,9 +133,12 @@ enum State {
     ApcPass,
     /// Saw ESC inside a passed-through APC.
     ApcPassEsc,
-    /// APC/OSC too long: discard until the terminator.
+    /// APC too long: discard until the terminator.
     Discard,
     DiscardEsc,
+    /// OSC 7577 too long: discard until ST/BEL/CAN/SUB, recovering on an aborting ESC.
+    DiscardOsc,
+    DiscardOscEsc,
 }
 
 /// Longest APC control data we look at (kitty keys before the `;`).
@@ -219,6 +230,9 @@ pub struct StreamFilter {
     /// A chunked file / shared memory transmission is being taken out: its continuation
     /// chunks are too.
     media_more: bool,
+    /// Longest `buf` an intercepted OSC body reached (see [`StreamFilter::osc_append`]).
+    #[cfg(test)]
+    osc_peak: usize,
 }
 
 impl Default for StreamFilter {
@@ -239,7 +253,42 @@ impl StreamFilter {
             mouse_format: None,
             all_apc: false,
             media_more: false,
+            #[cfg(test)]
+            osc_peak: 0,
         }
+    }
+
+    /// Appends to the body of the intercepted OSC being buffered (tests watch how long it gets
+    /// before a terminator clears it).
+    fn osc_append(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        #[cfg(test)]
+        {
+            self.osc_peak = self.osc_peak.max(self.buf.len());
+        }
+    }
+
+    /// Whether an oversized OSC 7577 is being discarded: `1` inside its body, `2` right after
+    /// an ESC in it, `0` otherwise. Its start is gone (never buffered), so an in-place upgrade
+    /// carries this instead, and [`StreamFilter::restore_osc_7577_discard`] puts it back: the
+    /// rest of the report must not reach the terminal or clients.
+    pub fn osc_7577_discard(&self) -> u8 {
+        match self.state {
+            State::DiscardOsc => 1,
+            State::DiscardOscEsc => 2,
+            _ => 0,
+        }
+    }
+
+    /// Resumes discarding an oversized OSC 7577 (see [`StreamFilter::osc_7577_discard`]).
+    pub fn restore_osc_7577_discard(&mut self, state: u8) {
+        let next = match state {
+            1 => State::DiscardOsc,
+            2 => State::DiscardOscEsc,
+            _ => return,
+        };
+        self.buf = Vec::new();
+        self.state = next;
     }
 
     /// The scroll region set (DECSTBM, or reset by RIS) in what was fed since the last call:
@@ -315,8 +364,9 @@ impl StreamFilter {
                         }
                         _ => {
                             self.state = State::Ground;
-                            // The ESC may have been in a previous chunk.
-                            if pass_start > i || i == 0 || input[i - 1] != 0x1b {
+                            // The ESC may have been in a previous chunk or outside the pass slice
+                            // (e.g. reprocessed after dropping an aborted OSC 7577).
+                            if pass_start >= i || i == 0 || input[i - 1] != 0x1b {
                                 out.push(Chunk::Pass(Cow::Owned(vec![0x1b])));
                                 pass_start = i;
                             }
@@ -429,37 +479,63 @@ impl StreamFilter {
                     }
                 }
                 State::Osc => {
+                    let is_7577 = osc_number(&self.buf) == Some(7577);
                     match input[i..]
                         .iter()
                         .position(|&b| matches!(b, 0x07 | 0x1b | CAN | SUB))
                     {
                         Some(off) if matches!(input[i + off], CAN | SUB) => {
                             // CAN/SUB cancel the sequence: hand it to the terminal as it came,
-                            // which drops it.
-                            self.buf.extend_from_slice(&input[i..i + off]);
-                            let mut raw = b"\x1b]".to_vec();
-                            raw.append(&mut self.buf);
-                            out.push(Chunk::Pass(Cow::Owned(raw)));
+                            // which drops it (except OSC 7577, which stays daemon-only).
+                            if is_7577 {
+                                self.buf.clear();
+                            } else {
+                                self.osc_append(&input[i..i + off]);
+                                let mut raw = b"\x1b]".to_vec();
+                                raw.append(&mut self.buf);
+                                out.push(Chunk::Pass(Cow::Owned(raw)));
+                            }
                             self.state = State::Ground;
                             i += off;
                         }
                         Some(off) => {
-                            self.buf.extend_from_slice(&input[i..i + off]);
-                            i += off;
-                            if input[i] == 0x07 {
-                                self.osc_bel = true;
-                                self.finish_osc(out);
+                            if is_7577 && self.buf.len().saturating_add(off) > MAX_OSC_7577 {
+                                // Enforce the OSC 7577 buffer cap before copying excess bytes.
+                                self.buf = Vec::new();
+                                i += off;
+                                self.state = if input[i] == 0x07 {
+                                    State::Ground
+                                } else {
+                                    State::DiscardOscEsc
+                                };
+                                i += 1;
                             } else {
-                                self.state = State::OscEsc;
+                                self.osc_append(&input[i..i + off]);
+                                i += off;
+                                if input[i] == 0x07 {
+                                    self.osc_bel = true;
+                                    self.finish_osc(out);
+                                } else {
+                                    self.state = State::OscEsc;
+                                }
+                                i += 1;
                             }
-                            i += 1;
                         }
                         None => {
-                            self.buf.extend_from_slice(&input[i..]);
-                            i = input.len();
+                            let rem = input.len() - i;
+                            if is_7577 && self.buf.len().saturating_add(rem) > MAX_OSC_7577 {
+                                // OSC 7577 longer than our parser holds: discard without copying
+                                // excess bytes or forwarding so clients never see it.
+                                self.buf = Vec::new();
+                                self.state = State::DiscardOsc;
+                                i = input.len();
+                            } else {
+                                self.osc_append(&input[i..]);
+                                i = input.len();
+                            }
                         }
                     }
-                    if self.state == State::Osc && self.buf.len() > MAX_OSC {
+                    if self.state == State::Osc && !is_7577 && self.buf.len() > MAX_OSC {
                         // Give up intercepting: replay what we have and pass the rest through.
                         let mut raw = b"\x1b]".to_vec();
                         raw.append(&mut self.buf);
@@ -473,6 +549,13 @@ impl StreamFilter {
                         self.osc_bel = false;
                         self.finish_osc(out);
                         i += 1;
+                        pass_start = i;
+                    } else if osc_number(&self.buf) == Some(7577) {
+                        // ESC aborted OSC 7577: drop the sequence (never forwarded) and reprocess
+                        // ESC + b through normal escape handling so CSI/RIS/OSC/APC state stays
+                        // in sync with libghostty-vt.
+                        self.buf.clear();
+                        self.state = State::Esc;
                         pass_start = i;
                     } else {
                         // ESC aborted the OSC: replay it raw and reprocess ESC + b.
@@ -620,6 +703,39 @@ impl StreamFilter {
                     i += 1;
                     pass_start = i;
                 }
+                State::DiscardOsc => {
+                    match input[i..]
+                        .iter()
+                        .position(|&b| matches!(b, 0x1b | 0x07 | CAN | SUB))
+                    {
+                        Some(off) if matches!(input[i + off], CAN | SUB) => {
+                            self.state = State::Ground;
+                            i += off;
+                        }
+                        Some(off) => {
+                            i += off;
+                            self.state = if input[i] == 0x07 {
+                                State::Ground
+                            } else {
+                                State::DiscardOscEsc
+                            };
+                            i += 1;
+                        }
+                        None => i = input.len(),
+                    }
+                    pass_start = i;
+                }
+                State::DiscardOscEsc => {
+                    if b == b'\\' {
+                        self.state = State::Ground;
+                        i += 1;
+                        pass_start = i;
+                    } else {
+                        // ESC aborted the oversized OSC 7577: reprocess ESC + b normally.
+                        self.state = State::Esc;
+                        pass_start = i;
+                    }
+                }
             }
         }
 
@@ -732,7 +848,18 @@ impl StreamFilter {
         self.state = State::Ground;
         let body = std::mem::take(&mut self.buf);
         let num = osc_number(&body);
-        if num.is_some_and(|n| PRIVATE_OSC.contains(&n)) {
+        if num == Some(7577) {
+            if body.len() <= MAX_OSC_7577
+                && let Some(payload) = body.strip_prefix(b"7577;")
+            {
+                let term_len = if self.osc_bel { 1 } else { 2 };
+                let total_len = 2 + body.len() + term_len;
+                out.push(Chunk::ProgramResume {
+                    body: payload.to_vec(),
+                    total_len,
+                });
+            }
+        } else if num.is_some_and(|n| PRIVATE_OSC.contains(&n)) {
             let mut raw = Vec::with_capacity(body.len() + 4);
             raw.extend_from_slice(b"\x1b]");
             raw.extend_from_slice(&body);
@@ -945,6 +1072,9 @@ mod tests {
                         Chunk::Apc(a) => seqs.push(Chunk::Apc(a)),
                         Chunk::Osc(o) => seqs.push(Chunk::Osc(o)),
                         Chunk::Private(o) => seqs.push(Chunk::Private(o)),
+                        Chunk::ProgramResume { body, total_len } => {
+                            seqs.push(Chunk::ProgramResume { body, total_len })
+                        }
                     }
                 }
             }
@@ -971,6 +1101,191 @@ mod tests {
                 Chunk::Private(b"\x1b]7501;?\x1b\\".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn program_resume_osc_is_daemon_only_and_bounded() {
+        let (pass, seqs) = run(b"a\x1b]7577;pid=1:time=2:clear=1:mac=aa\x07b\x1b]7577;?\x1b\\c");
+        assert_eq!(pass, b"abc");
+        assert_eq!(
+            seqs,
+            vec![
+                Chunk::ProgramResume {
+                    body: b"pid=1:time=2:clear=1:mac=aa".to_vec(),
+                    total_len: b"\x1b]7577;pid=1:time=2:clear=1:mac=aa\x07".len(),
+                },
+                Chunk::ProgramResume {
+                    body: b"?".to_vec(),
+                    total_len: b"\x1b]7577;?\x1b\\".len(),
+                },
+            ]
+        );
+        // Bare `OSC 7577` without semicolon is dropped without leaking.
+        let (pass, seqs) = run(b"a\x1b]7577\x07b");
+        assert_eq!(pass, b"ab");
+        assert!(seqs.is_empty());
+        // Aborted OSC 7577 is dropped (ignored) and does not leak bytes to clients.
+        let (pass, seqs) = run(b"a\x1b]7577;pid=1\x18b\x1b]7577;pid=2\x1b[1mc");
+        assert_eq!(pass, b"a\x18b\x1b[1mc");
+        assert!(seqs.is_empty());
+        // Oversized OSC 7577 (> MAX_OSC_7577) is discarded without buffering excess bytes.
+        for term in [&b"\x1b\\"[..], &b"\x07"[..]] {
+            let mut huge = b"a\x1b]7577;".to_vec();
+            huge.extend(std::iter::repeat_n(b'A', MAX_OSC_7577 + 128));
+            huge.extend_from_slice(term);
+            huge.push(b'b');
+            let mut f = StreamFilter::new();
+            let mut out = Vec::new();
+            f.feed(&huge, &mut out);
+            // Checked where the body is copied: the terminator clears the buffer, so its size
+            // afterwards would not show a copy of the whole body made first.
+            assert!(
+                f.osc_peak <= MAX_OSC_7577,
+                "oversized OSC 7577 was buffered beyond the cap: {}",
+                f.osc_peak
+            );
+            let mut pass = Vec::new();
+            let mut resumes = 0;
+            for c in out {
+                match c {
+                    Chunk::Pass(b) => pass.extend_from_slice(&b),
+                    Chunk::ProgramResume { .. } => resumes += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(pass, b"ab");
+            assert_eq!(resumes, 0);
+        }
+
+        // While an oversized OSC 7577 is still arriving (no terminator yet) its body is never
+        // copied: in one chunk four times the cap, or in pieces that cross it.
+        {
+            let mut f = StreamFilter::new();
+            let mut out = Vec::new();
+            let mut chunk = b"\x1b]7577;".to_vec();
+            chunk.extend(std::iter::repeat_n(b'A', MAX_OSC_7577 * 4));
+            f.feed(&chunk, &mut out);
+            assert_eq!(f.osc_7577_discard(), 1);
+            assert!(f.buf.capacity() <= 2 * MAX_OSC_7577, "{}", f.buf.capacity());
+            let piece = vec![b'A'; MAX_OSC_7577 / 3];
+            let mut out = Vec::new();
+            let mut f = StreamFilter::new();
+            f.feed(b"\x1b]7577;", &mut out);
+            for _ in 0..8 {
+                f.feed(&piece, &mut out);
+                assert!(f.buf.capacity() <= 2 * MAX_OSC_7577, "{}", f.buf.capacity());
+            }
+            assert_eq!(f.osc_7577_discard(), 1);
+        }
+
+        // A discard handed to a new filter (an in-place upgrade) keeps the rest out.
+        for (state, rest) in [
+            (1u8, &b"AAAA\x07b"[..]),
+            (2, &b"\\b"[..]),
+            (1, &b"AA\x1b\\b"[..]),
+        ] {
+            let mut f = StreamFilter::new();
+            f.restore_osc_7577_discard(state);
+            assert_eq!(f.osc_7577_discard(), state);
+            let mut out = Vec::new();
+            f.feed(rest, &mut out);
+            let pass: Vec<u8> = out
+                .iter()
+                .filter_map(|c| match c {
+                    Chunk::Pass(b) => Some(b.to_vec()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert_eq!(pass, b"b", "state {state}");
+            assert_eq!(f.osc_7577_discard(), 0);
+        }
+        // Nothing to restore leaves the filter as it was.
+        let mut f = StreamFilter::new();
+        f.restore_osc_7577_discard(0);
+        assert_eq!(f.osc_7577_discard(), 0);
+
+        // Oversized zero-padded OSC `07577;` across split feeds never leaks to clients or VT.
+        {
+            let mut f = StreamFilter::new();
+            let mut pass = Vec::new();
+            let mut resumes = 0;
+            let mut feed = |chunk: &[u8]| {
+                let mut out = Vec::new();
+                f.feed(chunk, &mut out);
+                assert!(f.buf.len() <= MAX_OSC_7577);
+                for c in out {
+                    match c {
+                        Chunk::Pass(b) => pass.extend_from_slice(&b),
+                        Chunk::ProgramResume { .. } => resumes += 1,
+                        _ => {}
+                    }
+                }
+            };
+            feed(b"a\x1b]07577;");
+            for _ in 0..3 {
+                feed(&vec![b'X'; MAX_OSC_7577 / 2 + 1024]);
+            }
+            feed(b"\x1b");
+            feed(b"\\b");
+            assert_eq!(pass, b"ab");
+            assert_eq!(resumes, 0);
+        }
+
+        // Aborted OSC 7577 followed by DECSTBM keeps scroll-region tracking in sync (single & split).
+        for chunks in [
+            vec![&b"a\x1b]7577;pid=1\x1b[5;20rb"[..]],
+            vec![&b"a\x1b]7577;pid=1\x1b"[..], &b"[5;20rb"[..]],
+            vec![&b"a\x1b]7577;pid=1"[..], &b"\x1b[5;20rb"[..]],
+        ] {
+            let mut f = StreamFilter::new();
+            let mut pass = Vec::new();
+            for c in chunks {
+                let mut out = Vec::new();
+                f.feed(c, &mut out);
+                for item in out {
+                    match item {
+                        Chunk::Pass(b) => pass.extend_from_slice(&b),
+                        Chunk::ProgramResume { .. } => panic!("unexpected resume"),
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(pass, b"a\x1b[5;20rb");
+            assert_eq!(f.take_scroll_region(), Some(Some((5, 20))));
+        }
+
+        // Oversized OSC 7577 aborted by ESC + CSI recovers identically in single and split feeds.
+        let payload = vec![b'Z'; MAX_OSC_7577 + 64];
+        let mut whole = b"a\x1b]7577;".to_vec();
+        whole.extend_from_slice(&payload);
+        whole.extend_from_slice(b"\x1b[3;12rb");
+        for split in [
+            whole.len(),
+            12 + MAX_OSC_7577,
+            whole.len() - 8,
+            whole.len() - 7,
+        ] {
+            let mut f = StreamFilter::new();
+            let mut pass = Vec::new();
+            let (first, second) = whole.split_at(split);
+            for part in [first, second] {
+                if part.is_empty() {
+                    continue;
+                }
+                let mut out = Vec::new();
+                f.feed(part, &mut out);
+                for item in out {
+                    match item {
+                        Chunk::Pass(b) => pass.extend_from_slice(&b),
+                        Chunk::ProgramResume { .. } => panic!("unexpected resume"),
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(pass, b"a\x1b[3;12rb", "split={split}");
+            assert_eq!(f.take_scroll_region(), Some(Some((3, 12))), "split={split}");
+        }
     }
 
     #[test]

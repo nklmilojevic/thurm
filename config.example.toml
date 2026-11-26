@@ -143,8 +143,20 @@ snapshot_interval_secs = 15
 quit = "detach"
 # Run configured agent resume commands when a saved session is restored.
 resume_agents = true
+# Resume programs that reported a resume command via OSC 7577: "rules", "all", or "off".
+resume_programs = "rules"
+# Include built-in trust rules for OSC 7577 program resume (claude, codex, opencode, pi, agy).
+resume_default_rules = true
 # Exit the daemon this many seconds after the last pane closes. 0 disables this.
 daemon_idle_exit_secs = 0
+
+# Add a trust rule for OSC 7577 program resume, or override/disable a built-in rule by name.
+# [[session.resume_rules]]
+# name = "mytool"
+# enabled = true
+# command = ["mytool", "resume", "<id>"]
+# dirs = ["~/code"]
+# match_process = true
 
 [security]
 # Enable Secure Keyboard Entry when a password prompt is detected.

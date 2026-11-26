@@ -33,6 +33,7 @@ use crate::agents::{self, AgentTracker, AiWant};
 use crate::ai;
 use crate::persist::{self, PaneSnapshot, SessionSnapshot, Store};
 use crate::procinfo;
+use crate::program_resume::{self, ProgramResumeState, ResumeExecSpec, TrustSubject, TrustVerdict};
 use crate::pty::{self, Pty};
 use crate::shell;
 use crate::upgrade;
@@ -44,6 +45,9 @@ const OUTPUT_BACKLOG: usize = 4096;
 /// Bytes of output queued for a client before its subscriptions switch to re-sync (an
 /// `Output` can be 256 KiB: counting messages alone let a stalled client pin a gigabyte).
 const OUTPUT_BACKLOG_BYTES: usize = 16 * 1024 * 1024;
+/// The most record bytes one [`Request::ResumeRecords`] answer holds: every pane's records
+/// fit when a pane is named, a list of all panes past it is refused.
+const RESUME_LIST_BYTES: usize = 8 * 1024 * 1024;
 
 /// PTY output read ahead of the parser. A macOS PTY buffers only a few KiB, so a program that
 /// writes faster than we parse would stall on every chunk; with the read-ahead it keeps
@@ -274,30 +278,48 @@ fn read_groups(len: usize, groups: &[(usize, Option<u32>)]) -> Vec<(usize, usize
     out
 }
 
-/// Follows program reports (OSC 7501) through PTY reads, which split them anywhere.
-#[derive(Default)]
+/// Follows program reports (OSC 7501 status, OSC 7577 resume) through PTY reads, which split
+/// them anywhere: a read with one is looked at behind PTY proxies, where the reporter runs.
 struct ReportScan {
+    /// The report's OSC marker ([`ReportScan::STATUS`], [`ReportScan::RESUME`]).
+    marker: &'static [u8],
     /// The last read's last bytes: the start of a marker the next read may finish.
     tail: Vec<u8>,
     /// Inside a report: its end is still to come.
     open: bool,
+    /// The last read ended on the ESC of a report's ST (`ESC \`): the report is complete (and
+    /// parsed) on the next read, with the backslash, so that read counts as the report's too.
+    esc_pending: bool,
 }
 
 impl ReportScan {
-    const MARKER: &[u8] = b"]7501;";
+    const STATUS: &[u8] = b"]7501;";
+    const RESUME: &[u8] = b"]7577;";
+
+    fn new(marker: &'static [u8]) -> Self {
+        Self {
+            marker,
+            tail: Vec::new(),
+            open: false,
+            esc_pending: false,
+        }
+    }
 
     /// Whether this read has a part of a report from its marker on.
     fn read(&mut self, data: &[u8]) -> bool {
-        let mut touched = self.open;
+        let mut touched = self.open || (self.esc_pending && !data.is_empty());
+        if !data.is_empty() {
+            self.esc_pending = false;
+        }
         let mut at = 0;
         let mut joined = std::mem::take(&mut self.tail);
         let kept = joined.len();
-        joined.extend_from_slice(&data[..data.len().min(Self::MARKER.len() - 1)]);
-        if let Some(i) = memchr::memmem::find(&joined, Self::MARKER) {
+        joined.extend_from_slice(&data[..data.len().min(self.marker.len() - 1)]);
+        if let Some(i) = memchr::memmem::find(&joined, self.marker) {
             // Too short to hold a marker on either side: it spans the two reads.
             touched = true;
             self.open = true;
-            at = i + Self::MARKER.len() - kept;
+            at = i + self.marker.len() - kept;
         }
         loop {
             if self.open {
@@ -306,16 +328,19 @@ impl ReportScan {
                     break;
                 };
                 self.open = false;
+                // An ESC as the read's last byte: its backslash, and so the report's end, is
+                // in the next read.
+                self.esc_pending = data[at + i] == 0x1b && at + i + 1 == data.len();
                 at += i + 1;
             }
-            let Some(i) = memchr::memmem::find(&data[at..], Self::MARKER) else {
+            let Some(i) = memchr::memmem::find(&data[at..], self.marker) else {
                 break;
             };
             touched = true;
             self.open = true;
-            at += i + Self::MARKER.len();
+            at += i + self.marker.len();
         }
-        let keep = Self::MARKER.len() - 1;
+        let keep = self.marker.len() - 1;
         self.tail = if data.len() >= keep {
             data[data.len() - keep..].to_vec()
         } else {
@@ -361,6 +386,8 @@ pub struct Client {
     pub push_device: Mutex<Option<String>>,
     /// The connection, to drop it from outside its reader (a revoked phone).
     pub socket: Mutex<Option<std::os::unix::net::UnixStream>>,
+    /// The connecting process, for a local peer (see [`Client::is_local_cli`]).
+    pub peer_pid: Mutex<Option<u32>>,
     /// Dropped by `RevokePhone`: it may no longer register for push or follow an agent.
     pub revoked: AtomicBool,
     /// Its panes follow the active client's size ([`thurm_proto::CAP_ACTIVE_SIZE`]).
@@ -496,6 +523,32 @@ impl Client {
         })
     }
 
+    /// Whether this is the `thurm` CLI of this user on this machine: a local peer whose
+    /// executable is named `thurm`. What only the CLI asks for and carries programs' arguments
+    /// ([`Request::ResumeRecords`]) is for it alone: a same-user socket forward over SSH comes
+    /// from `sshd`, whose caller may have no shell here. (A process of the user here could pose
+    /// as the CLI, but it can already type into the panes.) Unknown: not the CLI. No setting
+    /// opens this up (the tests ask through a copy of their binary named `thurm`).
+    pub fn is_local_cli(&self) -> bool {
+        if !self.is_local_peer() {
+            return false;
+        }
+        let pid = *self.peer_pid.lock();
+        pid.and_then(crate::procinfo::exe_path)
+            .is_some_and(|exe| is_cli_executable(&exe))
+    }
+
+    /// Whether the connecting process runs on one of `ttys` (slave devices: a pane's, and the
+    /// one a verified PTY proxy in it runs its shell on): its controlling terminal is one of
+    /// them. Unknown: no. The helper that redeems a pane's resume ticket runs in the pane's
+    /// shell; a same-user socket forward over SSH has no such terminal, so a ticket seen
+    /// elsewhere (the typed line shows in the pane) can only be redeemed in the pane itself.
+    pub fn runs_on_terminal(&self, ttys: &[u64]) -> bool {
+        let pid = *self.peer_pid.lock();
+        pid.and_then(crate::procinfo::controlling_tty)
+            .is_some_and(|tty| ttys.contains(&tty))
+    }
+
     /// `n` clipboard bytes left the queue. Never below zero: after [`Client::writer_ended`]
     /// set the count to zero, a send that counted its message and then failed gives it back
     /// to nothing.
@@ -538,8 +591,25 @@ pub fn message_weight(msg: &ServerMessage) -> usize {
     match msg {
         ServerMessage::Event(Event::Output { data, .. }) => data.len(),
         ServerMessage::Event(Event::Attach { state, .. }) => state.len(),
+        ServerMessage::Response {
+            result: Ok(Response::ResumeRecords(list)),
+            ..
+        } => resume_records_weight(list),
         _ => 256,
     }
+}
+
+/// About what a [`Response::ResumeRecords`] answer takes in memory and on the wire.
+fn resume_records_weight(list: &[thurm_proto::PaneResumeRecords]) -> usize {
+    list.iter()
+        .flat_map(|p| &p.records)
+        .map(|r| {
+            256 + r.process_name.len()
+                + r.cwd.as_ref().map_or(0, String::len)
+                + r.argv.iter().map(|a| a.len() + 8).sum::<usize>()
+        })
+        .sum::<usize>()
+        .max(256)
 }
 
 pub struct Pane {
@@ -592,7 +662,16 @@ pub struct PaneState {
     /// the state, so the output that follows finishes the sequence there instead of showing
     /// its end as text.
     forwarded_carry: Vec<u8>,
+    /// A line to type into the shell once it is up (an agent or program resume in a shell
+    /// without the integration hook): at the shell's first prompt, or when due if the shell
+    /// is in the foreground and nobody `typed`.
     pending_input: Option<(Instant, Vec<u8>)>,
+    /// How many times `pending_input` came due while the shell wasn't in the foreground yet
+    /// (its startup files still running): it waits a second more each time, up to
+    /// [`PENDING_INPUT_WAITS`].
+    pending_waits: u32,
+    /// A client typed or pasted into the pane.
+    typed: bool,
     shell_integration_seen: bool,
     /// Last git probe: when, for which directory, and whether one is in flight.
     git_probe: Option<(Instant, String)>,
@@ -612,6 +691,8 @@ pub struct PaneState {
     programs_pgrp: Option<u32>,
     /// The foreground process group when the output being parsed was read (see `reader_loop`).
     output_pgrp: Option<u32>,
+    /// Program Resume Protocol (OSC 7577) token, records, and replay tracking.
+    resume: ProgramResumeState,
 }
 
 impl PaneState {
@@ -622,6 +703,85 @@ impl PaneState {
         state.extend_from_slice(&self.forwarded_carry);
         state
     }
+}
+
+/// How [`Daemon::create_pane_with_resume`] starts a restored pane with an OSC 7577 command.
+enum RestoreLaunch<'a> {
+    Normal,
+    /// Interactive shell (zsh, bash, fish) whose integration runs `--exec-resume` at its first
+    /// prompt.
+    Hook { exec: &'a Path, ticket: &'a str },
+    /// Owning process was the PTY's first process: `exec thurmd --exec-resume <ticket>` via
+    /// login shell.
+    FirstProcess {
+        exec: &'a Path,
+        ticket: &'a str,
+        title: String,
+        /// Started instead when the resume fails, so the pane stays with the reason: the
+        /// configured shell's program and arguments.
+        shell: &'a [String],
+    },
+}
+
+/// Whether the pane command `cmd` starts the same program with the same arguments as `program`
+/// `args` (the configured shell): the same file, whether named by path or looked up on `PATH`,
+/// by the same name (a shell reads its name: `sh` linked to Bash runs Bash as a POSIX shell).
+fn same_invocation(cmd: &[String], program: &str, args: &[String]) -> bool {
+    let name = |prog: &str| Path::new(prog).file_name().map(|n| n.to_owned());
+    let resolve = |prog: &str| -> Option<std::path::PathBuf> {
+        let found = if prog.contains('/') {
+            std::path::PathBuf::from(prog)
+        } else {
+            let path = std::env::var_os("PATH")?;
+            std::env::split_paths(&path)
+                .filter(|d| d.is_absolute())
+                .map(|d| d.join(prog))
+                .find(|c| c.is_file())?
+        };
+        std::fs::canonicalize(found).ok()
+    };
+    match cmd.split_first() {
+        Some((first, rest)) => {
+            rest == args
+                && name(first).is_some()
+                && name(first) == name(program)
+                && resolve(first).is_some_and(|a| resolve(program) == Some(a))
+        }
+        None => false,
+    }
+}
+
+/// How many seconds a pending resume line waits, past its due time, for a slow shell to come
+/// up before it is given up.
+const PENDING_INPUT_WAITS: u32 = 30;
+
+/// A restored pane's saved program, waiting for the pane's shell to redeem `ticket`
+/// ([`Request::TakeResume`]).
+pub(crate) struct ResumeTicket {
+    pub ticket: String,
+    pub pane: PaneId,
+    pub spec: ResumeExecSpec,
+    pub expires: Instant,
+    /// [`resume_policy`] of the configuration that let the program resume: redeemed only while
+    /// the configuration still says the same.
+    pub policy: String,
+}
+
+/// Whether `exe` is the `thurm` CLI (by name: see [`Client::is_local_cli`]).
+fn is_cli_executable(exe: &std::path::Path) -> bool {
+    exe.file_name().is_some_and(|n| n == "thurm")
+}
+
+/// A digest of what decides which programs resume (`resume_programs` and the effective
+/// rules): a ticket issued under one policy is not redeemed under another.
+pub(crate) fn resume_policy(cfg: &Config) -> String {
+    use sha2::Digest;
+    let json =
+        serde_json::to_vec(&(cfg.session.resume_programs, cfg.resume_rules())).unwrap_or_default();
+    sha2::Sha256::digest(&json)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// What [`Daemon::install_pane`] needs: a new pane, or one handed over by the previous daemon.
@@ -639,6 +799,13 @@ struct InstallPane {
     forwarded_carry: Vec<u8>,
     /// The program records' group (see `PaneState::programs_pgrp`).
     programs_pgrp: Option<u32>,
+    /// Program Resume Protocol (OSC 7577) state for this pane.
+    resume: ProgramResumeState,
+    /// A line still to be typed, its waits so far, and whether a client typed (see the
+    /// `PaneState` fields): in place before the reader can see the shell's first prompt.
+    pending_input: Option<(Instant, Vec<u8>)>,
+    pending_waits: u32,
+    typed: bool,
 }
 
 pub struct Daemon {
@@ -683,7 +850,23 @@ pub struct Daemon {
     pub socket: PathBuf,
     integration_dir: Option<PathBuf>,
     session_dirty: AtomicBool,
+    /// An OSC 7577 record was set or removed, or a pane closed: the monitor saves on its next
+    /// tick, off the thread that parses output.
+    resume_save_due: AtomicBool,
+    /// Restored panes' saved programs waiting for their shell (see [`ResumeTicket`]).
+    resume_tickets: Mutex<Vec<ResumeTicket>>,
+    /// An in-place upgrade has captured the panes for the next image, which does not resume
+    /// what is still pending: until the exec, or until the upgrade gives up, no resume line is
+    /// typed and no ticket redeemed (see [`Daemon::set_handing_over`]). Changed only under
+    /// `resume_tickets`' lock, which redemption holds while it checks it.
+    handing_over: AtomicBool,
+    /// Signalled (with `resume_tickets`' lock) when an upgrade gives up: redemptions waiting
+    /// for its outcome go on.
+    handover_ended: parking_lot::Condvar,
     restored: AtomicBool,
+    /// `restore_session` or `adopt` is still installing panes: a snapshot written now would
+    /// lack the rest of them and the layout, so saves wait (the session stays dirty).
+    loading: AtomicBool,
     pub shutdown: AtomicBool,
     /// SIGTERM/SIGINT arrived. Shells dying from here on are part of the teardown (quitting
     /// the app that spawned us signals its whole tree at once) and stay in the saved session.
@@ -761,7 +944,12 @@ impl Daemon {
             socket,
             integration_dir,
             session_dirty: AtomicBool::new(false),
+            resume_save_due: AtomicBool::new(false),
+            handing_over: AtomicBool::new(false),
+            handover_ended: parking_lot::Condvar::new(),
+            resume_tickets: Mutex::new(Vec::new()),
             restored: AtomicBool::new(false),
+            loading: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             stopping,
             just_exited: Mutex::new(Vec::new()),
@@ -965,6 +1153,7 @@ impl Daemon {
             exit: parking_lot::ReentrantMutex::new(()),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
+            peer_pid: Mutex::new(None),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),
@@ -1075,6 +1264,15 @@ impl Daemon {
         req: CreatePane,
         restore: Option<PaneId>,
     ) -> anyhow::Result<PaneId> {
+        self.create_pane_with_resume(req, restore, RestoreLaunch::Normal)
+    }
+
+    fn create_pane_with_resume(
+        self: &Arc<Self>,
+        req: CreatePane,
+        restore: Option<PaneId>,
+        resume_launch: RestoreLaunch<'_>,
+    ) -> anyhow::Result<PaneId> {
         let id = match restore {
             Some(id) => {
                 self.next_pane.fetch_max(id + 1, Ordering::Relaxed);
@@ -1103,9 +1301,36 @@ impl Daemon {
             ensure_hooks(command.as_deref());
         }
         let token = shell_token()?;
+        let resume_token = (!program_resume::is_root())
+            .then(program_resume::generate_token)
+            .transpose()?;
+        let (spawn_command, resume_hook, title_override) = match resume_launch {
+            RestoreLaunch::Normal => (command.clone(), None, None),
+            RestoreLaunch::Hook { exec, ticket } => (None, Some((exec, ticket)), None),
+            RestoreLaunch::FirstProcess {
+                exec,
+                ticket,
+                title,
+                shell,
+            } => (
+                Some(
+                    vec![
+                        exec.display().to_string(),
+                        "--exec-resume".into(),
+                        ticket.to_owned(),
+                        "--or-shell".into(),
+                    ]
+                    .into_iter()
+                    .chain(shell.iter().cloned())
+                    .collect(),
+                ),
+                None,
+                Some(title),
+            ),
+        };
         let opts = shell::spawn_options(shell::PaneLaunch {
             id,
-            command: command.clone(),
+            command: spawn_command,
             cwd: cwd.clone(),
             extra_env: req.env.clone(),
             size,
@@ -1113,6 +1338,8 @@ impl Daemon {
             socket: &self.socket,
             integration_dir: self.integration_dir.as_deref(),
             token: &token,
+            resume_token: resume_token.as_deref(),
+            resume_hook,
         });
         let mut term = Terminal::new(size, self.engine.read().clone());
         term.set_shell_token(Some(token));
@@ -1127,9 +1354,8 @@ impl Daemon {
         let pid = pty.pid();
         let info = PaneInfo {
             id,
-            title: command
-                .as_ref()
-                .and_then(|c| c.first().cloned())
+            title: title_override
+                .or_else(|| command.as_ref().and_then(|c| c.first().cloned()))
                 .unwrap_or_else(|| "shell".into()),
             cwd: cwd.clone(),
             pid: Some(pid),
@@ -1150,6 +1376,10 @@ impl Daemon {
                 carry: Vec::new(),
                 forwarded_carry: Vec::new(),
                 programs_pgrp: None,
+                resume: ProgramResumeState::with_token(resume_token),
+                pending_input: None,
+                pending_waits: 0,
+                typed: false,
             },
             true,
         )?;
@@ -1194,7 +1424,9 @@ impl Daemon {
                 command_line: None,
                 carry: p.carry,
                 forwarded_carry: p.forwarded_carry,
-                pending_input: None,
+                pending_input: p.pending_input,
+                pending_waits: p.pending_waits,
+                typed: p.typed,
                 shell_integration_seen: p.shell_integration_seen,
                 git_probe: None,
                 git_pending: false,
@@ -1205,6 +1437,7 @@ impl Daemon {
                 command_check: None,
                 programs_pgrp: p.programs_pgrp,
                 output_pgrp: None,
+                resume: p.resume,
             }),
         });
         self.panes.lock().insert(id, pane.clone());
@@ -1249,7 +1482,8 @@ impl Daemon {
         }
         let mut buf = vec![0u8; 64 * 1024];
         let mut last_read = Instant::now();
-        let mut reports = ReportScan::default();
+        let mut reports = ReportScan::new(ReportScan::STATUS);
+        let mut resumes = ReportScan::new(ReportScan::RESUME);
         loop {
             self.readers.park_if_paused();
             let n = match pty::read_pty(&mut reader, &mut buf, self.readers.wake_fd()) {
@@ -1268,7 +1502,8 @@ impl Daemon {
             let mut group = pty::foreground_of(&reader);
             // Behind a PTY proxy, the reporting program is on the proxy's terminal. Looking
             // there takes a few more calls, so only for reads with a report in them.
-            if reports.read(&buf[..n]) {
+            // Both scanned every read: each follows its reports across reads.
+            if reports.read(&buf[..n]) | resumes.read(&buf[..n]) {
                 group = group.map(procinfo::behind_proxy);
             }
             let quiet = last_read.elapsed() >= QUIET;
@@ -1488,8 +1723,17 @@ impl Daemon {
         if events.is_empty() {
             return;
         }
-        let cfg = self.config.read().notifications.clone();
+        let (cfg, configured_shell) = {
+            let c = self.config.read();
+            let shell = events
+                .iter()
+                .any(|e| matches!(e, TermEvent::ProgramResume { .. }))
+                .then(|| c.terminal.shell.as_ref().and_then(|s| s.first()).cloned())
+                .flatten();
+            (c.notifications.clone(), shell)
+        };
         let mut info_changed = false;
+        let mut resume_changed = false;
         let mut outgoing: Vec<Outgoing> = Vec::new();
         {
             let mut st = pane.state.lock();
@@ -1555,7 +1799,16 @@ impl Daemon {
                             info_changed = true;
                         }
                         if let Some((_, input)) = st.pending_input.take() {
-                            pane.write(input);
+                            // At its prompt the shell reads it, unless someone started typing
+                            // a line it would join.
+                            if st.typed {
+                                self.resume_tickets.lock().retain(|t| t.pane != pane.id);
+                                st.term.print(
+                                    "\r\n[automatic resume skipped: the terminal was busy]\r\n",
+                                );
+                            } else {
+                                pane.write(input);
+                            }
                         }
                     }
                     TermEvent::CommandStart => {
@@ -1623,6 +1876,22 @@ impl Daemon {
                         outgoing.extend(self.sync_programs(pane.id, &mut st, records));
                         info_changed = true;
                     }
+                    TermEvent::ProgramResume { body, total_len } => {
+                        let ctx = program_resume::PaneContext {
+                            leader: st.pty.live_leader(),
+                            tty_rdev: st.pty.slave_rdev(),
+                            tty_session: st.pty.terminal_session(),
+                            // Who is in front when the report's bytes were read.
+                            foreground_pgrp: st.output_pgrp.or_else(|| st.pty.foreground_pgrp()),
+                            has_explicit_command: st.command.is_some(),
+                            trusted_shells: program_resume::PaneContext::resolve_trusted_shells(
+                                configured_shell.as_deref(),
+                            ),
+                        };
+                        if st.resume.handle_report(&body, total_len, &ctx) {
+                            resume_changed = true;
+                        }
+                    }
                     // Subscribers run their own copy of the terminal and free images there.
                     TermEvent::ImageFreed(_) => {}
                 }
@@ -1633,6 +1902,14 @@ impl Daemon {
             for ev in outgoing {
                 self.broadcast_outgoing(ev, true);
             }
+        }
+        if resume_changed
+            && self.config.read().session.resume_programs != thurm_config::ResumeProgramsMode::Off
+        {
+            // Spec SHOULD: save each resume record and each removal when it happens. The
+            // monitor does it within a tick, so this thread never waits on the disk.
+            self.session_dirty.store(true, Ordering::Relaxed);
+            self.resume_save_due.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1735,13 +2012,18 @@ impl Daemon {
             return false;
         };
         self.just_exited.lock().retain(|(p, _)| p.id != id);
+        self.resume_tickets.lock().retain(|t| t.pane != id);
         self.session_dirty.store(true, Ordering::Relaxed);
         // Under the pane's lock, as `pane_exited` broadcasts: its exit's PaneInfo comes before
         // PaneClosed or not at all.
         let mut st = pane.state.lock();
         st.closed = true;
         st.pty.hangup();
+        drop(st);
         self.broadcast(Event::PaneClosed { pane: id }, false);
+        // Spec SHOULD: discard a record when the user closes the terminal on purpose. One save
+        // on the monitor's next tick covers every pane of a closed tab.
+        self.resume_save_due.store(true, Ordering::Relaxed);
         true
     }
 
@@ -2019,10 +2301,17 @@ impl Daemon {
             };
             let defs = self.agent_defs.read().clone();
             let program_defs = self.program_defs.read().clone();
+            let mut resume_expired = false;
+            let resume_now_ms = program_resume::monotonic_ms();
+            let daemon_stopping = self.stopping.load(Ordering::Relaxed);
             for pane in self.all_panes() {
                 let mut events: Vec<Outgoing> = Vec::new();
                 {
                     let mut st = pane.state.lock();
+                    // Before skipping dead panes: a held pane's records expire too.
+                    if !daemon_stopping && st.resume.poll_liveness(resume_now_ms) {
+                        resume_expired = true;
+                    }
                     if !st.info.alive {
                         continue;
                     }
@@ -2166,12 +2455,7 @@ impl Daemon {
                         };
                     st.info.title = pane_title(&st, fg.as_ref());
                     st.info.foreground = fg;
-                    if let Some((due, _)) = &st.pending_input
-                        && Instant::now() >= *due
-                        && let Some((_, input)) = st.pending_input.take()
-                    {
-                        pane.write(input);
-                    }
+                    self.type_pending_input(&pane, &mut st);
                     // idle_ms changes every tick; only report it along with other changes, or
                     // every 2 s for clients that display it.
                     let mut cmp = st.info.clone();
@@ -2186,7 +2470,16 @@ impl Daemon {
                     }
                 }
             }
-            if self.store.is_some()
+            let resume_due = self.resume_save_due.swap(false, Ordering::Relaxed);
+            {
+                let now = Instant::now();
+                self.resume_tickets.lock().retain(|t| t.expires > now);
+            }
+            if self.store.is_some() && (resume_expired || resume_due) {
+                // A record came or went: saved now, and again a second later if that fails.
+                let _ = self.save_session_now();
+                last_save = Instant::now();
+            } else if self.store.is_some()
                 && (self.session_dirty.load(Ordering::Relaxed)
                     && last_save.elapsed() > Duration::from_secs(1)
                     || last_save.elapsed() > interval)
@@ -2219,12 +2512,23 @@ impl Daemon {
         serde_json::to_string(&layout).ok()
     }
 
+    /// [`Daemon::save_session`] for a change that must reach the disk (a resume record that
+    /// came or went): the session stays dirty when the write fails, so the next tick retries.
+    fn save_session_now(&self) -> std::io::Result<()> {
+        self.session_dirty.store(true, Ordering::Relaxed);
+        self.save_session()
+    }
+
     /// Writes the layout and each pane's cwd, command and agent. Scrollback stays in memory:
     /// it never reaches the disk, so a restart restores the panes without their history.
     pub fn save_session(&self) -> std::io::Result<()> {
         let Some(store) = &self.store else {
             return Ok(());
         };
+        if self.loading.load(Ordering::Relaxed) {
+            self.session_dirty.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
         let _saving = self.save_lock.lock();
         // Changes from here on (a hook during the save) make the session dirty again.
         let was_dirty = self.session_dirty.swap(false, Ordering::Relaxed);
@@ -2237,11 +2541,19 @@ impl Daemon {
             }
         }
         saving.sort_by_key(|p| p.id);
+        let (resume_mode, resume_rules) = {
+            let cfg = self.config.read();
+            (cfg.session.resume_programs, cfg.resume_rules())
+        };
         for pane in saving {
-            let st = pane.state.lock();
+            let mut st = pane.state.lock();
             if !st.info.alive && !teardown.iter().any(|p| p.id == pane.id) {
                 continue;
             }
+            let foreground = st.pty.foreground_pgrp();
+            let program_resume = st
+                .resume
+                .chosen_for_save(foreground, resume_mode, &resume_rules);
             panes.push(PaneSnapshot {
                 id: pane.id,
                 cwd: st.info.cwd.clone(),
@@ -2254,6 +2566,7 @@ impl Daemon {
                     .and(st.agent.session_id())
                     .map(str::to_owned),
                 agent_resume: st.agent.resume_argv().map(<[String]>::to_vec),
+                program_resume,
                 size: st.info.size.into(),
             });
         }
@@ -2308,15 +2621,89 @@ impl Daemon {
         true
     }
 
+    /// Types a restored pane's pending resume line once it is due (see `pending_input`). Not
+    /// while an upgrade hands the panes over (the next image resumes nothing pending); it
+    /// stays for this monitor if the upgrade gives up.
+    fn type_pending_input(&self, pane: &Arc<Pane>, st: &mut PaneState) {
+        if self.handing_over.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some((due, _)) = &st.pending_input
+            && Instant::now() >= *due
+            && let Some((_, input)) = st.pending_input.take()
+        {
+            // Typed only into the pane's own shell, waiting in the foreground, and
+            // never after someone typed: a startup job would read it as input, and
+            // a half-typed line would run with it.
+            let shell_waits = st.info.foreground.as_ref().is_some_and(|p| {
+                procinfo::is_shell(&p.name)
+                    && (st.info.pid == Some(p.pid) || procinfo::parent(p.pid) == st.info.pid)
+            });
+            if shell_waits && !st.typed {
+                pane.write(input);
+            } else if !st.typed && st.pending_waits < PENDING_INPUT_WAITS {
+                // The shell isn't up yet (slow startup files run something in the
+                // foreground): wait for it, or for its first prompt.
+                st.pending_waits += 1;
+                st.pending_input = Some((Instant::now() + Duration::from_secs(1), input));
+            } else {
+                self.resume_tickets.lock().retain(|t| t.pane != pane.id);
+                st.term
+                    .print("\r\n[automatic resume skipped: the terminal was busy]\r\n");
+            }
+        }
+    }
+
     /// Lets the readers go on (the upgrade did not happen).
     pub fn resume_readers(&self) {
         self.readers.resume();
     }
 
+    /// Whether a restored pane still waits to resume its program: a resume line not yet typed,
+    /// or a ticket its shell has not redeemed. An upgrade waits a little for these, then hands
+    /// the panes over without them (see [`Daemon::handoff`]). They come only from restoring,
+    /// which is done before the daemon serves or upgrades, so none appear later.
+    pub fn resumes_pending(&self) -> bool {
+        let now = Instant::now();
+        !self.resume_tickets.lock().iter().all(|t| t.expires <= now)
+            || self
+                .all_panes()
+                .iter()
+                .any(|p| p.state.lock().pending_input.is_some())
+    }
+
+    /// Set before [`Daemon::handoff`] captures the panes, and cleared if the upgrade gives up:
+    /// meanwhile nothing pending resumes here (see `handing_over`). Under the tickets' lock,
+    /// so a redemption either took its ticket before (and the hand-off doesn't list its pane
+    /// as skipped) or waits for the outcome: redeemed if the upgrade gives up; if it goes
+    /// ahead, the helper's connection ends with this image and it starts the shell.
+    pub fn set_handing_over(&self, on: bool) {
+        let _tickets = self.resume_tickets.lock();
+        self.handing_over.store(on, Ordering::SeqCst);
+        if !on {
+            self.handover_ended.notify_all();
+        }
+    }
+
+    /// What the next image takes over. Resumes still pending are left out, and stay pending
+    /// here in case the upgrade gives up: input that should cancel one could end with this
+    /// image, unseen (keystrokes get no reply), while the next resumed the program anyway. The
+    /// next image only notes them as skipped in their panes (`resumes_skipped`).
     pub fn handoff(&self, listener_fd: RawFd, log_to_file: bool) -> upgrade::Handoff {
+        let now = Instant::now();
+        let mut resumes_skipped: Vec<PaneId> = self
+            .resume_tickets
+            .lock()
+            .iter()
+            .filter(|t| t.expires > now)
+            .map(|t| t.pane)
+            .collect();
         let mut panes = Vec::new();
         for pane in self.all_panes() {
             let mut st = pane.state.lock();
+            if st.pending_input.is_some() && !resumes_skipped.contains(&pane.id) {
+                resumes_skipped.push(pane.id);
+            }
             let exited = st.pty.try_wait().or(st.pty.exit_status());
             let state = st.term.serialize_state();
             panes.push(upgrade::PaneHandoff {
@@ -2342,6 +2729,11 @@ impl Daemon {
                 terminal_size_after_detach: st.terminal_attachment.map(|(_, size)| size.into()),
                 programs: st.term.program_status_handoff(),
                 programs_pgrp: st.programs_pgrp,
+                slave_rdev: st.pty.slave_rdev(),
+                resume_token: st.resume.token().map(str::to_owned),
+                resume_state: Some(st.resume.handoff()),
+                typed: st.typed,
+                osc_7577_discard: st.term.osc_7577_discard(),
             });
         }
         upgrade::Handoff {
@@ -2354,6 +2746,7 @@ impl Daemon {
             restored: self.restored.load(Ordering::Relaxed),
             panes,
             tailnet: self.tailnet.handoff(),
+            resumes_skipped,
         }
     }
 
@@ -2375,10 +2768,11 @@ impl Daemon {
 
     /// Takes over the panes of the image we replaced.
     pub fn adopt(self: &Arc<Self>, h: upgrade::Handoff) {
+        self.loading.store(true, Ordering::Relaxed);
         let mut adopted = 0;
         for p in h.panes {
             let mut size = sanitize_size(p.size.into());
-            let pty = match Pty::adopt(p.fd, p.pid, p.exited) {
+            let pty = match Pty::adopt(p.fd, p.pid, p.exited, p.slave_rdev) {
                 Ok(pty) => pty,
                 Err(e) => {
                     log::warn!("pane {}: cannot adopt fd {}: {e}", p.id, p.fd);
@@ -2403,7 +2797,12 @@ impl Daemon {
             }
             term.set_shell_token(p.shell_token.clone());
             term.set_shell_path(p.shell_path.clone());
+            // Last, after the replay: the rest of an oversized OSC 7577 is still discarded.
+            term.restore_osc_7577_discard(p.osc_7577_discard);
             term.restore_program_status(p.programs.clone());
+            if h.resumes_skipped.contains(&p.id) {
+                term.print("\r\n[automatic resume skipped: the daemon was upgraded]\r\n");
+            }
             let alive = p.exited.is_none();
             let info = PaneInfo {
                 id: p.id,
@@ -2417,6 +2816,10 @@ impl Daemon {
                 ..Default::default()
             };
             self.next_pane.fetch_max(p.id + 1, Ordering::Relaxed);
+            let mut resume = ProgramResumeState::with_token(p.resume_token.clone());
+            if let Some(rs) = p.resume_state {
+                resume.restore_handoff(rs);
+            }
             let installed = self.install_pane(
                 InstallPane {
                     term,
@@ -2430,6 +2833,10 @@ impl Daemon {
                     carry: pending,
                     forwarded_carry,
                     programs_pgrp: p.programs_pgrp,
+                    resume,
+                    pending_input: None,
+                    pending_waits: 0,
+                    typed: p.typed,
                 },
                 alive,
             );
@@ -2462,17 +2869,366 @@ impl Daemon {
         self.next_pane.fetch_max(h.next_pane_id, Ordering::Relaxed);
         *self.layout.lock() = h.layout;
         self.restored.store(h.restored, Ordering::Relaxed);
+        self.loading.store(false, Ordering::Relaxed);
         log::info!("adopted {adopted} panes from the previous daemon");
     }
 
     /// Recreate panes from the last snapshot (after a reboot or daemon restart).
     pub fn restore_session(self: &Arc<Self>) {
         let Some(store) = &self.store else { return };
-        let Some(snap) = store.load() else { return };
+        let Some(mut snap) = store.load() else { return };
+        self.loading.store(true, Ordering::Relaxed);
         let cfg = self.config.read().clone();
         let defs = cfg.agent_defs();
+        let resume_rules = cfg.resume_rules();
+        let policy = resume_policy(&cfg);
+        let my_uid = unsafe { libc::geteuid() };
+        let thurmd_exe = std::env::current_exe().ok();
+        let use_hook = shell::uses_hook_resume(&cfg, self.integration_dir.as_deref());
+        let (shell_prog, shell_args) = shell::interactive_shell(&cfg);
+        let shell_argv: Vec<String> = std::iter::once(shell_prog.clone())
+            .chain(shell_args.iter().cloned())
+            .collect();
+
+        struct PlannedResume {
+            spec: ResumeExecSpec,
+            cwd: Option<String>,
+            first_process: bool,
+            program_label: String,
+            rule: Option<String>,
+        }
+
+        // With OSC 7577 resume off, a saved record is as good as absent: the pane's command
+        // and `resume_agents` apply as if it had never been reported.
+        if program_resume::is_root()
+            || cfg.session.resume_programs == thurm_config::ResumeProgramsMode::Off
+        {
+            for p in &mut snap.panes {
+                p.program_resume = None;
+            }
+        }
+
+        // First pass: validate every saved OSC 7577 record against current config, UID, canonical
+        // paths, directory existence, and shell support; mark accepted ones `attempted = true` on
+        // disk BEFORE spawning so a crash or failed command never retries.
+        // Saved launch evidence is digested with this key: without it, rules fail closed.
+        let evidence_key = snap
+            .panes
+            .iter()
+            .any(|p| p.program_resume.is_some())
+            .then(program_resume::evidence_key)
+            .flatten();
+        let mut plans: Vec<Option<PlannedResume>> = Vec::with_capacity(snap.panes.len());
+        let mut marked_attempted = false;
+        // Records an earlier start already tried: their pane gets a plain shell, since the
+        // program (or its resume) may be what failed.
+        let tried_before: Vec<bool> = snap
+            .panes
+            .iter()
+            .map(|p| p.program_resume.as_ref().is_some_and(|r| r.attempted))
+            .collect();
+        for p in &mut snap.panes {
+            let Some(rec) = p.program_resume.as_mut() else {
+                plans.push(None);
+                continue;
+            };
+            let prog = rec
+                .argv
+                .first()
+                .map(|a| program_resume::escape_display(a))
+                .unwrap_or_default();
+            let skip = |reason: &str| {
+                log::info!(
+                    "pane {}: not resuming saved program {prog} (reason={reason})",
+                    p.id
+                );
+            };
+            if rec.attempted {
+                skip("already_tried");
+                plans.push(None);
+                continue;
+            }
+            if rec.uid != my_uid {
+                log::warn!(
+                    "pane {}: discarding saved program {prog} (reason=uid_mismatch)",
+                    p.id
+                );
+                p.program_resume = None;
+                marked_attempted = true;
+                plans.push(None);
+                continue;
+            }
+            // The directory the command will actually start in: the report's `cwd` (which must
+            // still exist), else the owner's directory if it still exists, else the pane's.
+            let resolved_cwd = if rec.cwd_from_report {
+                match &rec.cwd {
+                    Some(dir) if Path::new(dir).is_dir() => Some(dir.clone()),
+                    _ => {
+                        skip("dir_gone");
+                        plans.push(None);
+                        continue;
+                    }
+                }
+            } else {
+                rec.cwd
+                    .as_ref()
+                    .filter(|d| Path::new(d).is_dir())
+                    .cloned()
+                    .or_else(|| p.cwd.clone())
+            };
+            // Resolved once, here: the rules check the directory the ticket pins below, not one
+            // a symlink swapped in between could lead elsewhere. Kept exactly: a canonical path
+            // that isn't UTF-8 (the ticket's text can't hold it) isn't resumed into, rather
+            // than spelled as another directory's name.
+            let resolved_cwd = match resolved_cwd.map(|dir| match std::fs::canonicalize(&dir) {
+                Ok(c) => c.into_os_string().into_string().ok(),
+                Err(_) => Some(dir),
+            }) {
+                Some(None) => {
+                    skip("dir_unrepresentable");
+                    plans.push(None);
+                    continue;
+                }
+                other => other.flatten(),
+            };
+            let trust = program_resume::evaluate_trust(
+                &TrustSubject {
+                    argv: &rec.argv,
+                    cwd: resolved_cwd.as_deref(),
+                    process_exe: &rec.process_exe,
+                    launch: program_resume::Launch::Saved {
+                        evidence: rec.launch.as_ref(),
+                        key: evidence_key.as_ref(),
+                    },
+                    wrapped: rec.wrapped,
+                },
+                cfg.session.resume_programs,
+                &resume_rules,
+                true,
+            );
+            let (rule, dir_restricted, pin_exe) = match trust {
+                TrustVerdict::Trusted {
+                    rule,
+                    dirs_restricted,
+                    pin_exe,
+                } => (rule, dirs_restricted, pin_exe),
+                TrustVerdict::Untrusted(reason) => {
+                    skip(&format!("not_trusted trust_reason={reason}"));
+                    plans.push(None);
+                    continue;
+                }
+            };
+            // The rule that trusted it limits the program to some directories: it may only
+            // start in one that exists.
+            if dir_restricted
+                && !resolved_cwd
+                    .as_deref()
+                    .is_some_and(|d| Path::new(d).is_dir())
+            {
+                skip("dir_gone");
+                plans.push(None);
+                continue;
+            }
+            // A job of the shell resumes only in the default shell, the one the hook and the
+            // typed line are made for: a pane made with another command (`thurm new -- bash`
+            // under zsh, or another shell of the same name) is restored with that command, and
+            // its program isn't resumed.
+            if !rec.first_process
+                && p.command
+                    .as_ref()
+                    .is_some_and(|c| !same_invocation(c, &shell_prog, &shell_args))
+            {
+                skip("own_command");
+                plans.push(None);
+                continue;
+            }
+            // A job of the shell runs from the shell's own first-prompt hook, or else is typed
+            // into a POSIX shell once its startup files had time to run.
+            if !rec.first_process
+                && !use_hook
+                && !program_resume::shell_supports_job_resume(&shell_prog)
+            {
+                skip("shell_unsupported");
+                plans.push(None);
+                continue;
+            }
+            if thurmd_exe.is_none() {
+                log::warn!(
+                    "pane {}: not resuming saved program {prog} (cannot locate thurmd binary)",
+                    p.id
+                );
+                plans.push(None);
+                continue;
+            }
+            let require_cwd = rec.cwd_from_report || dir_restricted;
+            // A directory it must start in is pinned to the one checked here: its canonical
+            // path (as checked: one that resolves elsewhere now is not it), entered only while
+            // it is still the same directory.
+            let (spec_cwd, cwd_id) = match resolved_cwd.as_deref() {
+                Some(dir) if require_cwd => {
+                    let canon = std::fs::canonicalize(dir)
+                        .ok()
+                        .and_then(|d| d.into_os_string().into_string().ok())
+                        .filter(|c| c == dir);
+                    let id = canon.as_deref().and_then(program_resume::dir_identity);
+                    match (canon, id) {
+                        (Some(canon), Some(id)) => (Some(canon), Some(id)),
+                        _ => {
+                            skip("dir_gone");
+                            plans.push(None);
+                            continue;
+                        }
+                    }
+                }
+                _ => (resolved_cwd.clone(), None),
+            };
+            // A rule that trusted the owner by its executable also decides which program runs:
+            // only one found where that executable (or its script) is. Taken from the verdict,
+            // not looked up by the rule's name: a rule need not have one.
+            let exe_dirs = if pin_exe {
+                let dirs = program_resume::saved_pin_dirs(&rec.process_exe, rec.launch.as_ref());
+                if dirs.is_empty() {
+                    skip("program_gone");
+                    plans.push(None);
+                    continue;
+                }
+                dirs
+            } else {
+                Vec::new()
+            };
+            rec.attempted = true;
+            marked_attempted = true;
+            let title = rec
+                .argv
+                .first()
+                .map(|a| program_resume::escape_display(a.rsplit('/').next().unwrap_or(a)))
+                .unwrap_or_else(|| "shell".into());
+            plans.push(Some(PlannedResume {
+                spec: ResumeExecSpec {
+                    argv: rec.argv.clone(),
+                    // Entered by the helper itself, after the shell's startup files (which may
+                    // change directory) ran.
+                    cwd: spec_cwd,
+                    require_cwd,
+                    cwd_id,
+                    exe_dirs,
+                },
+                cwd: resolved_cwd,
+                first_process: rec.first_process,
+                program_label: title,
+                rule,
+            }));
+        }
+        // Nothing runs unless the snapshot says it was tried: a crash afterwards must not run it
+        // again on the next start.
+        if marked_attempted && let Err(e) = store.save(&snap) {
+            log::warn!("not resuming saved programs: cannot record the attempt: {e}");
+            for plan in &mut plans {
+                *plan = None;
+            }
+        }
+
         let mut restored = 0;
-        for p in &snap.panes {
+        for ((p, plan), tried_before) in snap.panes.iter().zip(plans).zip(tried_before) {
+            if let Some(plan) = plan {
+                let exe = thurmd_exe.as_ref().expect("checked above");
+                // The pane's shell redeems the ticket for the command; the command itself
+                // stays in this process. In place before the shell starts.
+                let ticket = match program_resume::generate_ticket() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::warn!("pane {}: cannot resume {}: {e}", p.id, plan.program_label);
+                        String::new()
+                    }
+                };
+                if !ticket.is_empty() {
+                    self.resume_tickets.lock().push(ResumeTicket {
+                        ticket: ticket.clone(),
+                        pane: p.id,
+                        spec: plan.spec.clone(),
+                        expires: Instant::now() + program_resume::TICKET_TTL,
+                        policy: policy.clone(),
+                    });
+                    let req = CreatePane {
+                        // The pane's own command (the default shell, for a job of it).
+                        command: p.command.clone(),
+                        cwd: plan.cwd.clone(),
+                        size: p.size.into(),
+                        ..Default::default()
+                    };
+                    let launch = if plan.first_process {
+                        RestoreLaunch::FirstProcess {
+                            exec: exe,
+                            ticket: &ticket,
+                            title: plan.program_label.clone(),
+                            shell: &shell_argv,
+                        }
+                    } else if use_hook {
+                        RestoreLaunch::Hook {
+                            exec: exe,
+                            ticket: &ticket,
+                        }
+                    } else {
+                        RestoreLaunch::Normal
+                    };
+                    match self.create_pane_with_resume(req, Some(p.id), launch) {
+                        Ok(id) => {
+                            restored += 1;
+                            log::info!(
+                                "pane {id}: resuming saved program {} (rule={})",
+                                plan.program_label,
+                                plan.rule.as_deref().unwrap_or("all")
+                            );
+                            if !plan.first_process
+                                && !use_hook
+                                && let Some(pane) = self.pane(id)
+                            {
+                                // No hook: typed like `resume_agents` does, once the shell
+                                // holds the terminal and nobody typed (see `pending_input`). A
+                                // leading space keeps it out of history where configured; only
+                                // the helper's path and the ticket are typed, never `argv`.
+                                let line = format!(
+                                    " {} --exec-resume {}\r",
+                                    shell::shell_quote(&exe.display().to_string()),
+                                    ticket,
+                                );
+                                pane.state.lock().pending_input = Some((
+                                    Instant::now() + Duration::from_millis(2500),
+                                    line.into_bytes(),
+                                ));
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            self.resume_tickets.lock().retain(|t| t.pane != p.id);
+                            log::warn!(
+                                "pane {}: cannot resume {}, starting a shell: {e}",
+                                p.id,
+                                plan.program_label
+                            );
+                        }
+                    }
+                }
+            }
+
+            // A record an earlier start already tried gets a plain shell in the pane's saved cwd,
+            // not `p.command` or `agent_resume`: never run what may have failed twice. Any other
+            // record not resumed here (untrusted, dir_gone, shell_unsupported, or a failed
+            // launch) leaves the pane as if it had never been reported.
+            if tried_before {
+                let req = CreatePane {
+                    command: None,
+                    cwd: p.cwd.clone(),
+                    size: p.size.into(),
+                    ..Default::default()
+                };
+                match self.create_pane(req, Some(p.id)) {
+                    Ok(_) => restored += 1,
+                    Err(e) => log::warn!("failed to restore pane {}: {e}", p.id),
+                }
+                continue;
+            }
+
             let reported_resume = p.agent_resume.as_ref().filter(|argv| {
                 cfg.session.resume_agents
                     && p.agent_session.is_some()
@@ -2566,6 +3322,7 @@ impl Daemon {
         self.next_pane
             .fetch_max(snap.next_pane_id, Ordering::Relaxed);
         *self.layout.lock() = snap.layout;
+        self.loading.store(false, Ordering::Relaxed);
         if restored > 0 {
             self.restored.store(true, Ordering::Relaxed);
             log::info!("restored {restored} panes from snapshot");
@@ -3147,6 +3904,7 @@ impl Daemon {
                 self.with_input_pane(client.id, pane, |p, st| {
                     self.used_by(client, st);
                     if !data.is_empty() {
+                        st.typed = true;
                         st.agent.prompt.interrupted();
                     }
                     st.agent.user_answer(&data);
@@ -3166,9 +3924,10 @@ impl Daemon {
             }
             Request::Key { pane, key } => {
                 self.with_input_pane(client.id, pane, |p, st| {
-                    self.used_by(client, st);
                     let bytes = st.term.key(&key);
+                    self.used_by(client, st);
                     if !bytes.is_empty() {
+                        st.typed = true;
                         st.agent.prompt.interrupted();
                         st.agent.user_answer(&bytes);
                         self.acknowledge_programs(pane, st);
@@ -3842,6 +4601,124 @@ impl Daemon {
             Request::GetPendingPrompt { pane } => self.with_pane(pane, |_, st| {
                 Response::PendingPrompt(st.agent.pending_prompt(pane))
             }),
+            Request::ResumeRecords { pane } => {
+                // The records hold programs' arguments, which can carry credentials (sealed on
+                // disk for that reason): only for the `thurm resume` CLI of this user on this
+                // machine, never a remote, mobile or SSH-forwarded client.
+                if !client.is_local_cli() {
+                    return Err("not allowed".into());
+                }
+                let (mode, rules) = {
+                    let cfg = self.config.read();
+                    (cfg.session.resume_programs, cfg.resume_rules())
+                };
+                let targets: Vec<Arc<Pane>> = match pane {
+                    Some(id) => vec![self.pane(id).ok_or_else(|| format!("unknown pane {id}"))?],
+                    None => self.all_panes(),
+                };
+                // A client still reading earlier answers gets no more (each can be large).
+                if client.queued.load(Ordering::Relaxed) > OUTPUT_BACKLOG_BYTES {
+                    return Err("busy: read the previous answers first".into());
+                }
+                let all = pane.is_none();
+                let mut list = Vec::with_capacity(targets.len());
+                let mut bytes = 0;
+                for p in targets {
+                    let records = {
+                        let st = p.state.lock();
+                        st.resume.inspect(st.pty.foreground_pgrp(), mode, &rules)
+                    };
+                    let entry = thurm_proto::PaneResumeRecords {
+                        pane: p.id,
+                        records,
+                    };
+                    bytes += resume_records_weight(std::slice::from_ref(&entry));
+                    if all && bytes > RESUME_LIST_BYTES {
+                        return Err(
+                            "too many program resume records to list at once: ask for one pane \
+                             (thurm resume --pane ID)"
+                                .into(),
+                        );
+                    }
+                    list.push(entry);
+                }
+                Ok(Response::ResumeRecords(list))
+            }
+            Request::TakeResume { ticket } => {
+                // Only this user's own processes on this machine (the pane's shell).
+                if !client.is_local_peer() {
+                    return Err("not allowed".into());
+                }
+                // Only from the ticket's own pane (see `Client::runs_on_terminal`), checked
+                // before anything of the ticket is used. The pane's lock is not taken under
+                // the tickets' (the monitor takes them the other way round).
+                let ticket_pane = {
+                    let now = Instant::now();
+                    self.resume_tickets
+                        .lock()
+                        .iter()
+                        .find(|t| t.expires > now && program_resume::ticket_eq(&t.ticket, &ticket))
+                        .map(|t| t.pane)
+                };
+                // The pane's terminal, and the one its shell runs on behind a PTY proxy
+                // (`script`, `atuin pty-proxy`): the terminal of the pane's foreground group,
+                // which `Pty::foreground_pgrp` follows only through proxies that read the
+                // pane's terminal (as the agent detection does).
+                let mut pane_ttys = Vec::new();
+                if let Some(p) = ticket_pane.and_then(|id| self.pane(id)) {
+                    let (slave, fg) = {
+                        let st = p.state.lock();
+                        (st.pty.slave_rdev(), st.pty.foreground_pgrp())
+                    };
+                    pane_ttys.extend(slave);
+                    pane_ttys.extend(fg.and_then(procinfo::controlling_tty));
+                }
+                if ticket_pane.is_some() && !client.runs_on_terminal(&pane_ttys) {
+                    return Err("not allowed".into());
+                }
+                let spec = {
+                    let mut tickets = self.resume_tickets.lock();
+                    // Not while an upgrade hands the panes over without it: waits for the
+                    // outcome, with no deadline of its own (see `set_handing_over`).
+                    while self.handing_over.load(Ordering::SeqCst) {
+                        self.handover_ended.wait(&mut tickets);
+                    }
+                    let now = Instant::now();
+                    let pos = tickets.iter().position(|t| {
+                        t.expires > now && program_resume::ticket_eq(&t.ticket, &ticket)
+                    });
+                    pos.map(|i| tickets.swap_remove(i))
+                };
+                let ResumeTicket {
+                    pane, spec, policy, ..
+                } = spec.ok_or("unknown or used resume ticket")?;
+                // Issued under other resume settings (reloaded, or another image's since an
+                // upgrade): what let it resume may no longer.
+                if policy != resume_policy(&self.config.read()) {
+                    if let Some(pane) = self.pane(pane) {
+                        pane.state
+                            .lock()
+                            .term
+                            .print("\r\n[automatic resume skipped: resume settings changed]\r\n");
+                    }
+                    return Err(
+                        "skipped: resume settings changed since the pane was restored".into(),
+                    );
+                }
+                // Someone typed before the shell's first prompt: what they typed would go to
+                // the resumed program (or join its line), so it isn't resumed. Every shell's
+                // hook comes here; the typed line checks `typed` itself.
+                if let Some(pane) = self.pane(pane) {
+                    let mut st = pane.state.lock();
+                    if st.typed {
+                        st.term.print("\r\n[automatic resume skipped: the terminal was busy]\r\n");
+                        return Err("skipped: input was typed before the shell was ready".into());
+                    }
+                }
+                serde_json::to_string(&spec)
+                    .map(Response::Text)
+                    .map_err(|e| e.to_string())
+            }
         }
     }
 
@@ -3891,6 +4768,7 @@ impl Daemon {
     ) {
         self.used_by(client, st);
         if !text.is_empty() {
+            st.typed = true;
             st.agent.prompt.interrupted();
         }
         st.agent.user_input();
@@ -4024,10 +4902,16 @@ impl Daemon {
     }
 
     pub fn apply_config(&self, cfg: Config) {
-        if cfg.ai != self.config.read().ai {
-            // Turned off, or on again: ask the model afresh (it may have become available).
-            self.ai.stop();
-        }
+        let resume_changed = {
+            let prev = self.config.read();
+            if cfg.ai != prev.ai {
+                // Turned off, or on again: ask the model afresh (it may have become available).
+                self.ai.stop();
+            }
+            cfg.session.resume_programs != prev.session.resume_programs
+                || cfg.session.resume_default_rules != prev.session.resume_default_rules
+                || cfg.session.resume_rules != prev.session.resume_rules
+        };
         *self.engine.write() = EngineConfig::from_config(&cfg, self.dark.load(Ordering::Relaxed));
         *self.agent_defs.write() = cfg.agent_defs();
         *self.program_defs.write() = cfg.program_defs();
@@ -4043,7 +4927,35 @@ impl Daemon {
             st.agent.titles = session_titles;
             drop(st);
         }
+        if resume_changed {
+            self.drop_stale_tickets();
+            self.session_dirty.store(true, Ordering::Relaxed);
+            let _ = self.save_session();
+        }
         self.broadcast(Event::ConfigReloaded, false);
+    }
+
+    /// Forgets the resume tickets issued under other resume settings than the current ones,
+    /// and the helper lines still to be typed for them (`TakeResume` refuses them anyway).
+    fn drop_stale_tickets(&self) {
+        let policy = resume_policy(&self.config.read());
+        let mut stale = Vec::new();
+        self.resume_tickets.lock().retain(|t| {
+            let keep = t.policy == policy;
+            if !keep {
+                stale.push(t.pane);
+            }
+            keep
+        });
+        for id in stale {
+            if let Some(pane) = self.pane(id) {
+                let mut st = pane.state.lock();
+                // A ticket's pane gets no other typed line: this one is the helper's.
+                st.pending_input = None;
+                st.term
+                    .print("\r\n[automatic resume skipped: resume settings changed]\r\n");
+            }
+        }
     }
 
     fn wait(
@@ -4798,18 +5710,20 @@ mod tests {
     #[test]
     fn reports_are_found_across_reads() {
         let stream = b"ab\x1b]7501;state=working:app=x\x1b\\cd\x1b]7501;app=y\x07ef";
-        // Where each report ends: the first ESC or BEL after its marker.
-        let ends: Vec<usize> = memchr::memmem::find_iter(stream, ReportScan::MARKER)
+        // Where each report is complete (and parsed): its BEL, or the backslash of its ST
+        // (`ESC \`), which a read may split from the ESC.
+        let ends: Vec<usize> = memchr::memmem::find_iter(stream, ReportScan::STATUS)
             .map(|m| {
-                m + stream[m..]
+                let at = m + stream[m..]
                     .iter()
                     .position(|&b| b == 0x1b || b == 0x07)
-                    .unwrap()
+                    .unwrap();
+                if stream[at] == 0x1b { at + 1 } else { at }
             })
             .collect();
         assert_eq!(ends.len(), 2);
         let check = |cuts: &[usize]| {
-            let mut scan = ReportScan::default();
+            let mut scan = ReportScan::new(ReportScan::STATUS);
             let mut start = 0;
             for &end in cuts.iter().chain([&stream.len()]) {
                 let touched = scan.read(&stream[start..end]);
@@ -4830,10 +5744,17 @@ mod tests {
                 check(&[a, b]);
             }
         }
-        let mut scan = ReportScan::default();
+        let mut scan = ReportScan::new(ReportScan::STATUS);
         for chunk in b"plain ]750 output\x1b]0;title\x07 and 1;7501;".chunks(3) {
             assert!(!scan.read(chunk), "{chunk:?}");
         }
+        // Program resume reports are followed alike, each kind by its own scan.
+        let mut resume = ReportScan::new(ReportScan::RESUME);
+        let mut status = ReportScan::new(ReportScan::STATUS);
+        let parts: [&[u8]; 3] = [b"x\x1b]75", b"77;v=1;pid=4;argv=", b"YQ==\x07y"];
+        let touched: Vec<bool> = parts.iter().map(|p| resume.read(p)).collect();
+        assert_eq!(touched, [false, true, true]);
+        assert!(parts.iter().all(|p| !status.read(p)));
     }
 
     /// A program behind a PTY proxy reports, then ends without a prompt mark: its report is
@@ -5024,6 +5945,7 @@ mod tests {
             exit: parking_lot::ReentrantMutex::new(()),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
+            peer_pid: Mutex::new(None),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),
@@ -5719,6 +6641,339 @@ mod tests {
         assert_eq!(json["body"], "asks for permission");
 
         daemon.close_pane(pane);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("thurm-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cat_pane(daemon: &Arc<Daemon>) -> PaneId {
+        daemon
+            .create_pane(
+                CreatePane {
+                    command: Some(vec!["cat".into()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+    }
+
+    fn ticket_for(pane: PaneId, ticket: &str, policy: String) -> ResumeTicket {
+        ResumeTicket {
+            ticket: ticket.to_owned(),
+            pane,
+            spec: ResumeExecSpec {
+                argv: vec!["/bin/true".into()],
+                cwd: None,
+                require_cwd: false,
+                cwd_id: None,
+                exe_dirs: Vec::new(),
+            },
+            expires: Instant::now() + Duration::from_secs(60),
+            policy,
+        }
+    }
+
+    /// A pane command names the configured shell only when it is the same file with the same
+    /// arguments: another shell of the same name is not interchangeable with it.
+    #[test]
+    fn a_shell_of_the_same_name_elsewhere_is_another_command() {
+        let dir = test_dir("same-invocation");
+        for d in ["a", "b", "c"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let a = dir.join("a/sh");
+        let b = dir.join("b/sh");
+        std::fs::write(&a, "#!/bin/sh\n").unwrap();
+        std::fs::write(&b, "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&a, dir.join("c/sh")).unwrap();
+        let s = |p: &Path| p.display().to_string();
+        let a_s = s(&a);
+        assert!(same_invocation(std::slice::from_ref(&a_s), &a_s, &[]));
+        // The same file by another path.
+        assert!(same_invocation(&[s(&dir.join("c/sh"))], &a_s, &[]));
+        // The same file by another name (`sh` linked to `bash`): it may run differently.
+        std::os::unix::fs::symlink(&a, dir.join("c/bash")).unwrap();
+        assert!(!same_invocation(&[s(&dir.join("c/bash"))], &a_s, &[]));
+        assert!(!same_invocation(
+            std::slice::from_ref(&a_s),
+            &s(&dir.join("c/bash")),
+            &[]
+        ));
+        assert!(!same_invocation(&[s(&b)], &a_s, &[]));
+        // The configured arguments must come along, and nothing else.
+        assert!(!same_invocation(
+            std::slice::from_ref(&a_s),
+            &a_s,
+            &["-l".into()]
+        ));
+        assert!(same_invocation(
+            &[a_s.clone(), "-l".into()],
+            &a_s,
+            &["-l".into()]
+        ));
+        assert!(!same_invocation(&[a_s.clone(), "-x".into()], &a_s, &[]));
+        assert!(!same_invocation(&[], &a_s, &[]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A resume record's change that fails to save stays to be saved: the next tick retries
+    /// instead of waiting for the snapshot interval.
+    #[test]
+    fn a_resume_save_that_fails_is_retried() {
+        let dir = test_dir("resume-save-retry");
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(daemon.store.is_some());
+        // Nothing can replace a non-empty directory where the snapshot goes.
+        std::fs::create_dir_all(dir.join("state/session.json/x")).unwrap();
+        daemon.session_dirty.store(false, Ordering::Relaxed);
+        assert!(daemon.save_session_now().is_err());
+        assert!(daemon.session_dirty.load(Ordering::Relaxed));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A ticket is redeemed only under the resume settings it was issued under: a reload that
+    /// changes them forgets it (and its line to type), and one from another configuration (an
+    /// upgrade's previous image) is refused.
+    #[test]
+    fn resume_tickets_follow_the_resume_settings() {
+        let dir = test_dir("ticket-policy");
+        let mut cfg = Config::default();
+        cfg.session.resume_programs = thurm_config::ResumeProgramsMode::All;
+        let daemon = Daemon::new(
+            cfg.clone(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let id = cat_pane(&daemon);
+        let pane = daemon.pane(id).unwrap();
+        let t1 = "a1".repeat(16);
+        daemon
+            .resume_tickets
+            .lock()
+            .push(ticket_for(id, &t1, resume_policy(&cfg)));
+        pane.state.lock().pending_input = Some((
+            Instant::now() + Duration::from_secs(600),
+            b" thurmd --exec-resume x\r".to_vec(),
+        ));
+        // A reload that leaves them alone keeps it.
+        daemon.apply_config(cfg.clone());
+        assert_eq!(daemon.resume_tickets.lock().len(), 1);
+        assert!(pane.state.lock().pending_input.is_some());
+        let mut off = cfg.clone();
+        off.session.resume_programs = thurm_config::ResumeProgramsMode::Off;
+        daemon.apply_config(off.clone());
+        assert!(daemon.resume_tickets.lock().is_empty());
+        assert!(pane.state.lock().pending_input.is_none());
+        // Redeemed from the pane itself: its `cat` stands for the shell's helper.
+        let (client, _rx) = daemon.add_client();
+        *client.peer_pid.lock() = pane.state.lock().info.pid;
+        let got = daemon.dispatch(&client, Request::TakeResume { ticket: t1 });
+        assert!(got.is_err(), "{got:?}");
+
+        // Issued under other settings than these: refused when redeemed.
+        let t2 = "b2".repeat(16);
+        daemon
+            .resume_tickets
+            .lock()
+            .push(ticket_for(id, &t2, resume_policy(&cfg)));
+        let got = daemon.dispatch(&client, Request::TakeResume { ticket: t2 });
+        assert!(
+            matches!(&got, Err(e) if e.contains("settings changed")),
+            "{got:?}"
+        );
+        // Under these settings: redeemed.
+        let t3 = "c3".repeat(16);
+        daemon
+            .resume_tickets
+            .lock()
+            .push(ticket_for(id, &t3, resume_policy(&off)));
+        let got = daemon.dispatch(&client, Request::TakeResume { ticket: t3 });
+        assert!(matches!(&got, Ok(Response::Text(_))), "{got:?}");
+        daemon.close_pane(id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A resume ticket is redeemed only from its own pane: a process on another terminal, one
+    /// on none (a socket forwarded over SSH comes from `sshd`) or an unknown one is refused,
+    /// and the ticket stays for the pane's shell.
+    #[test]
+    fn a_resume_ticket_is_redeemed_only_from_its_pane() {
+        let dir = test_dir("ticket-pane");
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let id = cat_pane(&daemon);
+        let other = cat_pane(&daemon);
+        let ticket = "f6".repeat(16);
+        let policy = resume_policy(&daemon.config.read());
+        daemon
+            .resume_tickets
+            .lock()
+            .push(ticket_for(id, &ticket, policy));
+        let take = |client: &Arc<Client>| {
+            daemon.dispatch(
+                client,
+                Request::TakeResume {
+                    ticket: ticket.clone(),
+                },
+            )
+        };
+        let refused = |got: &Result<Response, String>| matches!(got, Err(e) if e == "not allowed");
+        let (unknown, _rx) = daemon.add_client();
+        assert!(refused(&take(&unknown)));
+        let (elsewhere, _rx2) = daemon.add_client();
+        *elsewhere.peer_pid.lock() = daemon.pane(other).unwrap().state.lock().info.pid;
+        assert!(refused(&take(&elsewhere)));
+        let (no_terminal, _rx3) = daemon.add_client();
+        *no_terminal.peer_pid.lock() = Some(std::process::id());
+        if crate::procinfo::controlling_tty(std::process::id()).is_none() {
+            assert!(refused(&take(&no_terminal)));
+        }
+        assert_eq!(daemon.resume_tickets.lock().len(), 1);
+        let (in_pane, _rx4) = daemon.add_client();
+        *in_pane.peer_pid.lock() = daemon.pane(id).unwrap().state.lock().info.pid;
+        let got = take(&in_pane);
+        assert!(matches!(&got, Ok(Response::Text(_))), "{got:?}");
+        for p in [id, other] {
+            daemon.close_pane(p);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The resume records hold programs' arguments (credentials too): only the `thurm` CLI of
+    /// this user on this machine may list them; not a tailnet or mobile client, nor a same-user
+    /// connection from another program (an SSH socket forward comes from `sshd`).
+    #[test]
+    fn resume_records_are_for_the_local_cli_only() {
+        use std::path::Path;
+        assert!(is_cli_executable(Path::new("/usr/local/bin/thurm")));
+        assert!(is_cli_executable(Path::new(
+            "/Applications/Thurm.app/Contents/MacOS/thurm"
+        )));
+        assert!(!is_cli_executable(Path::new("/usr/sbin/sshd")));
+        assert!(!is_cli_executable(Path::new("/usr/libexec/sshd-session")));
+        assert!(!is_cli_executable(Path::new("/opt/thurm/thurmd")));
+
+        let dir = test_dir("records-local");
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let records =
+            |client: &Arc<Client>| daemon.dispatch(client, Request::ResumeRecords { pane: None });
+        let refused = |got: &Result<Response, String>| matches!(got, Err(e) if e == "not allowed");
+        // A local peer whose process is unknown, or is not the CLI (this test binary).
+        let (unknown, _rx) = daemon.add_client();
+        assert!(refused(&records(&unknown)));
+        let (other, _rx2) = daemon.add_client();
+        *other.peer_pid.lock() = Some(std::process::id());
+        assert!(refused(&records(&other)));
+        // A tailnet caller, whatever its process.
+        let (remote, _rx3) = daemon.add_client();
+        *remote.principal.lock() = Some(thurm_proto::Principal {
+            kind: thurm_proto::PrincipalKind::Tailscale,
+            ..Default::default()
+        });
+        *remote.peer_pid.lock() = Some(std::process::id());
+        assert!(refused(&records(&remote)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An upgrade hands over no pending resume: the next image only notes it as skipped. They
+    /// stay pending here, untouched while the panes are handed over, so an upgrade that gives
+    /// up after capturing them leaves them to resume as before.
+    #[test]
+    fn pending_resumes_stay_here_and_are_not_handed_over() {
+        let dir = test_dir("upgrade-resumes");
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let waiting = cat_pane(&daemon);
+        let ticketed = cat_pane(&daemon);
+        let plain = cat_pane(&daemon);
+        assert!(!daemon.resumes_pending());
+        // An expired ticket waits for nothing.
+        let mut stale = ticket_for(plain, &"e5".repeat(16), String::new());
+        stale.expires = Instant::now();
+        daemon.resume_tickets.lock().push(stale);
+        assert!(!daemon.resumes_pending());
+        let due = Instant::now();
+        daemon.pane(waiting).unwrap().state.lock().pending_input = Some((due, b"x\r".to_vec()));
+        let policy = resume_policy(&daemon.config.read());
+        daemon
+            .resume_tickets
+            .lock()
+            .push(ticket_for(ticketed, &"d4".repeat(16), policy));
+        assert!(daemon.resumes_pending());
+
+        daemon.set_handing_over(true);
+        let h = daemon.handoff(-1, false);
+        let mut skipped = h.resumes_skipped.clone();
+        skipped.sort_unstable();
+        assert_eq!(skipped, vec![waiting, ticketed]);
+        // Nothing resumes here meanwhile: the due line stays untyped.
+        let pane = daemon.pane(waiting).unwrap();
+        daemon.type_pending_input(&pane, &mut pane.state.lock());
+        let line = Some((due, b"x\r".to_vec()));
+        assert_eq!(pane.state.lock().pending_input, line);
+
+        // A redemption meanwhile waits for the outcome, however long the hand-off takes.
+        let (client, _rx) = daemon.add_client();
+        *client.peer_pid.lock() = daemon.pane(ticketed).unwrap().state.lock().info.pid;
+        std::thread::scope(|s| {
+            let redeem = s.spawn(|| {
+                daemon.dispatch(
+                    &client,
+                    Request::TakeResume {
+                        ticket: "d4".repeat(16),
+                    },
+                )
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!redeem.is_finished());
+            let tickets = daemon.resume_tickets.lock();
+            assert!(tickets.iter().any(|t| t.pane == ticketed));
+            drop(tickets);
+
+            // The upgrade gave up: the redemption goes on, and the rest is serviced again.
+            daemon.set_handing_over(false);
+            let got = redeem.join().unwrap();
+            assert!(matches!(&got, Ok(Response::Text(_))), "{got:?}");
+        });
+        let tickets = daemon.resume_tickets.lock();
+        assert!(!tickets.iter().any(|t| t.pane == ticketed));
+        drop(tickets);
+        assert!(daemon.resumes_pending());
+        daemon.type_pending_input(&pane, &mut pane.state.lock());
+        {
+            // `cat` is no shell: the line waits for one.
+            let st = pane.state.lock();
+            assert_eq!(st.pending_waits, 1);
+            assert!(st.pending_input.as_ref().is_some_and(|(d, _)| *d > due));
+        }
+        for id in [waiting, ticketed, plain] {
+            daemon.close_pane(id);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

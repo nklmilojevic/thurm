@@ -10,6 +10,7 @@ pub mod hooks;
 pub mod plugins;
 mod overlay;
 mod programs;
+mod resume;
 pub mod settings;
 mod themes;
 
@@ -20,6 +21,10 @@ use thurm_proto::AgentStatus;
 
 pub use agents::{AgentDef, builtin_agents};
 pub use programs::{CATEGORIES, ProgramDef, builtin_programs, executable_name, identify, marks};
+pub use resume::{
+    FlagArity, ResumeProgramsMode, ResumeRule, builtin_resume_rules, resolve_resume_rules,
+    resume_rule_warnings,
+};
 pub use themes::{Theme, builtin_theme, builtin_theme_names, is_own_theme};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -790,6 +795,12 @@ pub struct SessionConfig {
     pub quit: QuitBehavior,
     /// When a restored pane was running an agent with a `resume` command, run it again.
     pub resume_agents: bool,
+    /// Whether and how to resume programs that reported a resume command via OSC 7577.
+    pub resume_programs: ResumeProgramsMode,
+    /// Include Thurm's built-in trust rules for OSC 7577 program resume.
+    pub resume_default_rules: bool,
+    /// User trust rules for OSC 7577 program resume (`[[session.resume_rules]]`).
+    pub resume_rules: Vec<ResumeRule>,
     /// Exit the daemon this many seconds after the last pane closed (0 = never).
     pub daemon_idle_exit_secs: u64,
 }
@@ -802,6 +813,9 @@ impl Default for SessionConfig {
             snapshot_interval_secs: 15,
             quit: QuitBehavior::Detach,
             resume_agents: true,
+            resume_programs: ResumeProgramsMode::Rules,
+            resume_default_rules: true,
+            resume_rules: Vec::new(),
             daemon_idle_exit_secs: 0,
         }
     }
@@ -1349,6 +1363,110 @@ pub fn state_dir() -> PathBuf {
     }
 }
 
+/// `<state>-keys`, next to the state directory `state` and never inside it: a trailing
+/// separator (`/srv/thurm/state/`) would otherwise make it `<state>/-keys`, which copies of the
+/// state directory carry along with the evidence the key signs.
+fn keys_beside(state: &Path) -> PathBuf {
+    let mut name = state.components().collect::<PathBuf>().into_os_string();
+    name.push("-keys");
+    PathBuf::from(name)
+}
+
+/// Where the daemon keeps the key that digests and seals saved program resume records: outside
+/// the state directory, so `session.json` and a copy of it never carry what opens them.
+/// `THURM_KEY_DIR` overrides it; with `THURM_STATE_DIR` set it is that directory's `-keys`
+/// sibling, else `~/Library/Application Support/Thurm Keys` on macOS and
+/// `~/.local/share/thurm/keys` elsewhere (the data directory, not the state or config one).
+/// A default that falls inside the state directory (`XDG_DATA_HOME` and `XDG_STATE_HOME` the
+/// same directory) gives way to the `-keys` sibling; an override inside it is an error.
+pub fn resume_key_dir() -> Result<PathBuf, String> {
+    let state = state_dir();
+    let over = std::env::var_os("THURM_KEY_DIR").map(PathBuf::from);
+    let default = if std::env::var_os("THURM_STATE_DIR").is_some() {
+        keys_beside(&state)
+    } else {
+        default_key_dir()
+    };
+    key_dir_outside(&state, over, default)
+}
+
+#[cfg(target_vendor = "apple")]
+fn default_key_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Thurm Keys")
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn default_key_dir() -> PathBuf {
+    dirs::data_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("thurm")
+        .join("keys")
+}
+
+/// `over` (or else `default`, or else `state`'s `-keys` sibling) unless it resolves to `state`
+/// or a directory in it, symlinks followed as far as the paths exist. What it returns is the
+/// resolved path, the one that was checked.
+fn key_dir_outside(
+    state: &Path,
+    over: Option<PathBuf>,
+    default: PathBuf,
+) -> Result<PathBuf, String> {
+    // A path that does not resolve (a dangling symlink on it) counts as inside.
+    let outside = {
+        let state = resolve_existing(state);
+        move |dir: &Path| {
+            resolve_existing(dir).filter(|d| state.as_ref().is_some_and(|s| !d.starts_with(s)))
+        }
+    };
+    if let Some(dir) = over {
+        return outside(&dir).ok_or_else(|| {
+            format!(
+                "THURM_KEY_DIR {} is inside the state directory {} or does not resolve",
+                dir.display(),
+                state.display()
+            )
+        });
+    }
+    if let Some(dir) = outside(&default) {
+        return Ok(dir);
+    }
+    outside(&keys_beside(state)).ok_or_else(|| {
+        format!(
+            "no key directory outside the state directory {}",
+            state.display()
+        )
+    })
+}
+
+/// `path` made absolute and resolved component by component the way the system does: each
+/// symlink is followed before a `..` after it applies, and the part that does not exist yet is
+/// appended as named. `None` when a dangling symlink is on it (where it leads is not known).
+fn resolve_existing(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut abs = std::env::current_dir().unwrap_or_default();
+    abs.push(path);
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+        match std::fs::canonicalize(&out) {
+            Ok(real) => out = real,
+            // Missing, not a dangling symlink: the rest is made as named.
+            Err(_) if std::fs::symlink_metadata(&out).is_err() => {}
+            Err(_) => return None,
+        }
+    }
+    Some(out)
+}
+
 /// The dial socket's file name, beside the daemon's socket.
 pub const TAILNET_DIAL_SOCKET: &str = "tailnet-dial.sock";
 
@@ -1528,6 +1646,47 @@ pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
     }
 }
 
+/// The pid of the process at the other end of `stream`, where the system says it (Linux's
+/// `SO_PEERCRED`, Apple's `LOCAL_PEERPID`).
+#[cfg(unix)]
+pub fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        (libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        ) == 0
+            && cred.pid > 0)
+            .then_some(cred.pid as u32)
+    }
+    #[cfg(target_vendor = "apple")]
+    unsafe {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        (libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        ) == 0
+            && pid > 0)
+            .then_some(pid as u32)
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
 /// Where the app keeps its end of each remote tunnel (`<name>.sock`) and the tunnel's state
 /// (`<name>.state`, read by `thurm --remote`): `~/Library/Caches/Thurm/remote` on macOS,
 /// `$XDG_CACHE_HOME/thurm/remote` elsewhere. `THURM_REMOTE_DIR` overrides it.
@@ -1673,6 +1832,10 @@ impl Config {
             .apply_replaced_keys(&notification_keys(text));
         cfg.validate()?;
         cfg.drop_unusable_entries(&mut unknown);
+        unknown.extend(resume_rule_warnings(
+            cfg.session.resume_default_rules,
+            &cfg.session.resume_rules,
+        ));
         Ok((cfg, unknown))
     }
 
@@ -1705,15 +1868,30 @@ impl Config {
             Err(e) => return Err(fail(e.to_string())),
         };
         let overlay_path = overlay::path_beside(&path);
-        let (text, mut warnings) = match overlay::read(&overlay_path) {
+        // Whether program resume settings in the overlay may have been lost: it could not be
+        // read or parsed, or one of them was left out.
+        let (text, mut warnings, resume_lost) = match overlay::read_for_load(&overlay_path) {
             Ok(overlay) => {
                 let merged = overlay::merge(&text, &overlay).map_err(fail)?;
-                (merged.text, merged.warnings)
+                let lost = merged
+                    .rejected
+                    .iter()
+                    .any(|k| k == "*" || k == "session" || k.starts_with("session.resume"));
+                (merged.text, merged.warnings, lost)
             }
-            Err(e) => (text, vec![format!("{}: {e}", overlay_path.display())]),
+            Err(e) => (text, vec![format!("{}: {e}", overlay_path.display())], true),
         };
-        let (cfg, unknown) = Self::parse_with_warnings(&text).map_err(fail)?;
+        let (mut cfg, unknown) = Self::parse_with_warnings(&text).map_err(fail)?;
         warnings.extend(unknown);
+        // It may have been the overlay that turned program resume off: the base config (or the
+        // defaults) must not run a saved command the user meant to stop.
+        if resume_lost && cfg.session.resume_programs != ResumeProgramsMode::Off {
+            cfg.session.resume_programs = ResumeProgramsMode::Off;
+            warnings.push(format!(
+                "{}: program resume is off until it loads",
+                overlay_path.display()
+            ));
+        }
         Ok((with_session_theme(cfg), warnings))
     }
 
@@ -1766,6 +1944,11 @@ impl Config {
             .into_iter()
             .filter(|b| !user.iter().any(|d| d.id == b.id));
         user.iter().cloned().chain(builtins).collect()
+    }
+
+    /// Effective trust rules for OSC 7577 program resume.
+    pub fn resume_rules(&self) -> Vec<ResumeRule> {
+        resolve_resume_rules(self.session.resume_default_rules, &self.session.resume_rules)
     }
 
     /// Launch presets: explicit ones from the config, otherwise one per built-in agent
@@ -2384,6 +2567,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_key_directory_is_never_inside_the_state_directory() {
+        let base = std::env::temp_dir().join(format!("thurm-keydir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("share/thurm")).unwrap();
+        let base = std::fs::canonicalize(base).unwrap();
+        let state = base.join("share/thurm");
+        // XDG_STATE_HOME and XDG_DATA_HOME the same directory: the default gives way.
+        assert_eq!(
+            key_dir_outside(&state, None, state.join("keys")).unwrap(),
+            base.join("share/thurm-keys")
+        );
+        // A state directory not made yet, under a symlinked parent: the path that was checked.
+        std::os::unix::fs::symlink(base.join("share"), base.join("alias")).unwrap();
+        let new_state = base.join("alias/new/state");
+        assert_eq!(
+            key_dir_outside(&new_state, None, base.join("share/new/state/k")).unwrap(),
+            base.join("share/new/state-keys")
+        );
+        // A symlink into a directory of the state one, then `..`: the system follows the
+        // symlink first, and so does the check.
+        std::fs::create_dir_all(base.join("share/thurm/subdir")).unwrap();
+        std::fs::create_dir_all(base.join("config")).unwrap();
+        std::os::unix::fs::symlink(base.join("share/thurm/subdir"), base.join("config/link"))
+            .unwrap();
+        std::os::unix::fs::symlink("../share/thurm/subdir", base.join("config/rel")).unwrap();
+        // A dangling symlink: where it leads is not known.
+        std::os::unix::fs::symlink(base.join("nowhere"), base.join("config/dangling")).unwrap();
+        // An override inside it, through an alias or `..`, is refused; one beside it is kept.
+        for over in [
+            "alias/thurm/keys",
+            "share/thurm",
+            "share/x/../thurm/keys",
+            "config/link/../keys",
+            "config/link/../../thurm/keys",
+            "config/rel/../keys",
+            "config/rel/../new/../keys",
+            "config/dangling/../keys",
+        ] {
+            assert!(
+                key_dir_outside(&state, Some(base.join(over)), base.join("d")).is_err(),
+                "{over}"
+            );
+        }
+        assert_eq!(
+            key_dir_outside(&state, Some(base.join("share/thurm-k")), base.join("d")).unwrap(),
+            base.join("share/thurm-k")
+        );
+        assert_eq!(
+            key_dir_outside(
+                &state,
+                Some(base.join("config/link/../../k")),
+                base.join("d")
+            )
+            .unwrap(),
+            base.join("share/k")
+        );
+        assert_eq!(
+            key_dir_outside(&state, None, base.join("d")).unwrap(),
+            base.join("d")
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn the_key_directory_is_beside_the_state_directory() {
+        for state in ["/srv/thurm/state", "/srv/thurm/state/", "/srv/thurm/state//", "/srv/thurm/./state/"] {
+            assert_eq!(
+                keys_beside(Path::new(state)),
+                Path::new("/srv/thurm/state-keys"),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
     fn an_unreadable_overlay_holds_nothing() {
         let dir = std::env::temp_dir().join(format!("thurm-overlay-holds-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2867,6 +3125,60 @@ clipboard_read = "always"
             .try_fold(DEFAULT_CONFIG_TOML.to_owned(), |t, (k, v)| with_setting(&t, k, v))
             .unwrap();
         assert_eq!(all, DEFAULT_CONFIG_TOML);
+    }
+
+    #[test]
+    fn a_settings_overlay_that_fails_to_load_turns_program_resume_off() {
+        let dir = std::env::temp_dir().join(format!("thurm-overlay-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[session]\nresume_programs = \"all\"\n").unwrap();
+        let overlay = overlay::path_beside(&path);
+        let load = || Config::load_with_warnings_from(&path).unwrap();
+        let mode = || load().0.session.resume_programs;
+        assert_eq!(mode(), ResumeProgramsMode::All);
+        // Read and applied: its value holds.
+        std::fs::write(&overlay, "[session]\nresume_programs = \"rules\"\n").unwrap();
+        assert_eq!(mode(), ResumeProgramsMode::Rules);
+        // A setting of something else left out: the base's value holds.
+        std::fs::write(&overlay, "[font]\nsize = \"big\"\n").unwrap();
+        assert_eq!(mode(), ResumeProgramsMode::All);
+        // Not parsed, a resume setting left out, or not readable: off, with a warning.
+        for text in [
+            "[session\nresume_programs = \"off\"",
+            "[session]\nresume_programs = \"of\"\n",
+        ] {
+            std::fs::write(&overlay, text).unwrap();
+            let (cfg, warnings) = load();
+            assert_eq!(
+                cfg.session.resume_programs,
+                ResumeProgramsMode::Off,
+                "{text}"
+            );
+            assert!(
+                warnings.iter().any(|w| w.contains("program resume is off")),
+                "{warnings:?}"
+            );
+            // Other settings still come from the base.
+            assert_eq!(cfg.font.size, Config::default().font.size);
+        }
+        std::fs::remove_file(&overlay).unwrap();
+        std::fs::create_dir(&overlay).unwrap();
+        assert_eq!(mode(), ResumeProgramsMode::Off);
+        // A symlink to a file that is not there (yet): not the same as no overlay.
+        std::fs::remove_dir(&overlay).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere.toml"), &overlay).unwrap();
+        let (cfg, warnings) = load();
+        assert_eq!(cfg.session.resume_programs, ResumeProgramsMode::Off);
+        assert!(
+            warnings.iter().any(|w| w.contains("program resume is off")),
+            "{warnings:?}"
+        );
+        // No overlay at all: the base's value.
+        std::fs::remove_file(&overlay).unwrap();
+        assert_eq!(mode(), ResumeProgramsMode::All);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

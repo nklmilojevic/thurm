@@ -60,6 +60,10 @@ pub struct Handoff {
     /// The Tailscale helper's pid and control socket, which stay open across the exec.
     #[serde(default)]
     pub tailnet: Option<(i32, RawFd)>,
+    /// Panes whose program was still waiting to resume: not handed over (see
+    /// `Daemon::handoff`), only noted as skipped in the pane.
+    #[serde(default)]
+    pub resumes_skipped: Vec<PaneId>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -107,6 +111,22 @@ pub struct PaneHandoff {
     /// The process group the program records were reported in (see `PaneState::programs_pgrp`).
     #[serde(default)]
     pub programs_pgrp: Option<u32>,
+    /// Device number (`st_rdev`) of the PTY slave.
+    #[serde(default)]
+    pub slave_rdev: Option<u64>,
+    /// Per-pane `OSC7577_TOKEN` (sealed inside the encrypted hand-off file).
+    #[serde(default)]
+    pub resume_token: Option<String>,
+    /// Accepted Program Resume Protocol (OSC 7577) state for this pane.
+    #[serde(default)]
+    pub resume_state: Option<crate::program_resume::ResumeHandoff>,
+    /// A client typed or pasted into the pane.
+    #[serde(default)]
+    pub typed: bool,
+    /// The terminal was discarding an oversized OSC 7577 (see
+    /// `StreamFilter::osc_7577_discard`): its start is not in `pending`, the rest still comes.
+    #[serde(default)]
+    pub osc_7577_discard: u8,
 }
 
 impl PaneHandoff {
@@ -246,6 +266,7 @@ pub fn perform(
     struct Resume<'a>(&'a Daemon);
     impl Drop for Resume<'_> {
         fn drop(&mut self) {
+            self.0.set_handing_over(false);
             self.0.resume_readers();
         }
     }
@@ -261,6 +282,8 @@ pub fn perform(
         // The handoff carries the panes; the snapshot is only the fallback after a crash.
         log::warn!("upgrade: session snapshot not saved: {e}");
     }
+    // From here nothing pending resumes in this image (the next one doesn't take it over).
+    daemon.set_handing_over(true);
     let mut handoff = daemon.handoff(listener_fd, log_to_file);
     handoff.version = version;
     handoff.lock_fd = lock_fd;
@@ -438,17 +461,35 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Reads (and deletes) the hand-off file given to `--adopt`, opening it with the key in
 /// `key_fd` (`--handoff-key-fd`) when it is sealed.
+/// A plain hand-off (from an image older than sealing) is not authenticated: nothing in it
+/// may decide what runs unattended, so the program resume state goes (records and tokens).
+/// Pending resumes are never handed over (see `Daemon::handoff`).
+fn strip_resume(h: &mut Handoff) {
+    for p in &mut h.panes {
+        p.resume_token = None;
+        p.resume_state = None;
+    }
+}
+
 pub fn load(path: &Path, key_fd: Option<RawFd>) -> Result<Handoff, String> {
     let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()));
     let _ = std::fs::remove_file(path);
     let key = key_fd.map(read_key).transpose()?;
     let mut data = data?;
-    if data.starts_with(SEALED_MAGIC) {
+    let sealed = data.starts_with(SEALED_MAGIC);
+    if sealed {
         let key = key.ok_or("the hand-off is sealed, but no key came with it")?;
         data = open(&key, &data)?;
+    } else if key.is_some() {
+        // The old image seals whenever it passes a key: a plain file now was put there by
+        // someone else.
+        return Err("the hand-off came with a key but is not sealed".into());
     }
-    let h: Handoff =
+    let mut h: Handoff =
         serde_json::from_slice(&data).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !sealed {
+        strip_resume(&mut h);
+    }
     if h.version > HANDOFF_VERSION {
         return Err(format!(
             "hand-off version {} is newer than {HANDOFF_VERSION}",
@@ -501,6 +542,7 @@ mod tests {
             restored: false,
             panes: Vec::new(),
             tailnet: None,
+            resumes_skipped: Vec::new(),
         }
     }
 
@@ -539,6 +581,16 @@ mod tests {
         // may take the number at once) now names something else.
         assert!(!path.exists());
         assert_ne!(inode(fd), Some(pipe));
+
+        // The old image seals whenever it passes a key: a plain file was swapped in. Here,
+        // not in a test of its own: another key pipe opened alongside could take the number
+        // (and identity) of the one just closed.
+        let path = temp("swapped");
+        write_private(&path, &serde_json::to_vec(&sample()).unwrap()).unwrap();
+        let fd = key_pipe(&key).unwrap();
+        let err = load(&path, Some(fd)).unwrap_err();
+        assert!(err.contains("not sealed"), "{err}");
+        assert!(!path.exists());
     }
 
     /// What `fd` refers to (device and inode), when it is open.
@@ -565,8 +617,22 @@ mod tests {
         let path = temp("plain");
         let mut old = sample();
         old.version = 1;
-        write_private(&path, &serde_json::to_vec(&old).unwrap()).unwrap();
+        // Nothing resume-related survives an unauthenticated file.
+        // A pane with a resume token and its accepted records.
+        let mut value = serde_json::to_value(&old).unwrap();
+        value["panes"] = serde_json::json!([{
+            "id": 1, "fd": 9, "pid": 42,
+            "size": {"cols": 80, "rows": 24, "cell_width": 0, "cell_height": 0},
+            "title": "zsh", "cwd": "/tmp", "command": null, "hold": false, "restored": true,
+            "exited": null, "osc_cwd": null, "shell_integration_seen": true, "state": "",
+            "resume_token": "cd".repeat(32),
+        }]);
+        write_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
         let h = load(&path, None).unwrap();
         assert_eq!(h.version, 1);
+        // The pane stays; its resume state does not.
+        assert_eq!(h.panes.len(), 1);
+        assert_eq!((h.panes[0].id, h.panes[0].title.as_str()), (1, "zsh"));
+        assert!(h.panes[0].resume_token.is_none());
     }
 }
