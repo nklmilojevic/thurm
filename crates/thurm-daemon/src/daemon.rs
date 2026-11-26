@@ -2977,9 +2977,20 @@ impl Daemon {
                     .or_else(|| p.cwd.clone())
             };
             // Resolved once, here: the rules check the directory the ticket pins below, not one
-            // a symlink swapped in between could lead elsewhere.
-            let resolved_cwd = resolved_cwd
-                .map(|dir| std::fs::canonicalize(&dir).map_or(dir, |c| c.display().to_string()));
+            // a symlink swapped in between could lead elsewhere. Kept exactly: a canonical path
+            // that isn't UTF-8 (the ticket's text can't hold it) isn't resumed into, rather
+            // than spelled as another directory's name.
+            let resolved_cwd = match resolved_cwd.map(|dir| match std::fs::canonicalize(&dir) {
+                Ok(c) => c.into_os_string().into_string().ok(),
+                Err(_) => Some(dir),
+            }) {
+                Some(None) => {
+                    skip("dir_unrepresentable");
+                    plans.push(None);
+                    continue;
+                }
+                other => other.flatten(),
+            };
             let trust = program_resume::evaluate_trust(
                 &TrustSubject {
                     argv: &rec.argv,
@@ -3057,7 +3068,7 @@ impl Daemon {
                 Some(dir) if require_cwd => {
                     let canon = std::fs::canonicalize(dir)
                         .ok()
-                        .map(|d| d.display().to_string())
+                        .and_then(|d| d.into_os_string().into_string().ok())
                         .filter(|c| c == dir);
                     let id = canon.as_deref().and_then(program_resume::dir_identity);
                     match (canon, id) {

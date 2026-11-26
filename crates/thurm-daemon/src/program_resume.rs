@@ -547,8 +547,15 @@ pub fn inspect_owner(pid: u32, pane: &PaneContext) -> Result<OwnerSnapshot, &'st
     let info = procinfo::process_info(pid);
     let process_name = info.as_ref().map(|p| p.name.clone()).unwrap_or_default();
     let process_argv = info.map(|p| p.argv).unwrap_or_default();
+    // Kept exactly: one that isn't UTF-8 is unknown (empty), never spelled as another path.
     let process_exe = procinfo::exe_path(pid)
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p).display().to_string())
+        .and_then(|p| {
+            std::fs::canonicalize(&p)
+                .unwrap_or(p)
+                .into_os_string()
+                .into_string()
+                .ok()
+        })
         .unwrap_or_default();
     let process_cwd = procinfo::cwd(pid);
     let mut process_argv = process_argv;
@@ -568,7 +575,7 @@ pub fn inspect_owner(pid: u32, pane: &PaneContext) -> Result<OwnerSnapshot, &'st
         .map(|k| process_argv[k].as_str())
         .filter(|s| s.starts_with('/'))
         .and_then(|s| std::fs::canonicalize(s).ok())
-        .map(|p| p.display().to_string());
+        .and_then(|p| p.into_os_string().into_string().ok());
     let kind_of = |p: u32| classify_ancestor(p, &pane.trusted_shells);
     let owner_is_shell = kind_of(pid) == AncestorKind::Shell;
 
@@ -1488,6 +1495,46 @@ fn path_within_dir(target: &str, allowed_dir: &str, allow_equal: bool, verify_fs
     true
 }
 
+/// Owned by this user or root.
+fn ours(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::geteuid() };
+    m.uid() == uid || m.uid() == 0
+}
+
+/// Whether another principal can change the entries of directory `dir` (`entry`: the one looked
+/// up in it, if it exists): `dir` is owned by neither this user nor root, or is group or other
+/// writable, unless it is sticky and `entry` is this user's or root's.
+fn writable_by_others(dir: &Path, entry: Option<&std::fs::Metadata>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if !m.is_dir() => false,
+        Ok(m) => {
+            !ours(&m)
+                || (m.mode() & 0o022 != 0 && !(m.mode() & 0o1000 != 0 && entry.is_some_and(ours)))
+        }
+        Err(_) => true,
+    }
+}
+
+/// Whether a directory from `/` down to the canonical `base` lets another principal replace
+/// the next one on the way (or `base` itself).
+fn base_can_be_swapped(base: &Path) -> bool {
+    let mut cur = PathBuf::from("/");
+    for c in base.components() {
+        let Component::Normal(name) = c else {
+            continue;
+        };
+        let next = cur.join(name);
+        let entry = std::fs::symlink_metadata(&next).ok();
+        if writable_by_others(&cur, entry.as_ref()) {
+            return true;
+        }
+        cur = next;
+    }
+    false
+}
+
 /// Whether another principal could change what `target` resolves to, followed as given (each
 /// symlink on the way, not only where it ends up, which is inside the canonical `base`): from
 /// `base` on, a directory an entry is looked up in, or the directory reached, is owned by
@@ -1497,19 +1544,11 @@ fn path_within_dir(target: &str, allowed_dir: &str, allow_equal: bool, verify_fs
 /// path never passes through it.
 fn others_can_retarget(base: &Path, target: &Path) -> bool {
     use std::ffi::OsString;
-    use std::os::unix::fs::MetadataExt;
-    let uid = unsafe { libc::geteuid() };
-    let ours = |m: &std::fs::Metadata| m.uid() == uid || m.uid() == 0;
-    let writable_by_others =
-        |dir: &Path, entry: Option<&std::fs::Metadata>| match std::fs::symlink_metadata(dir) {
-            Ok(m) if !m.is_dir() => false,
-            Ok(m) => {
-                !ours(&m)
-                    || (m.mode() & 0o022 != 0
-                        && !(m.mode() & 0o1000 != 0 && entry.is_some_and(ours)))
-            }
-            Err(_) => true,
-        };
+    // `base` itself, reached from `/`: a directory above it another principal can change
+    // could swap `base` (or a directory on the way) for one of theirs.
+    if base_can_be_swapped(base) {
+        return true;
+    }
     let names = |p: &Path| -> Vec<OsString> {
         p.components()
             .rev()
@@ -2347,9 +2386,13 @@ fn pinned_program(
     use std::os::unix::ffi::OsStrExt;
     let check = |candidate: &Path| -> Result<String, String> {
         let canon = std::fs::canonicalize(candidate).map_err(|e| e.to_string())?;
-        let dir = canon.parent().map(|d| d.display().to_string());
-        if dir.is_some_and(|d| exe_dirs.contains(&d)) {
-            Ok(canon.display().to_string())
+        // Compared and returned exactly: a path that isn't UTF-8 is not one of `exe_dirs`.
+        let canon = canon.to_str();
+        let dir = canon.and_then(|c| Path::new(c).parent()?.to_str());
+        if let (Some(canon), Some(dir)) = (canon, dir)
+            && exe_dirs.iter().any(|d| d == dir)
+        {
+            Ok(canon.to_owned())
         } else {
             Err(format!(
                 "{} is not the program that was trusted",
@@ -3189,6 +3232,30 @@ mod tests {
     /// The executable's directory is pinned as it was when the report was accepted: replaced
     /// by a symlink since (to a directory of someone else's), it pins nothing, rather than the
     /// directory the link now leads to.
+    /// An allowed directory under one another principal may change (writable by others, not
+    /// sticky) can itself be swapped: a path under it is not trusted, however its own
+    /// directories are kept.
+    #[test]
+    fn a_directory_above_the_allowed_one_counts_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("thurm-base-above-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (open, closed) = (root.join("open"), root.join("closed"));
+        for d in [&open, &closed] {
+            std::fs::create_dir_all(d.join("base/sub")).unwrap();
+        }
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let target = |d: &Path| d.join("base/sub/file");
+        assert!(!others_can_retarget(&closed.join("base"), &target(&closed)));
+        assert!(others_can_retarget(&open.join("base"), &target(&open)));
+        // Sticky, the entry being this user's: it can't be swapped.
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(!others_can_retarget(&open.join("base"), &target(&open)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_redirected_executable_directory_pins_nothing() {
         let root = std::fs::canonicalize(std::env::temp_dir())
