@@ -120,6 +120,8 @@ if (( ${#${_thurm_resume_ticket-}} && ${#${_thurm_resume_exec-}} )); then
   }
   # Armed at the first prompt, once .zshrc defined its own zle hooks (kept and run too).
   _thurm_resume_arm() {
+    # The precmd hooks after this one (those .zshrc added), which zsh runs after it this time.
+    local -a later=("${(@)precmd_functions[${precmd_functions[(ie)_thurm_resume_arm]}+1,-1]}")
     add-zsh-hook -d precmd _thurm_resume_arm
     if [[ -o zle ]]; then
       autoload -Uz add-zle-hook-widget
@@ -128,9 +130,15 @@ if (( ${#${_thurm_resume_ticket-}} && ${#${_thurm_resume_exec-}} )); then
       return 0
     fi
     # No line editor (.zshrc turned ZLE off): no command line to run it as, so it runs from
-    # this hook, after the startup files but before precmd hooks they added. It is a command,
-    # not the prompt, while it runs (the prompt marks come again after it); the daemon
-    # refuses the ticket if anything was typed first.
+    # this hook, after the startup files. zsh fixed this round's hook list before .zshrc's
+    # hooks could come ahead of this one, so they run here first (the program is looked up on
+    # the PATH they make), and again after it, as after any command. It is a command, not the
+    # prompt, while it runs (the prompt marks come again after it); the daemon refuses the
+    # ticket if anything was typed first.
+    local f
+    for f in "${(@)later:#_thurm_*}"; do
+      if (( ${+functions[$f]} )); then "$f" || :; fi
+    done
     builtin printf '\e]133;C\a'
     _thurm_executing=1
     _thurm_resume_run

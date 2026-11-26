@@ -494,7 +494,8 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
 
 /// zsh without its line editor has no first-prompt widget: started with `--no-zle` the daemon
 /// types the resume line, and with ZLE turned off by `.zshrc` the integration runs it from its
-/// hook. Either way the program runs in the foreground and reads the terminal.
+/// hook. Either way the program is looked up on the PATH `.zshrc`'s precmd hooks make, and runs
+/// in the foreground reading the terminal.
 #[test]
 fn zsh_without_zle_still_resumes() {
     if running_as_root() {
@@ -517,7 +518,11 @@ fn zsh_without_zle_still_resumes() {
         );
         std::fs::write(
             home.join(".zshrc"),
-            format!("export PATH=\"{}:$PATH\"\n{zshrc}", custom_bin.display()),
+            format!(
+                "_my_env_hook() {{ [[ :$PATH: == *:{0}:* ]] || export PATH=\"{0}:$PATH\"; }}\n\
+                 precmd_functions+=(_my_env_hook)\n{zshrc}",
+                custom_bin.display()
+            ),
         )
         .unwrap();
         let sep = if args.is_empty() { "" } else { ", " };
