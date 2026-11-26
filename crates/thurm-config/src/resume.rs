@@ -72,6 +72,15 @@ impl ResumeRule {
         }
         all
     }
+
+    /// A flag listed in both `flags` and `preserve_flags` with different arities: the rule is
+    /// ambiguous about how many values the restriction holds, so it is not used.
+    pub fn conflicting_flag(&self) -> Option<&str> {
+        self.preserve_flags
+            .iter()
+            .find(|(k, v)| self.flags.get(*k).is_some_and(|f| f != *v))
+            .map(|(k, _)| k.as_str())
+    }
 }
 
 impl Default for ResumeRule {
@@ -214,7 +223,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
 /// restricts its `dirs` / `match_process` when `command`, `flags` and `preserve_flags` are
 /// omitted, or replaces it when any of them is provided (keeping the built-in's `command` and
 /// `preserve_flags` where the user rule leaves them empty).
-pub fn resolve_resume_rules(include_defaults: bool, user: &[ResumeRule]) -> Vec<ResumeRule> {
+fn merge_resume_rules(include_defaults: bool, user: &[ResumeRule]) -> Vec<ResumeRule> {
     let mut rules = if include_defaults {
         builtin_resume_rules()
     } else {
@@ -252,9 +261,87 @@ pub fn resolve_resume_rules(include_defaults: bool, user: &[ResumeRule]) -> Vec<
     rules
 }
 
+/// The trust rules in effect: the built-ins (if `include_defaults`) with the user's overrides
+/// and additions. A merged rule giving a flag two arities is left out (see
+/// [`resume_rule_warnings`]): checked after merging, so an override's `flags` that disagree
+/// with an inherited `preserve_flags` count too.
+pub fn resolve_resume_rules(include_defaults: bool, user: &[ResumeRule]) -> Vec<ResumeRule> {
+    let mut rules = merge_resume_rules(include_defaults, user);
+    rules.retain(|r| r.conflicting_flag().is_none());
+    rules
+}
+
+/// One warning per rule [`resolve_resume_rules`] leaves out because a flag has two arities.
+pub fn resume_rule_warnings(include_defaults: bool, user: &[ResumeRule]) -> Vec<String> {
+    merge_resume_rules(include_defaults, user)
+        .iter()
+        .filter_map(|r| {
+            r.conflicting_flag().map(|flag| {
+                format!(
+                    "resume rule {:?}: flag {flag:?} has different arities in flags and \
+                     preserve_flags; rule ignored",
+                    r.name
+                )
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flag_with_two_arities_drops_the_rule() {
+        let mut both = ResumeRule {
+            name: "tool".into(),
+            command: vec!["tool".into()],
+            ..Default::default()
+        };
+        both.flags.insert("--deny".into(), FlagArity::One);
+        both.preserve_flags.insert("--deny".into(), FlagArity::Many);
+        assert_eq!(both.conflicting_flag(), Some("--deny"));
+        assert!(resolve_resume_rules(false, std::slice::from_ref(&both)).is_empty());
+        let w = resume_rule_warnings(false, std::slice::from_ref(&both));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("--deny"));
+
+        // The same arity in both maps is fine.
+        both.flags.insert("--deny".into(), FlagArity::Many);
+        assert_eq!(
+            resolve_resume_rules(false, std::slice::from_ref(&both)).len(),
+            1
+        );
+        assert!(resume_rule_warnings(false, std::slice::from_ref(&both)).is_empty());
+
+        // No built-in rule is ambiguous.
+        let builtin = builtin_resume_rules();
+        assert!(builtin.iter().all(|r| r.conflicting_flag().is_none()));
+        // An override's `flags` against a built-in's inherited `preserve_flags`.
+        if let Some((name, flag, arity)) = builtin.iter().find_map(|r| {
+            r.preserve_flags
+                .iter()
+                .next()
+                .map(|(f, a)| (r.name.clone(), f.clone(), *a))
+        }) {
+            let other = if arity == FlagArity::None {
+                FlagArity::One
+            } else {
+                FlagArity::None
+            };
+            let mut over = ResumeRule {
+                name: name.clone(),
+                ..Default::default()
+            };
+            over.flags.insert(flag, other);
+            assert!(
+                !resolve_resume_rules(true, std::slice::from_ref(&over))
+                    .iter()
+                    .any(|r| r.name == name)
+            );
+            assert_eq!(resume_rule_warnings(true, &[over]).len(), 1);
+        }
+    }
 
     #[test]
     fn resolves_builtin_overrides_and_disables() {

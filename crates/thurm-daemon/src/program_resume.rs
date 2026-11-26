@@ -148,8 +148,7 @@ fn is_valid_value(bytes: &[u8]) -> bool {
 }
 
 fn has_control_char(s: &str) -> bool {
-    s.chars()
-        .any(|c| matches!(c, '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}'))
+    s.chars().any(has_control_char_char)
 }
 
 fn decode_b64_text(raw: &[u8]) -> Option<String> {
@@ -2236,6 +2235,9 @@ pub fn exec_resume(ticket: &str) -> ! {
     }
     let mut ptrs: Vec<*const libc::c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
+    // Rust's runtime ignores SIGPIPE, and `execv` keeps ignored signals: the program gets the
+    // default action, as a program the shell starts does. The rest come as the shell set them.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let path = std::env::var_os("PATH");
     let program = if spec.exe_dirs.is_empty() {
         spec.argv[0].clone()

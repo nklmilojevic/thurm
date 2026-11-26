@@ -1198,6 +1198,16 @@ impl Terminal {
         self.shell_token = token;
     }
 
+    /// See [`StreamFilter::osc_7577_discard`]: for an in-place upgrade.
+    pub fn osc_7577_discard(&self) -> u8 {
+        self.filter.osc_7577_discard()
+    }
+
+    /// See [`StreamFilter::restore_osc_7577_discard`]: after the replay, before new output.
+    pub fn restore_osc_7577_discard(&mut self, state: u8) {
+        self.filter.restore_osc_7577_discard(state);
+    }
+
     pub fn shell_token(&self) -> Option<&str> {
         self.shell_token.as_deref()
     }

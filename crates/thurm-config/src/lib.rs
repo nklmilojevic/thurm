@@ -23,6 +23,7 @@ pub use agents::{AgentDef, builtin_agents};
 pub use programs::{CATEGORIES, ProgramDef, builtin_programs, executable_name, identify, marks};
 pub use resume::{
     FlagArity, ResumeProgramsMode, ResumeRule, builtin_resume_rules, resolve_resume_rules,
+    resume_rule_warnings,
 };
 pub use themes::{Theme, builtin_theme, builtin_theme_names, is_own_theme};
 
@@ -1716,6 +1717,10 @@ impl Config {
             .apply_replaced_keys(&notification_keys(text));
         cfg.validate()?;
         cfg.drop_unusable_entries(&mut unknown);
+        unknown.extend(resume_rule_warnings(
+            cfg.session.resume_default_rules,
+            &cfg.session.resume_rules,
+        ));
         Ok((cfg, unknown))
     }
 

@@ -135,6 +135,10 @@ pub struct PaneHandoff {
     /// A client typed or pasted into the pane.
     #[serde(default)]
     pub typed: bool,
+    /// The terminal was discarding an oversized OSC 7577 (see
+    /// `StreamFilter::osc_7577_discard`): its start is not in `pending`, the rest still comes.
+    #[serde(default)]
+    pub osc_7577_discard: u8,
 }
 
 impl PaneHandoff {
@@ -466,17 +470,37 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Reads (and deletes) the hand-off file given to `--adopt`, opening it with the key in
 /// `key_fd` (`--handoff-key-fd`) when it is sealed.
+/// A plain hand-off (from an image older than sealing) is not authenticated: nothing in it
+/// may decide what runs unattended, so the program resume state goes (records, tokens,
+/// tickets and lines waiting to be typed).
+fn strip_resume(h: &mut Handoff) {
+    h.resume_tickets.clear();
+    for p in &mut h.panes {
+        p.resume_token = None;
+        p.resume_state = None;
+        p.pending_input = None;
+    }
+}
+
 pub fn load(path: &Path, key_fd: Option<RawFd>) -> Result<Handoff, String> {
     let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()));
     let _ = std::fs::remove_file(path);
     let key = key_fd.map(read_key).transpose()?;
     let mut data = data?;
-    if data.starts_with(SEALED_MAGIC) {
+    let sealed = data.starts_with(SEALED_MAGIC);
+    if sealed {
         let key = key.ok_or("the hand-off is sealed, but no key came with it")?;
         data = open(&key, &data)?;
+    } else if key.is_some() {
+        // The old image seals whenever it passes a key: a plain file now was put there by
+        // someone else.
+        return Err("the hand-off came with a key but is not sealed".into());
     }
-    let h: Handoff =
+    let mut h: Handoff =
         serde_json::from_slice(&data).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !sealed {
+        strip_resume(&mut h);
+    }
     if h.version > HANDOFF_VERSION {
         return Err(format!(
             "hand-off version {} is newer than {HANDOFF_VERSION}",
@@ -568,6 +592,16 @@ mod tests {
         // may take the number at once) now names something else.
         assert!(!path.exists());
         assert_ne!(inode(fd), Some(pipe));
+
+        // The old image seals whenever it passes a key: a plain file was swapped in. Here,
+        // not in a test of its own: another key pipe opened alongside could take the number
+        // (and identity) of the one just closed.
+        let path = temp("swapped");
+        write_private(&path, &serde_json::to_vec(&sample()).unwrap()).unwrap();
+        let fd = key_pipe(&key).unwrap();
+        let err = load(&path, Some(fd)).unwrap_err();
+        assert!(err.contains("not sealed"), "{err}");
+        assert!(!path.exists());
     }
 
     /// What `fd` refers to (device and inode), when it is open.
@@ -594,8 +628,22 @@ mod tests {
         let path = temp("plain");
         let mut old = sample();
         old.version = 1;
+        // Nothing resume-related survives an unauthenticated file.
+        old.resume_tickets.push(TicketHandoff {
+            ticket: "ab".repeat(16),
+            pane: 1,
+            spec: crate::program_resume::ResumeExecSpec {
+                argv: vec!["/bin/sh".into()],
+                cwd: None,
+                require_cwd: false,
+                cwd_id: None,
+                exe_dirs: Vec::new(),
+            },
+            remaining_ms: 1000,
+        });
         write_private(&path, &serde_json::to_vec(&old).unwrap()).unwrap();
         let h = load(&path, None).unwrap();
         assert_eq!(h.version, 1);
+        assert!(h.resume_tickets.is_empty());
     }
 }
