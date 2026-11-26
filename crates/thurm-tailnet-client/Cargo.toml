@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 thurm-proto.workspace = true
 thurm-client.workspace = true
+libc.workspace = true
 log.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

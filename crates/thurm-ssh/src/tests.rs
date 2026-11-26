@@ -79,6 +79,20 @@ fn tells_an_untrusted_host_key_from_a_changed_one() {
         Err(e) => panic!("{e}"),
         Ok(_) => panic!("an unknown key was accepted"),
     }
+    // `connect()` must keep UnknownHostKey distinct from HostKeyChanged too.
+    let mut unpinned = target(&server);
+    unpinned.host_keys.clear();
+    match connect(&unpinned, TestKey::new(1), "test", |_| {}, || {}) {
+        Err(ConnectError::UnknownHostKey(seen)) => assert_eq!(seen, expected),
+        Err(e) => panic!("expected UnknownHostKey, got {e}"),
+        Ok(_) => panic!("connected without a trusted host key"),
+    }
+    unpinned.host_keys = vec!["SHA256:somethingElseEntirely".into()];
+    match connect(&unpinned, TestKey::new(1), "test", |_| {}, || {}) {
+        Err(ConnectError::HostKeyChanged(seen)) => assert_eq!(seen, expected),
+        Err(e) => panic!("expected HostKeyChanged, got {e}"),
+        Ok(_) => panic!("connected to a changed host key"),
+    }
 }
 
 #[test]

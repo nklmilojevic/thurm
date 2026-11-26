@@ -55,11 +55,21 @@ fn http_server(rt: &Runtime, response: &'static str) -> String {
     format!("ws://{addr}/v1/connect")
 }
 
+fn open_test(url: &str, timeout: Duration) -> Result<(UnixStream, Session), ConnectError> {
+    open_with(
+        url,
+        Limits {
+            connect: timeout,
+            ..LIMITS
+        },
+    )
+}
+
 #[test]
 fn relays_bytes_both_ways() {
     let server = server_rt();
     let url = echo_server(&server);
-    let (mut stream, _session) = open(&url, CONNECT_TIMEOUT).unwrap();
+    let (mut stream, _session) = open_test(&url, CONNECT_TIMEOUT).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -73,7 +83,7 @@ fn relays_bytes_both_ways() {
 fn dropping_the_session_closes_the_stream() {
     let server = server_rt();
     let url = echo_server(&server);
-    let (mut stream, session) = open(&url, CONNECT_TIMEOUT).unwrap();
+    let (mut stream, session) = open_test(&url, CONNECT_TIMEOUT).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -90,7 +100,7 @@ fn a_refused_account_says_so() {
         "HTTP/1.1 403 Forbidden\r\nContent-Length: 50\r\nConnection: close\r\n\r\n\
          forbidden: other@example.com is not the node owner",
     );
-    match open(&url, CONNECT_TIMEOUT) {
+    match open_test(&url, CONNECT_TIMEOUT) {
         Err(ConnectError::Forbidden(body)) => {
             assert!(body.contains("other@example.com"), "{body}")
         }
@@ -106,7 +116,7 @@ fn a_daemon_that_is_down_says_so() {
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
     assert!(matches!(
-        open(&url, CONNECT_TIMEOUT),
+        open_test(&url, CONNECT_TIMEOUT),
         Err(ConnectError::DaemonUnavailable)
     ));
 }
@@ -117,7 +127,7 @@ fn a_silent_address_times_out_quickly() {
     let ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("ws://{}/v1/connect", ln.local_addr().unwrap());
     let started = Instant::now();
-    let r = open(&url, Duration::from_millis(500));
+    let r = open_test(&url, Duration::from_millis(500));
     assert!(
         matches!(r, Err(ConnectError::Unreachable(_))),
         "{:?}",
@@ -133,12 +143,355 @@ fn only_websocket_urls() {
         open("https://mac.tail1234.ts.net/v1/connect", CONNECT_TIMEOUT),
         Err(ConnectError::BadUrl(_))
     ));
+    // Cleartext ws:// is rejected by open(), even on a Tailscale IP. connect() takes it only as
+    // the plain route (older apps pass that here): a Tailscale IP, through a verified Tailscale
+    // interface; there is none on this machine, so that is unreachable, never a cleartext dial.
+    for ws in [
+        "ws://127.0.0.1:7297/v1/connect",
+        "ws://100.64.0.7:7297/v1/connect",
+        "ws://host.tail1234.ts.net:7297/v1/connect",
+    ] {
+        assert!(
+            matches!(open(ws, CONNECT_TIMEOUT), Err(ConnectError::BadUrl(_))),
+            "{ws}"
+        );
+        let via_connect = connect(ws, "test", &[], |_| {}, || {});
+        if ws.contains("100.64.0.7") {
+            assert!(
+                matches!(via_connect, Err(ConnectError::Unreachable(_))),
+                "{ws}: {:?}",
+                via_connect.err()
+            );
+        } else {
+            assert!(
+                matches!(via_connect, Err(ConnectError::BadUrl(_))),
+                "{ws}: {:?}",
+                via_connect.err()
+            );
+        }
+    }
+}
+
+#[test]
+fn plain_tailnet_allows_only_ws_tailscale_ip_literals() {
+    for ok in [
+        "ws://100.64.0.1:7297/v1/connect",
+        "ws://100.100.100.100:7297/v1/connect",
+        "ws://100.127.255.254:7297/v1/connect",
+        "ws://[fd7a:115c:a1e0::1]:7297/v1/connect",
+        "ws://[fd7a:115c:a1e0:ab12::42]/v1/connect",
+    ] {
+        assert!(check_plain_tailnet_url(ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        "wss://100.64.0.1/v1/connect",
+        "wss://host.tail1234.ts.net/v1/connect",
+        "ws://100.63.255.255:7297/v1/connect",
+        "ws://100.128.0.0:7297/v1/connect",
+        "ws://127.0.0.1:7297/v1/connect",
+        "ws://192.168.1.10:7297/v1/connect",
+        "ws://[::1]:7297/v1/connect",
+        "ws://[fe80::1]:7297/v1/connect",
+        "ws://[fd7a:115c:a1e1::1]:7297/v1/connect",
+        "ws://host.tail1234.ts.net:7297/v1/connect",
+        "ws://100.64.0.1@evil.example:7297/v1/connect",
+        "http://100.64.0.1:7297/v1/connect",
+    ] {
+        assert!(
+            matches!(
+                open_plain(bad, CONNECT_TIMEOUT),
+                Err(ConnectError::BadUrl(_))
+            ),
+            "{bad}"
+        );
+        assert!(
+            matches!(
+                connect_plain(bad, "test", &[], |_| {}, || {}),
+                Err(ConnectError::BadUrl(_))
+            ),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn plain_tailnet_fails_closed_without_active_tailscale_tunnel() {
+    use std::net::IpAddr;
+
+    let target_v4: IpAddr = "100.64.0.7".parse().unwrap();
+    let target_v6: IpAddr = "fd7a:115c:a1e0::7".parse().unwrap();
+
+    // VPN off: physical Wi-Fi and cellular CGNAT (100.64/10 on pdp_ip0) MUST fail closed.
+    let carrier_cgnat = [
+        InterfaceAddr {
+            name: "en0".into(),
+            index: 1,
+            addr: "192.168.1.5".parse().unwrap(),
+            point_to_point: false,
+        },
+        InterfaceAddr {
+            name: "pdp_ip0".into(),
+            index: 2,
+            addr: "100.64.5.10".parse().unwrap(),
+            point_to_point: true,
+        },
+    ];
+    assert!(matches!(
+        select_tailnet_interface(target_v4, &carrier_cgnat),
+        Err(ConnectError::Unreachable(_))
+    ));
+    assert!(matches!(
+        open_plain_with("ws://100.64.0.7:7297/v1/connect", SHORT, Some(&carrier_cgnat)),
+        Err(ConnectError::Unreachable(_))
+    ));
+    assert!(matches!(
+        open_plain_with("ws://100.64.0.7:7297/v1/connect", SHORT, Some(&[])),
+        Err(ConnectError::Unreachable(_))
+    ));
+
+    #[cfg(target_vendor = "apple")]
+    let (tun_a, tun_b) = ("utun4", "utun5");
+    #[cfg(target_os = "linux")]
+    let (tun_a, tun_b) = ("tailscale0", "tailscale1");
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    {
+        // Two tunnels hold 100.64/10, but only tun_a also carries Tailscale's unique ULA -> pick tun_a.
+        let disambiguated = [
+            InterfaceAddr {
+                name: tun_b.into(),
+                index: 10,
+                addr: "100.64.99.2".parse().unwrap(),
+                point_to_point: true,
+            },
+            InterfaceAddr {
+                name: tun_a.into(),
+                index: 11,
+                addr: "100.64.0.1".parse().unwrap(),
+                point_to_point: true,
+            },
+            InterfaceAddr {
+                name: tun_a.into(),
+                index: 11,
+                addr: "fd7a:115c:a1e0::1".parse().unwrap(),
+                point_to_point: true,
+            },
+        ];
+        let picked = select_tailnet_interface(target_v4, &disambiguated).unwrap();
+        assert_eq!(picked.name, tun_a);
+        assert_eq!(picked.index, 11);
+        assert_eq!(picked.local_ip, "100.64.0.1".parse::<IpAddr>().unwrap());
+
+        let picked_v6 = select_tailnet_interface(target_v6, &disambiguated).unwrap();
+        assert_eq!(picked_v6.name, tun_a);
+        assert_eq!(picked_v6.local_ip, "fd7a:115c:a1e0::1".parse::<IpAddr>().unwrap());
+
+        // Ambiguous: two 100.64/10 tunnels without Tailscale ULA -> fail closed.
+        let ambiguous = [
+            InterfaceAddr {
+                name: tun_a.into(),
+                index: 11,
+                addr: "100.64.0.1".parse().unwrap(),
+                point_to_point: true,
+            },
+            InterfaceAddr {
+                name: tun_b.into(),
+                index: 12,
+                addr: "100.64.99.2".parse().unwrap(),
+                point_to_point: true,
+            },
+        ];
+        assert!(matches!(
+            select_tailnet_interface(target_v4, &ambiguous),
+            Err(ConnectError::Unreachable(_))
+        ));
+
+        // On Apple, a lone utun* carrying only 100.64/10 (without Tailscale's unique ULA) could
+        // be an unrelated corporate/CGNAT VPN, so it must fail closed; on Linux, `tailscale0`
+        // identifies Tailscale by interface name.
+        let lone_v4_only = [InterfaceAddr {
+            name: tun_a.into(),
+            index: 11,
+            addr: "100.64.0.1".parse().unwrap(),
+            point_to_point: true,
+        }];
+        #[cfg(target_vendor = "apple")]
+        assert!(matches!(
+            select_tailnet_interface(target_v4, &lone_v4_only),
+            Err(ConnectError::Unreachable(_))
+        ));
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            select_tailnet_interface(target_v4, &lone_v4_only)
+                .unwrap()
+                .name,
+            tun_a
+        );
+    }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn plain_tailnet_binds_before_dial_rejects_bind_failure_and_upgrades_bound_socket() {
+    use std::net::{IpAddr, SocketAddr};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[cfg(target_vendor = "apple")]
+    let tun_name = "utun4";
+    #[cfg(target_os = "linux")]
+    let tun_name = "tailscale0";
+
+    let valid_ifaces = [
+        InterfaceAddr {
+            name: tun_name.into(),
+            index: 11,
+            addr: "100.64.0.1".parse().unwrap(),
+            point_to_point: true,
+        },
+        InterfaceAddr {
+            name: tun_name.into(),
+            index: 11,
+            addr: "fd7a:115c:a1e0::1".parse().unwrap(),
+            point_to_point: true,
+        },
+    ];
+    let expected_selected = SelectedTailnetIface {
+        name: tun_name.into(),
+        index: 11,
+        local_ip: "100.64.0.1".parse::<IpAddr>().unwrap(),
+    };
+
+    // 1. Bind failure prevents dialing and surfaces the tunnel interface name.
+    let dialed = Arc::new(AtomicBool::new(false));
+    let dialed_in_closure = dialed.clone();
+    let seen_iface = Arc::new(Mutex::new(None));
+    let seen_in_bind = seen_iface.clone();
+    let res = open_plain_via(
+        "ws://100.64.0.7:7297/v1/connect",
+        SHORT,
+        Some(&valid_ifaces),
+        move |_socket, iface| {
+            *seen_in_bind.lock().unwrap() = Some(iface.clone());
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "injected bind error",
+            ))
+        },
+        move |_socket, _addr| {
+            dialed_in_closure.store(true, Ordering::SeqCst);
+            async {
+                Err(std::io::Error::other(
+                    "dial must not run after bind failure",
+                ))
+            }
+        },
+    );
+    match res {
+        Err(ConnectError::Unreachable(msg)) => {
+            assert!(msg.contains(tun_name), "{msg}");
+            assert!(msg.contains("injected bind error"), "{msg}");
+        }
+        other => panic!("expected bind error, got: {:?}", other.map(|_| ())),
+    }
+    assert_eq!(*seen_iface.lock().unwrap(), Some(expected_selected.clone()));
+    assert!(
+        !dialed.load(Ordering::SeqCst),
+        "dial must not be invoked when binding fails"
+    );
+
+    // 2. Real production `open_plain_with` invokes `bind_to_tailnet_interface` and fails before
+    // dialing when the selected tunnel interface/source IP cannot be bound on this host.
+    #[cfg(target_vendor = "apple")]
+    let bogus_tun = "utun9999";
+    #[cfg(target_os = "linux")]
+    let bogus_tun = "tailscale9999";
+    let bogus_ifaces = [
+        InterfaceAddr {
+            name: bogus_tun.into(),
+            index: 999_999,
+            addr: "100.64.254.254".parse().unwrap(),
+            point_to_point: true,
+        },
+        InterfaceAddr {
+            name: bogus_tun.into(),
+            index: 999_999,
+            addr: "fd7a:115c:a1e0::ffff".parse().unwrap(),
+            point_to_point: true,
+        },
+    ];
+    match open_plain_with("ws://100.64.0.7:7297/v1/connect", SHORT, Some(&bogus_ifaces)) {
+        Err(ConnectError::Unreachable(msg)) => {
+            assert!(
+                msg.contains(&format!("binding plain tailnet socket to {bogus_tun}")),
+                "{msg}"
+            );
+        }
+        other => panic!(
+            "expected real bind_to_tailnet_interface failure, got: {:?}",
+            other.map(|_| ())
+        ),
+    }
+
+    // 3. Positive path: selected interface triggers bind before dial, and the bound socket
+    // performs the WebSocket upgrade and relays binary traffic end-to-end.
+    let server = server_rt();
+    let echo_url = echo_server(&server);
+    let echo_addr: SocketAddr = echo_url
+        .strip_prefix("ws://")
+        .unwrap()
+        .strip_suffix("/v1/connect")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let plain_url = format!("ws://100.64.0.7:{}/v1/connect", echo_addr.port());
+    let expected_target: SocketAddr = format!("100.64.0.7:{}", echo_addr.port()).parse().unwrap();
+
+    let steps = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let steps_bind = steps.clone();
+    let steps_dial = steps.clone();
+    let (mut stream, _session) = open_plain_via(
+        &plain_url,
+        LIMITS,
+        Some(&valid_ifaces),
+        move |socket, iface| {
+            assert_eq!(*iface, expected_selected);
+            steps_bind.lock().unwrap().push("bind");
+            socket.bind("127.0.0.1:0".parse().unwrap())
+        },
+        move |socket, target_addr| {
+            assert_eq!(target_addr, expected_target);
+            // The same socket must already be bound to a local loopback port before dialing.
+            let local = socket
+                .local_addr()
+                .expect("socket should be bound before dial");
+            assert_eq!(local.ip(), IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            assert_ne!(local.port(), 0);
+            steps_dial.lock().unwrap().push("dial");
+            async move { socket.connect(echo_addr).await }
+        },
+    )
+    .expect("bound plain socket should complete WebSocket upgrade");
+
+    assert_eq!(*steps.lock().unwrap(), vec!["bind", "dial"]);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"tailnet-ok").unwrap();
+    let mut got = [0u8; 10];
+    stream.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"TAILNET-OK");
 }
 
 #[test]
 fn errors_tell_what_to_check() {
     let e = ConnectError::Unreachable("connection refused".into()).to_string();
     assert!(e.contains("Tailscale connected on this device"), "{e}");
+    assert!(!e.contains("Mac"), "error should be host-neutral: {e}");
+    let f = ConnectError::Forbidden("denied".into()).to_string();
+    assert!(!f.contains("Mac"), "error should be host-neutral: {f}");
+    let u = ConnectError::DaemonUnavailable.to_string();
+    assert!(!u.contains("Mac"), "error should be host-neutral: {u}");
 }
 
 /// A WebSocket server that upgrades and then neither reads nor writes, holding the connection.

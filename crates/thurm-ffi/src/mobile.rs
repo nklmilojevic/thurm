@@ -18,6 +18,7 @@ const APP_CAPABILITIES: &[&str] = &[
     thurm_proto::CAP_MOBILE,
     thurm_proto::CAP_PANE_PAGER,
     thurm_proto::CAP_AGENT_ACTIVITY,
+    thurm_proto::CAP_PENDING_PROMPT,
 ];
 
 /// [`APP_CAPABILITIES`] for a daemon across the network (the tailnet), which deflates its events
@@ -26,6 +27,7 @@ const REMOTE_CAPABILITIES: &[&str] = &[
     thurm_proto::CAP_MOBILE,
     thurm_proto::CAP_PANE_PAGER,
     thurm_proto::CAP_AGENT_ACTIVITY,
+    thurm_proto::CAP_PENDING_PROMPT,
     thurm_proto::CAP_DEFLATE,
 ];
 
@@ -85,16 +87,35 @@ fn set_err(err: *mut *mut c_char, e: String) {
 }
 
 /// `thurm_ssh_connect`'s failure, as the JSON `thurm_direct_connect` uses.
-fn ssh_failure(kind: &str, message: impl std::fmt::Display) -> String {
-    serde_json::json!({"kind": kind, "message": message.to_string()}).to_string()
+fn ssh_failure(
+    kind: &str,
+    message: impl std::fmt::Display,
+    fingerprint: Option<&str>,
+) -> String {
+    match fingerprint {
+        Some(fp) => serde_json::json!({
+            "kind": kind,
+            "message": message.to_string(),
+            "fingerprint": fp,
+        })
+        .to_string(),
+        None => serde_json::json!({
+            "kind": kind,
+            "message": message.to_string(),
+        })
+        .to_string(),
+    }
 }
 
 /// Connects to a paired host's daemon. `target_json`:
 /// `{"host","port","user","host_keys":["SHA256:…"],"socket"?}`. Blocks while connecting (ssh,
 /// probe, daemon start, Hello), so call it off the main thread. NULL with `err` set on failure
-/// (free it): JSON `{"kind","message"}`, `kind` being `"key_rejected"` (the host does not have
-/// the device's key yet), `"not_installed"` (no `thurm` there) or `"failed"`. Otherwise a client
-/// like `thurm_connect`'s, freed with `thurm_disconnect`, which also closes the ssh session.
+/// (free it): JSON `{"kind","message","fingerprint"?}`, `kind` being `"key_rejected"` (the host
+/// does not have the device's key yet), `"not_installed"` (no `thurm` there),
+/// `"unknown_host_key"` (unpinned target; with `"fingerprint"` set),
+/// `"host_key_changed"` (with `"fingerprint"` set), `"protocol_mismatch"` or `"failed"`.
+/// Otherwise a client like `thurm_connect`'s, freed with `thurm_disconnect`, which also closes the
+/// ssh session.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thurm_ssh_connect(
     target_json: *const c_char,
@@ -111,14 +132,14 @@ pub unsafe extern "C" fn thurm_ssh_connect(
     {
         Ok(t) => t,
         Err(e) => {
-            set_err(err, ssh_failure("failed", format!("bad target: {e}")));
+            set_err(err, ssh_failure("failed", format!("bad target: {e}"), None));
             return std::ptr::null_mut();
         }
     };
     let key = match unsafe { app_key(&key) } {
         Ok(k) => k,
         Err(e) => {
-            set_err(err, ssh_failure("failed", e));
+            set_err(err, ssh_failure("failed", e, None));
             return std::ptr::null_mut();
         }
     };
@@ -127,12 +148,22 @@ pub unsafe extern "C" fn thurm_ssh_connect(
         .to_owned();
     let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
         let remote = thurm_ssh::connect(&target, key, &name, on_ev, on_disc).map_err(|e| {
-            let kind = match &e {
-                thurm_ssh::ConnectError::KeyRejected => "key_rejected",
-                thurm_ssh::ConnectError::NotInstalled => "not_installed",
-                _ => "failed",
-            };
-            ssh_failure(kind, e)
+            match &e {
+                thurm_ssh::ConnectError::KeyRejected => ssh_failure("key_rejected", &e, None),
+                thurm_ssh::ConnectError::NotInstalled => ssh_failure("not_installed", &e, None),
+                thurm_ssh::ConnectError::UnknownHostKey(fp) => {
+                    ssh_failure("unknown_host_key", &e, Some(fp))
+                }
+                thurm_ssh::ConnectError::HostKeyChanged(fp) => {
+                    ssh_failure("host_key_changed", &e, Some(fp))
+                }
+                thurm_ssh::ConnectError::Daemon(::thurm_client::ClientError::Daemon(msg))
+                    if msg.contains("protocol mismatch:") =>
+                {
+                    ssh_failure("protocol_mismatch", &e, None)
+                }
+                _ => ssh_failure("failed", &e, None),
+            }
         })?;
         let transport: Box<dyn std::any::Any + Send> = Box::new(remote.session);
         Ok((remote.client, Some(transport)))
@@ -147,10 +178,11 @@ pub unsafe extern "C" fn thurm_ssh_connect(
 }
 
 /// Connects to a daemon served over Tailscale: `url` is the pairing code's
-/// `wss://<device>.<tailnet>.ts.net/v1/connect`. The phone's own Tailscale carries it; the daemon
-/// admits this device by its Tailscale account. Blocks while connecting (at most a few seconds:
-/// a device whose Tailscale is off fails fast, to fall back to ssh), so call it off the main
-/// thread. NULL with `err` set on failure (free it); otherwise a client like `thurm_connect`'s,
+/// `wss://<device>.<tailnet>.ts.net/v1/connect` (cleartext `ws://` is rejected; use
+/// `thurm_tailnet_connect_plain` for Tailscale IP literals). The phone's own Tailscale carries it;
+/// the daemon admits this device by its Tailscale account. Blocks while connecting (at most a few
+/// seconds: a device whose Tailscale is off fails fast, to fall back to ssh), so call it off the
+/// main thread. NULL with `err` set on failure (free it); otherwise a client like `thurm_connect`'s,
 /// freed with `thurm_disconnect`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thurm_tailnet_connect(
@@ -171,6 +203,43 @@ pub unsafe extern "C" fn thurm_tailnet_connect(
     let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
         let remote =
             thurm_tailnet_client::connect(&url, &name, REMOTE_CAPABILITIES, on_ev, on_disc)
+                .map_err(|e| e.to_string())?;
+        let transport: Box<dyn std::any::Any + Send> = Box::new(remote.session);
+        Ok((remote.client, Some(transport)))
+    });
+    match connected {
+        Ok(c) => c,
+        Err(e) => {
+            set_err(err, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Like `thurm_tailnet_connect`, for a daemon's plain listener over the system Tailscale VPN.
+/// Strictly requires a `ws://` URL whose host is a Tailscale IP literal (`100.64.0.0/10` or
+/// `fd7a:115c:a1e0::/48`) AND an active system Tailscale tunnel interface (`utun*` on Apple /
+/// `tailscale*` on Linux), binding the socket directly to that tunnel interface (`IP_BOUND_IF` /
+/// `IPV6_BOUND_IF` / `SO_BINDTODEVICE`) and failing closed when the VPN is down or ambiguous.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_tailnet_connect_plain(
+    url: *const c_char,
+    client_name: *const c_char,
+    on_event: thurm_event_cb,
+    on_frame: thurm_frame_cb,
+    ctx: *mut c_void,
+    err: *mut *mut c_char,
+) -> *mut thurm_client {
+    let Some(url) = (unsafe { opt_str(url) }).map(str::to_owned) else {
+        set_err(err, "no address".into());
+        return std::ptr::null_mut();
+    };
+    let name = unsafe { opt_str(client_name) }
+        .unwrap_or("Thurm iOS")
+        .to_owned();
+    let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
+        let remote =
+            thurm_tailnet_client::connect_plain(&url, &name, REMOTE_CAPABILITIES, on_ev, on_disc)
                 .map_err(|e| e.to_string())?;
         let transport: Box<dyn std::any::Any + Send> = Box::new(remote.session);
         Ok((remote.client, Some(transport)))

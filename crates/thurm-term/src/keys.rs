@@ -76,25 +76,40 @@ impl Encoders {
             Key::Named(k) => (named_key(k), 0),
         };
         let m = ghostty_mods(ev.mods);
-        // Shift is used up producing a shifted character ("A", "!"); the encoder reports it
-        // only where the protocol wants it.
-        let consumed = match ev.key {
-            Key::Char(c)
-                if ev.mods & mods::SHIFT != 0
-                    && !ev.text.is_empty()
-                    && ev.text != c.to_string() =>
-            {
-                ffi::MODS_SHIFT
-            }
-            _ => 0,
-        };
-        // The key's text as the encoder wants it: the character itself where the app sends
-        // none or a control character (Ctrl combinations).
+        let had_text = !ev.text.is_empty() && !ev.text.chars().all(char::is_control);
+        // The key's text as the encoder wants it: use `ev.text` when printable, else `ev.shifted`
+        // when Shift (without Ctrl) is held and the caller omitted `text`, else the key itself
+        // (Ctrl combinations).
         let text = match ev.key {
-            Key::Char(c) if ev.text.is_empty() || ev.text.chars().all(char::is_control) => {
-                c.to_string()
+            Key::Char(c) if !had_text => {
+                if ev.mods & mods::SHIFT != 0 && ev.mods & mods::CTRL == 0 {
+                    ev.shifted.unwrap_or(c).to_string()
+                } else {
+                    c.to_string()
+                }
             }
             _ => ev.text.clone(),
+        };
+        // Shift is used up producing a shifted character ("A", "!"); the encoder reports it
+        // only where the protocol wants it. Platforms like iOS also pass an already-shifted
+        // character as `code` alongside `SHIFT` (e.g. `code = '!'`, `mods = SHIFT`, `text = "!"`),
+        // or pass `shifted = Some('!')` with `code = '1'`: treat Shift as consumed there too
+        // (except Space, where Shift+Space is a distinct key, and Ctrl combinations).
+        let consumed = match ev.key {
+            Key::Char(c) if ev.mods & mods::SHIFT != 0 && ev.mods & mods::CTRL == 0 => {
+                let shifted_diff = text != c.to_string() && (had_text || ev.shifted.is_some());
+                let already_shifted = c != ' '
+                    && (ev.shifted == Some(c)
+                        || (had_text
+                            && (c.is_uppercase()
+                                || (!c.is_alphanumeric() && !c.is_whitespace()))));
+                if shifted_diff || already_shifted {
+                    ffi::MODS_SHIFT
+                } else {
+                    0
+                }
+            }
+            _ => 0,
         };
         let action = match ev.action {
             KeyAction::Press => ffi::KeyAction::PRESS,

@@ -119,6 +119,7 @@ osc52 = "copy"
 kitty_keyboard = true
 kitty_graphics = true
 # Maximum memory for kitty graphics per pane, in MiB.
+# Defaults to 320 on desktop and 64 on iOS when omitted.
 image_memory_mib = 320
 # Characters that end a word during selection with a double click.
 word_separators = ",│`|:\"' ()[]{}<>\t"

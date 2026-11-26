@@ -64,6 +64,9 @@ pub struct Engine {
     ack_due: Option<Instant>,
     last_heard: Option<Instant>,
     started: Instant,
+    /// The client is ending the session ([`Engine::start_shutdown`]): states go out as
+    /// [`SHUTDOWN`] until the host acknowledges one.
+    closing: bool,
 }
 
 impl Engine {
@@ -80,6 +83,7 @@ impl Engine {
             ack_due: None,
             last_heard: None,
             started: now,
+            closing: false,
         }
     }
 
@@ -114,6 +118,19 @@ impl Engine {
         self.current == SHUTDOWN
     }
 
+    /// Ends the session from this side, as `mosh` does: the next states are [`SHUTDOWN`], sent
+    /// again on the retransmission timer until the host acknowledges one
+    /// ([`Engine::shutdown_acked`]), at which point `mosh-server` exits and its shell with it.
+    pub fn start_shutdown(&mut self) {
+        self.closing = true;
+        self.force_send();
+    }
+
+    /// The host acknowledged our [`SHUTDOWN`] state: it is exiting.
+    pub fn shutdown_acked(&self) -> bool {
+        self.sent.front().is_some_and(|s| s.num == SHUTDOWN)
+    }
+
     /// Whether the host has been heard from since the session started.
     pub fn heard(&self) -> bool {
         self.last_heard.is_some()
@@ -138,7 +155,7 @@ impl Engine {
             return now;
         }
         let mut at = last + HEARTBEAT;
-        if self.unacked_input() {
+        if self.awaiting_ack() {
             at = at.min(last + self.rto());
         }
         if let Some(due) = self.ack_due {
@@ -151,12 +168,17 @@ impl Engine {
         self.sent.back().unwrap().upto > self.sent.front().unwrap().upto
     }
 
+    /// Something sent waits for the host's ack, and is sent again on the retransmission timer.
+    fn awaiting_ack(&self) -> bool {
+        self.unacked_input() || (self.closing && !self.shutdown_acked())
+    }
+
     /// The instruction to send now, if any.
     pub fn poll(&mut self, now: Instant) -> Option<Instruction> {
         let latest = self.sent.back().unwrap();
         let new_input = self.upto() > latest.upto;
         let since = self.last_send.map(|t| now.saturating_duration_since(t));
-        let retransmit = self.unacked_input() && since.is_some_and(|s| s >= self.rto());
+        let retransmit = self.awaiting_ack() && since.is_some_and(|s| s >= self.rto());
         let ack = self.ack_due.is_some_and(|due| now >= due);
         let heartbeat = since.is_none_or(|s| s >= HEARTBEAT);
         if !(new_input || retransmit || ack || heartbeat) {
@@ -165,9 +187,18 @@ impl Engine {
         if retransmit && !new_input {
             self.retries += 1;
         }
-        let num = latest.num + 1;
+        let num = if self.closing {
+            SHUTDOWN
+        } else {
+            latest.num + 1
+        };
         let upto = self.upto();
-        self.sent.push_back(Sent { num, upto });
+        if latest.num == SHUTDOWN {
+            // The shutdown state again (with any input since); there is no state after it.
+            self.sent.back_mut().unwrap().upto = upto;
+        } else {
+            self.sent.push_back(Sent { num, upto });
+        }
         if self.sent.len() > MAX_SENT {
             // Keep the acknowledged state and the newest; the host acks one of those.
             let newest = self.sent.pop_back().unwrap();
