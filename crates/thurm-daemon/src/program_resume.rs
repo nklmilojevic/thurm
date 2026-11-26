@@ -1502,18 +1502,37 @@ fn ours(m: &std::fs::Metadata) -> bool {
     m.uid() == uid || m.uid() == 0
 }
 
+/// Whether others may write what `m` describes: anyone, or a group other than root's or
+/// macOS's `admin` (whose members can become root anyway: Homebrew's trees are theirs), as
+/// `procinfo::is_trusted_install` takes them.
+fn others_may_write(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let admin_gid = if cfg!(target_os = "macos") { 80 } else { 0 };
+    m.mode() & 0o002 != 0 || (m.mode() & 0o020 != 0 && m.gid() != 0 && m.gid() != admin_gid)
+}
+
 /// Whether another principal can change the entries of directory `dir` (`entry`: the one looked
-/// up in it, if it exists): `dir` is owned by neither this user nor root, or is group or other
-/// writable, unless it is sticky and `entry` is this user's or root's.
+/// up in it, if it exists): `dir` is owned by neither this user nor root, or others may write
+/// it, unless it is sticky and `entry` is this user's or root's.
 fn writable_by_others(dir: &Path, entry: Option<&std::fs::Metadata>) -> bool {
     use std::os::unix::fs::MetadataExt;
     match std::fs::symlink_metadata(dir) {
         Ok(m) if !m.is_dir() => false,
         Ok(m) => {
             !ours(&m)
-                || (m.mode() & 0o022 != 0 && !(m.mode() & 0o1000 != 0 && entry.is_some_and(ours)))
+                || (others_may_write(&m) && !(m.mode() & 0o1000 != 0 && entry.is_some_and(ours)))
         }
         Err(_) => true,
+    }
+}
+
+/// Whether another principal could change the canonical file `file`: it is owned by neither
+/// this user nor root, or others may write it, or a directory from `/` to it lets another
+/// principal replace it.
+fn others_can_change_file(file: &Path) -> bool {
+    match std::fs::symlink_metadata(file) {
+        Ok(m) if ours(&m) && !others_may_write(&m) => base_can_be_swapped(file),
+        _ => true,
     }
 }
 
@@ -2392,6 +2411,14 @@ fn pinned_program(
         if let (Some(canon), Some(dir)) = (canon, dir)
             && exe_dirs.iter().any(|d| d == dir)
         {
+            // The trusted directory is not enough in a shared installation: nobody else may
+            // change the program or swap it on the way from `/`.
+            if others_can_change_file(Path::new(canon)) {
+                return Err(format!(
+                    "{} can be changed by another user",
+                    escape_display(canon)
+                ));
+            }
             Ok(canon.to_owned())
         } else {
             Err(format!(
@@ -3235,6 +3262,33 @@ mod tests {
     /// An allowed directory under one another principal may change (writable by others, not
     /// sticky) can itself be swapped: a path under it is not trusted, however its own
     /// directories are kept.
+    /// A program found where a rule pinned it still runs only if nobody else can change it: a
+    /// file others may write, or one in a directory others may write, is refused.
+    #[test]
+    fn a_pinned_program_others_can_change_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("thurm-pin-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let prog = bin.join("prog");
+        std::fs::write(&prog, "#!/bin/sh\n").unwrap();
+        let mode = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        mode(&prog, 0o755).unwrap();
+        let pins = vec![bin.display().to_string()];
+        let path = bin.as_os_str();
+        assert!(pinned_program("prog", Some(path), &pins).is_ok());
+        mode(&prog, 0o757).unwrap();
+        assert!(pinned_program("prog", Some(path), &pins).is_err());
+        mode(&prog, 0o755).unwrap();
+        mode(&bin, 0o757).unwrap();
+        assert!(pinned_program("prog", Some(path), &pins).is_err());
+        mode(&bin, 0o755).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_directory_above_the_allowed_one_counts_too() {
         use std::os::unix::fs::PermissionsExt;
