@@ -1414,40 +1414,81 @@ fn path_within_dir(target: &str, allowed_dir: &str, allow_equal: bool, verify_fs
             return false;
         };
         return within(&canon_target, &canon_base)
-            && !others_can_retarget(&canon_base, &canon_target);
+            && !others_can_retarget(&canon_base, target_path);
     }
     true
 }
 
-/// Whether another principal could change what `target` (canonical, inside `base`) resolves
-/// to: the base or an existing directory down to the target is owned by neither this user nor
-/// root, or is group or other writable. Such a path may be checked here and swapped before use.
+/// Whether another principal could change what `target` resolves to, followed as given (each
+/// symlink on the way, not only where it ends up, which is inside the canonical `base`): from
+/// `base` on, a directory an entry is looked up in, or the directory reached, is owned by
+/// neither this user nor root, or is group or other writable (a sticky one only protects an
+/// existing entry of this user's or root's). Such a path may be checked here and swapped before
+/// use. A writable directory holding a symlink back into `base` counts, though the canonical
+/// path never passes through it.
 fn others_can_retarget(base: &Path, target: &Path) -> bool {
+    use std::ffi::OsString;
     use std::os::unix::fs::MetadataExt;
     let uid = unsafe { libc::geteuid() };
-    let Ok(below) = target.strip_prefix(base) else {
-        return true;
+    let ours = |m: &std::fs::Metadata| m.uid() == uid || m.uid() == 0;
+    let writable_by_others =
+        |dir: &Path, entry: Option<&std::fs::Metadata>| match std::fs::symlink_metadata(dir) {
+            Ok(m) if !m.is_dir() => false,
+            Ok(m) => {
+                !ours(&m)
+                    || (m.mode() & 0o022 != 0
+                        && !(m.mode() & 0o1000 != 0 && entry.is_some_and(ours)))
+            }
+            Err(_) => true,
+        };
+    let names = |p: &Path| -> Vec<OsString> {
+        p.components()
+            .rev()
+            .filter_map(|c| match c {
+                Component::Normal(n) => Some(n.to_owned()),
+                Component::ParentDir => Some("..".into()),
+                _ => None,
+            })
+            .collect()
     };
-    let mut cur = base.to_path_buf();
-    let mut components = below.components();
-    loop {
-        match std::fs::symlink_metadata(&cur) {
-            Ok(meta) => {
-                if meta.is_dir()
-                    && ((meta.uid() != uid && meta.uid() != 0) || meta.mode() & 0o022 != 0)
-                {
+    // Still to resolve, the next one last; `cur` is always a resolved directory.
+    let mut pending = names(target);
+    let mut cur = PathBuf::from("/");
+    let mut checking = false;
+    let mut hops = 0;
+    while let Some(name) = pending.pop() {
+        checking |= cur.starts_with(base);
+        if name == ".." {
+            cur.pop();
+            continue;
+        }
+        let next = cur.join(&name);
+        let entry = std::fs::symlink_metadata(&next);
+        if checking && writable_by_others(&cur, entry.as_ref().ok()) {
+            return true;
+        }
+        match entry {
+            Ok(m) if m.file_type().is_symlink() => {
+                hops += 1;
+                let Ok(link) = std::fs::read_link(&next) else {
+                    return true;
+                };
+                if hops > 40 {
                     return true;
                 }
+                if link.is_absolute() {
+                    cur = PathBuf::from("/");
+                }
+                pending.extend(names(&link));
             }
+            Ok(_) => cur = next,
             // The rest does not exist yet: nothing below it to swap.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
             Err(_) => return true,
         }
-        match components.next() {
-            Some(c) => cur.push(c),
-            None => return false,
-        }
     }
+    checking |= cur.starts_with(base);
+    checking && writable_by_others(&cur, None)
 }
 
 /// Canonicalizes `path`, whose last components may not exist yet: the nearest existing ancestor
@@ -1503,6 +1544,14 @@ fn process_matches_command(
         ) && a == b
         {
             return true;
+        }
+        // An interpreted program runs as its interpreter: its script is the file named.
+        if is_interpreter(thurm_config::executable_name(process_exe))
+            && let Some(script) = script
+            && script.starts_with('/')
+            && let (Ok(a), Ok(b)) = (std::fs::canonicalize(script), std::fs::canonicalize(want))
+        {
+            return a == b && a.is_file();
         }
         return false;
     }
@@ -2077,21 +2126,22 @@ pub fn dir_identity(path: &str) -> Option<(u64, u64)> {
 
 /// The canonical directories holding the owner's executable and, for an interpreter, its
 /// script: a program a rule trusted by its executable must still be found in one of them
-/// (an update that replaces the file, or adds a version beside it, stays there).
+/// (an update that replaces the file, or adds a version beside it, stays there). The script is
+/// resolved first: a launcher symlinked into a `bin` directory is found again as its target.
 pub fn pin_dirs(process_exe: &str, script: Option<&str>) -> Vec<String> {
+    let exe_dir = Path::new(process_exe)
+        .parent()
+        .filter(|_| process_exe.starts_with('/'))
+        .and_then(|d| std::fs::canonicalize(d).ok());
+    let script_dir = script
+        .filter(|s| s.starts_with('/'))
+        .and_then(|s| std::fs::canonicalize(s).ok())
+        .and_then(|f| f.parent().map(Path::to_path_buf));
     let mut out: Vec<String> = Vec::new();
-    for file in std::iter::once(process_exe).chain(script) {
-        if !file.starts_with('/') {
-            continue;
-        }
-        let Some(parent) = Path::new(file).parent() else {
-            continue;
-        };
-        if let Ok(dir) = std::fs::canonicalize(parent) {
-            let dir = dir.display().to_string();
-            if !out.contains(&dir) {
-                out.push(dir);
-            }
+    for dir in exe_dir.into_iter().chain(script_dir) {
+        let dir = dir.display().to_string();
+        if !out.contains(&dir) {
+            out.push(dir);
         }
     }
     out
@@ -2137,16 +2187,11 @@ fn take_resume(ticket: &str) -> Result<ResumeExecSpec, String> {
 /// Enters `dir`; with `id`, only if it still is the directory restore checked, through the
 /// handle that was verified.
 fn enter_dir(dir: &str, id: Option<(u64, u64)>) -> std::io::Result<()> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::AsRawFd;
     let Some((dev, ino)) = id else {
         return std::env::set_current_dir(dir);
     };
-    let c = CString::new(dir).map_err(std::io::Error::other)?;
-    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd = open_dir_for_search(dir)?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
         return Err(std::io::Error::last_os_error());
@@ -2160,9 +2205,34 @@ fn enter_dir(dir: &str, id: Option<(u64, u64)>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A handle on the directory `dir` good for `fstat` and `fchdir`, needing only the permission
+/// to search it (as `chdir` does), not to list it.
+fn open_dir_for_search(dir: &str) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let flags = libc::O_PATH | libc::O_DIRECTORY;
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_SEARCH;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY;
+    let c = CString::new(dir).map_err(std::io::Error::other)?;
+    let mut fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC) };
+    // A kernel without search-only opens refuses the flag: open it for reading instead.
+    if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        let read = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        fd = unsafe { libc::open(c.as_ptr(), read) };
+    }
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// The program to run when it must be found in `exe_dirs`: the first `program` on the absolute
 /// entries of `PATH` (or `program` itself when it holds a `/`), canonical, and only if it is
-/// in one of `exe_dirs`. A same-named program found first elsewhere is refused, never skipped.
+/// in one of `exe_dirs`. Like a shell's lookup, an entry holding no executable file by that
+/// name (a directory, a dangling symlink, a file without execute permission) is passed over;
+/// a same-named executable found first elsewhere is refused, never skipped.
 fn pinned_program(
     program: &str,
     path: Option<&std::ffi::OsStr>,
@@ -2191,11 +2261,19 @@ fn pinned_program(
             continue;
         }
         let candidate = Path::new(std::ffi::OsStr::from_bytes(dir)).join(program);
-        if std::fs::symlink_metadata(&candidate).is_ok() {
+        if is_executable_file(&candidate) {
             return check(&candidate);
         }
     }
     Err("not found".into())
+}
+
+/// Whether `path` is (or links to) a regular file this process may execute.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file())
+        && CString::new(path.as_os_str().as_bytes())
+            .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0)
 }
 
 /// Runs the command behind a restored pane's ticket (never returns on success).
@@ -2970,6 +3048,141 @@ mod tests {
     }
 
     #[test]
+    fn pinned_program_passes_over_what_path_lookup_skips() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("thurm-pin-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (plain, folder, dangling, good, evil) = (
+            root.join("plain"),
+            root.join("folder"),
+            root.join("dangling"),
+            root.join("good"),
+            root.join("evil"),
+        );
+        for d in [&plain, &folder, &dangling, &good, &evil] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // Shadows a shell would not run: a file without execute permission, a directory, a
+        // symlink to nothing.
+        std::fs::write(plain.join("prog"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(plain.join("prog"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        std::fs::create_dir(folder.join("prog")).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), dangling.join("prog")).unwrap();
+        for d in [&good, &evil] {
+            let f = d.join("prog");
+            std::fs::write(&f, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let pins = pin_dirs(&good.join("prog").display().to_string(), None);
+        let path = format!(
+            "{}:{}:{}:{}",
+            plain.display(),
+            folder.display(),
+            dangling.display(),
+            good.display()
+        );
+        let got = pinned_program("prog", Some(path.as_ref()), &pins).unwrap();
+        assert!(got.ends_with("/good/prog"), "{got}");
+        // A runnable one outside the pin, after the shadows, is still refused.
+        let path = format!("{}:{}:{}", plain.display(), evil.display(), good.display());
+        assert!(pinned_program("prog", Some(path.as_ref()), &pins).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_launcher_symlink_is_pinned_where_its_script_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("thurm-pin-script-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (bin, pkg) = (root.join("bin"), root.join("lib/tool/dist"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&pkg).unwrap();
+        let script = pkg.join("cli.js");
+        std::fs::write(&script, "#!/usr/bin/env node\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launcher = bin.join("tool");
+        std::os::unix::fs::symlink(&script, &launcher).unwrap();
+        // `node <bin>/tool`: the script operand is the launcher as invoked.
+        let pins = pin_dirs("/usr/bin/node", Some(&launcher.display().to_string()));
+        let pkg_dir = std::fs::canonicalize(&pkg).unwrap().display().to_string();
+        assert!(pins.contains(&pkg_dir), "{pins:?}");
+        let path = bin.display().to_string();
+        let got = pinned_program("tool", Some(path.as_ref()), &pins).unwrap();
+        assert!(got.ends_with("/dist/cli.js"), "{got}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_searchable_unreadable_directory_can_be_entered() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("thurm-enter-x-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("search-only");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let dir_str = dir.display().to_string();
+        let id = dir_identity(&dir_str).unwrap();
+        let fd = open_dir_for_search(&dir_str);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fd = fd.unwrap();
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) }, 0);
+        assert_eq!((st.st_dev as u64, st.st_ino as u64), id);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_absolute_rule_matches_its_script_run_by_an_interpreter() {
+        let root = std::env::temp_dir().join(format!("thurm-abs-script-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let (tool, other) = (a.join("tool"), b.join("tool"));
+        std::fs::write(&tool, "#!/usr/bin/env python3\n").unwrap();
+        std::fs::write(&other, "#!/usr/bin/env python3\n").unwrap();
+        let link = root.join("tool-link");
+        std::os::unix::fs::symlink(&tool, &link).unwrap();
+        let want = tool.display().to_string();
+        let py = "/usr/bin/python3";
+        assert!(process_matches_command(
+            &want,
+            py,
+            Some("python3"),
+            Some(&want)
+        ));
+        // The same file through a symlink.
+        let via = link.display().to_string();
+        assert!(process_matches_command(
+            &want,
+            py,
+            Some("python3"),
+            Some(&via)
+        ));
+        // Another script of the same name is not the one the rule names.
+        let other = other.display().to_string();
+        assert!(!process_matches_command(
+            &want,
+            py,
+            Some("python3"),
+            Some(&other)
+        ));
+        // Nor is the script of a program that is no interpreter.
+        assert!(!process_matches_command(
+            &want,
+            "/usr/bin/env",
+            Some("env"),
+            Some(&want)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn exec_lookup_never_falls_back_to_a_shell() {
         let err = |code| std::io::Error::from_raw_os_error(code);
         // A text file without `#!`: the search stops with ENOEXEC, nothing else is tried.
@@ -3437,6 +3650,40 @@ mod tests {
         assert!(!path_within_dir(&target, &allowed, false, true));
         // Lexical checks alone (live records) do not look at the filesystem.
         assert!(path_within_dir(&target, &allowed, false, false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_symlink_in_a_writable_directory_is_not_a_trusted_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("thurm-resume-hop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let allowed = root.join("allowed");
+        let (mine, shared) = (allowed.join("mine"), allowed.join("shared"));
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        for d in [&root, &allowed, &mine, &shared] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(mine.join("s.vim"), "").unwrap();
+        // `shared/link` points back into the allowed tree.
+        std::os::unix::fs::symlink(&mine, shared.join("link")).unwrap();
+        let allowed_str = allowed.display().to_string();
+        let target = shared.join("link/s.vim").display().to_string();
+        assert!(path_within_dir(&target, &allowed_str, false, true));
+        // Anyone may now swap the link, though the canonical path never passes through it.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!path_within_dir(&target, &allowed_str, false, true));
+        // The canonical path alone is still fine.
+        let direct = mine.join("s.vim").display().to_string();
+        assert!(path_within_dir(&direct, &allowed_str, false, true));
+        // A relative link resolves the same way.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("../mine", shared.join("rel")).unwrap();
+        let rel = shared.join("rel/s.vim").display().to_string();
+        assert!(path_within_dir(&rel, &allowed_str, false, true));
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!path_within_dir(&rel, &allowed_str, false, true));
         let _ = std::fs::remove_dir_all(&root);
     }
 
