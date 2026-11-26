@@ -323,6 +323,79 @@ fn concealed_text_is_not_exported() {
     assert!(screen.starts_with("pw:            ok\nx\n"), "{screen:?}");
 }
 
+/// Concealed text blanks as wide as its cells were laid out, whatever grapheme clustering
+/// is when copying.
+#[test]
+fn concealed_blanks_keep_the_cells_laid_out() {
+    let mut t = term(20, 2);
+    t.advance("\x1b[8m👍🏽\x1b[m|".as_bytes());
+    t.advance(b"\x1b[?2027h");
+    t.selection(SelectionOp::SelectAll);
+    assert_eq!(t.selection_text(), "    |");
+}
+
+/// A concealed wide character reflowed onto the next row, selected up to the spacer it left
+/// at the row's end, is not copied.
+#[test]
+fn concealed_wide_character_past_the_selection_end() {
+    let mut t = term(6, 3);
+    t.advance("abcd\x1b[8m秘\x1b[m".as_bytes());
+    t.resize(PaneSize {
+        cols: 5,
+        rows: 3,
+        cell_width: 10,
+        cell_height: 20,
+    });
+    // Row 0: "abcd" and the spacer; row 1: the concealed character.
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 0,
+        right_half: false,
+        kind: SelectionKind::Simple,
+    });
+    t.selection(SelectionOp::Update {
+        col: 4,
+        row: 0,
+        right_half: true,
+    });
+    // The formatter copies the character past the spacer (the plain copy has it).
+    assert!(t.vt.selection_copies().0.contains('秘'));
+    let text = t.selection_text();
+    assert!(!text.contains('秘'), "{text:?}");
+    assert_eq!(text.trim_end(), "abcd");
+}
+
+/// A block beside concealed text copies as the plain text.
+#[test]
+fn block_beside_concealed_text_is_plain() {
+    let mut t = term(20, 3);
+    t.advance(b"left  \x1b[8msecret\x1b[m\r\nmore  \x1b[8mhidden\x1b[m");
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 0,
+        right_half: false,
+        kind: SelectionKind::Block,
+    });
+    t.selection(SelectionOp::Update {
+        col: 3,
+        row: 1,
+        right_half: true,
+    });
+    assert_eq!(t.selection_text(), "left\nmore");
+    assert_eq!(t.selection_text(), t.vt.selection_copies().0);
+}
+
+/// Rows erased with a background color after concealed text copy as nothing, like plain.
+#[test]
+fn concealed_copy_drops_trailing_background_rows() {
+    let mut t = term(10, 5);
+    t.advance(b"pw: \x1b[8mx\x1b[m ok\r\n\x1b[44m\x1b[K\r\n\x1b[K\x1b[m");
+    t.selection(SelectionOp::SelectAll);
+    let (plain, _) = t.vt.selection_copies();
+    assert_eq!(t.selection_text(), plain.replace('x', " "));
+    assert!(!t.selection_text().ends_with('\n'));
+}
+
 #[test]
 fn styled_text_parses_escapes() {
     use crate::vt::styled_text;
@@ -2406,4 +2479,92 @@ fn a_title_does_not_settle_a_resize_redraw() {
     t.advance(b"\x1b]0;title\x07");
     assert_eq!(t.sync_deadline(), deadline);
     assert!(t.in_sync());
+}
+
+/// Random styled output selected in every shape: the selected cells line up with the plain
+/// formatter's copy, so blanking concealed cells by them leaves the rest exactly as it is.
+#[test]
+fn selected_cells_line_up_with_plain_copy() {
+    let pieces: &[&str] = &[
+        "word",
+        " ",
+        "  ",
+        "\t",
+        "\r\n",
+        "漢",
+        "e\u{301}",
+        "👍🏽",
+        "\x1b[1m",
+        "\x1b[0m",
+        "\x1b[31m",
+        "\x1b[48;5;4m",
+        "\x1b[38;2;1;2;3m",
+        "\x1b[4:3m",
+        "\x1b[7m",
+        "\x1b[m",
+        "\x1b[5C",
+        "\x1b[2D",
+        "\x1b]8;;https://e.x\x1b\\",
+        "\x1b]8;;\x1b\\",
+        "\x1b(0q\x1b(B",
+        "\x1b[K",
+        "longerwordthatwraps",
+        "\x1b[3G",
+        "\x1b[?2027h",
+        "\x1b[?2027l",
+        "\x1b[2X",
+    ];
+    let mut seed = 0x2545_f491_u32;
+    let mut rand = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as usize % n
+    };
+    for round in 0..2000 {
+        let mut t = term(17, 6);
+        let mut input = String::new();
+        for _ in 0..60 {
+            input.push_str(pieces[rand(pieces.len())]);
+        }
+        t.advance(input.as_bytes());
+        if rand(4) == 0 {
+            // Reflow: wide characters move to the next row, leaving spacers.
+            t.resize(PaneSize {
+                cols: 9 + rand(8) as u16,
+                rows: 6,
+                cell_width: 10,
+                cell_height: 20,
+            });
+        }
+        let cols = t.cols;
+        let start = SelectionOp::Start {
+            col: rand(cols) as u16,
+            row: rand(6) as u16,
+            right_half: rand(2) == 0,
+            kind: [
+                SelectionKind::Simple,
+                SelectionKind::Block,
+                SelectionKind::Word,
+                SelectionKind::Line,
+            ][rand(4)],
+        };
+        for op in [SelectionOp::SelectAll, start] {
+            t.selection(op);
+            if let SelectionOp::Start { .. } = op {
+                t.selection(SelectionOp::Update {
+                    col: rand(cols) as u16,
+                    row: rand(6) as u16,
+                    right_half: rand(2) == 0,
+                });
+            }
+            let (plain, blanked) = t.vt.selection_copies();
+            assert_eq!(
+                blanked.as_ref(),
+                Some(&plain),
+                "round {round}: {input:?} {op:?}"
+            );
+            assert_eq!(t.selection_text(), plain);
+        }
+    }
 }
