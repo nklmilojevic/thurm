@@ -1684,10 +1684,12 @@ unsafe fn grid_lock_inner(
             out_info.dirty_rows = u64::MAX;
             out_info.shift = 0;
         } else if out_info.generation != last_gen {
-            let skipped = out_info.generation > last_gen.saturating_add(1);
+            // Preserve zero dirty_rows on a consecutive metadata/cursor-only update when no other
+            // reader has already consumed that generation; force a full repaint only if the
+            // reader skipped/rewound generations or another reader already consumed the mask.
+            let jumped = out_info.generation != last_gen.saturating_add(1);
             let consumed_by_other = last_gen < guard.last_consumed_gen;
-            let missing_dirty = out_info.dirty_rows == 0;
-            if skipped || consumed_by_other || missing_dirty {
+            if jumped || consumed_by_other {
                 out_info.dirty_rows = u64::MAX;
                 out_info.shift = 0;
             }
@@ -3276,6 +3278,43 @@ mod tests {
         assert_eq!(c1.generation, 3);
         assert_eq!(c1.dirty_rows, u64::MAX);
         assert_eq!(c1.shift, 0);
+
+        // Metadata/cursor-only update (gen 4, no dirty rows): the first consecutive reader keeps
+        // dirty_rows == 0 so it does not recopy the grid, while a second reader that missed or
+        // had the mask consumed still gets a full grid.
+        d.push(Event::Output {
+            pane: 1,
+            data: b"\x1b[?25l".to_vec(),
+        });
+        d.sync();
+        let c2 = lock_for(c1.generation);
+        assert_eq!(c2.generation, 4);
+        assert_eq!(c2.dirty_rows, 0);
+        assert_eq!(c2.shift, 0);
+        assert_eq!(c2.cursor_shape, 4);
+
+        let b3 = lock_for(b2.generation);
+        assert_eq!(b3.generation, 4);
+        assert_eq!(b3.dirty_rows, u64::MAX);
+        assert_eq!(b3.shift, 0);
+
+        // Second consecutive metadata-only update (gen 5): Reader B (at gen 4) gets dirty_rows == 0,
+        // and Reader C (also at gen 4) locking AFTER Reader B consumed gen 5 gets u64::MAX.
+        d.push(Event::Output {
+            pane: 1,
+            data: b"\x1b[?25h".to_vec(),
+        });
+        d.sync();
+        let b4 = lock_for(b3.generation);
+        assert_eq!(b4.generation, 5);
+        assert_eq!(b4.dirty_rows, 0);
+        assert_eq!(b4.shift, 0);
+        assert_ne!(b4.cursor_shape, 4);
+
+        let c3 = lock_for(c2.generation);
+        assert_eq!(c3.generation, 5);
+        assert_eq!(c3.dirty_rows, u64::MAX);
+        assert_eq!(c3.shift, 0);
     }
 
     #[test]
