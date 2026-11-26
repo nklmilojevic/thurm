@@ -1348,6 +1348,140 @@ fn wake_supersedes_stalled_dns_without_waiting_and_bounds_concurrency() {
     );
 }
 
+/// A lookup judged current must not retarget a session once a newer wake (the network changed
+/// again) has registered, even when it got that far before the newer wake came. Holding the
+/// pane's lock parks the old result between that judgment and its retarget.
+#[test]
+fn stale_wake_result_cannot_retarget_after_a_newer_wake_registers() {
+    let key = TestKey::new(1);
+    let server = ssh_server(&key);
+    let mut t = direct_target(&server, Mode::Ssh);
+    let (_stream, direct) = super::serve(t.clone(), key).unwrap();
+    let server_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    let alt_udp = std::net::UdpSocket::bind("[::1]:0")
+        .or_else(|_| std::net::UdpSocket::bind("127.0.0.2:0"))
+        .expect("alternate loopback socket");
+    let alt_ip = alt_udp.local_addr().unwrap().ip();
+    assert_ne!(alt_ip, server_addr.ip());
+
+    let mosh_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let session =
+        MoshSession::start(mosh_rt.handle(), server_addr, [9u8; 16], (80, 24), |_| {}).unwrap();
+    t.host = "roaming.example".into();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let inner = Arc::new(Inner {
+        target: t,
+        key: TestKey::new(1),
+        session: Mutex::new(SessionSlot {
+            current: direct.inner.session.lock().current.clone(),
+            session_id: 1,
+            ip: server_addr.ip(),
+            connecting: false,
+        }),
+        next_session_id: AtomicU64::new(2),
+        session_ready: Condvar::new(),
+        panes: Mutex::new(HashMap::from([(
+            1,
+            Arc::new(Mutex::new(Pane {
+                id: 1,
+                term: new_terminal(size(80, 24)),
+                backend: Backend::Mosh {
+                    session,
+                    pid: None,
+                    origin_session_id: 1,
+                    current: 0,
+                    snapshots: BTreeMap::new(),
+                    status: Status::Connecting,
+                },
+                subscribed: false,
+                alive: true,
+                exit_code: None,
+                held_replies: Vec::new(),
+            })),
+        )])),
+        next_pane: AtomicU64::new(2),
+        closed: AtomicBool::new(false),
+        creating: Mutex::new(0),
+        created: Condvar::new(),
+        out: Mutex::new(theirs),
+        wake_dns: Mutex::new(WakeDnsState::new()),
+        mosh_rt: Some(mosh_rt),
+    });
+    let _keep = ours;
+    let host_direct = Arc::new(Direct { inner });
+    let pane = host_direct.inner.pane(1).unwrap();
+    let peer_ip = || match &pane.lock().backend {
+        Backend::Mosh { session, .. } => session.peer_ip(),
+        _ => unreachable!(),
+    };
+    let wait_until = |what: &str, cond: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    // Wake #1 (the previous network) resolves to `alt_ip`, once released.
+    let alt_addr = SocketAddr::new(alt_ip, server_addr.port());
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let old_waiter = host_direct
+        .wake_with(
+            Arc::new(move |_host, _port| {
+                let _ = started_tx.send(());
+                let _ = release_rx.lock().recv();
+                Ok(vec![alt_addr])
+            }),
+            WAKE_DNS_TIMEOUT,
+        )
+        .expect("wake #1 starts a lookup");
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let old_gen = host_direct.inner.wake_dns.lock().latest_gen;
+
+    // Park wake #1's result after it is judged current, before it can retarget.
+    let held = pane.lock();
+    let _ = release_tx.send(());
+    wait_until("wake #1 to be judged current", &|| {
+        host_direct.inner.wake_dns.lock().active_task.is_none()
+    });
+
+    // Wake #2 (the network changed again) registers, then waits on the pane for its immediate
+    // wake. Its own lookup fails, so only wake #1 could move the peer.
+    let second = {
+        let d = Arc::clone(&host_direct);
+        std::thread::spawn(move || {
+            d.wake_with(
+                Arc::new(|_host, _port| Err(DirectError::Failed("no DNS here".into()))),
+                WAKE_DNS_TIMEOUT,
+            )
+        })
+    };
+    wait_until("wake #2 to register its generation", &|| {
+        host_direct.inner.wake_dns.lock().latest_gen > old_gen
+    });
+    drop(held);
+    let new_waiter = second.join().unwrap();
+
+    let rt = host_direct.inner.mosh_rt.as_ref().unwrap();
+    rt.block_on(old_waiter).unwrap();
+    if let Some(w) = new_waiter {
+        rt.block_on(w).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        peer_ip(),
+        server_addr.ip(),
+        "a superseded wake's address must not be installed"
+    );
+}
+
 #[test]
 fn close_and_shutdown_skip_old_mosh_pids_after_ssh_reconnect() {
     struct ChildGuard(Option<std::process::Child>);

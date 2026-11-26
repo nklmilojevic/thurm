@@ -208,6 +208,17 @@ fn spawn_wake_lookup_locked(
                         if let Some(ip) =
                             pick_wake_ip(actual_ip, &addrs).filter(|&ip| ip != actual_ip)
                         {
+                            // A newer wake (the network changed again) may have registered
+                            // since this lookup was judged current; its address wins. The
+                            // generation is rechecked and the nonblocking retarget queued under
+                            // `wake_dns`, which `wake_with` holds to register a generation, so
+                            // the two cannot interleave. Lock order: pane, then `wake_dns`.
+                            let dns = waiter_inner.wake_dns.lock();
+                            if dns.latest_gen != my_gen
+                                || waiter_inner.closed.load(Ordering::SeqCst)
+                            {
+                                return;
+                            }
                             session.wake_at(ip);
                         }
                     }
@@ -239,20 +250,28 @@ impl Direct {
         resolve: Arc<WakeResolver>,
         timeout: Duration,
     ) -> Option<tokio::task::JoinHandle<()>> {
+        let hostname = self.inner.target.host.parse::<IpAddr>().is_err()
+            && !self.inner.closed.load(Ordering::SeqCst);
+        // Register this wake's generation before the immediate wakes go out, so an older
+        // lookup that has not queued its retarget yet sees it is superseded and cannot point a
+        // session back at the previous network's address after this wake.
+        let my_gen = hostname.then(|| {
+            let mut dns = self.inner.wake_dns.lock();
+            dns.latest_gen = dns.latest_gen.saturating_add(1);
+            dns.latest_gen
+        });
         let panes: Vec<_> = self.inner.panes.lock().values().cloned().collect();
         for pane in panes {
             if let Backend::Mosh { session, .. } = &pane.lock().backend {
                 session.wake();
             }
         }
-        if self.inner.target.host.parse::<IpAddr>().is_ok()
-            || self.inner.closed.load(Ordering::SeqCst)
-        {
+        let my_gen = my_gen?;
+        let mut dns = self.inner.wake_dns.lock();
+        if dns.latest_gen != my_gen || self.inner.closed.load(Ordering::SeqCst) {
+            // A newer wake registered meanwhile and starts (or queues) its own lookup.
             return None;
         }
-        let mut dns = self.inner.wake_dns.lock();
-        dns.latest_gen = dns.latest_gen.saturating_add(1);
-        let my_gen = dns.latest_gen;
         if dns.in_flight < MAX_WAKE_DNS_IN_FLIGHT {
             dns.in_flight += 1;
             dns.started_gen = my_gen;
