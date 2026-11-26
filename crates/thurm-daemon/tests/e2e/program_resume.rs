@@ -291,8 +291,9 @@ fn report_persists_resumes_verbatim_without_shell_parsing_and_never_retries_twic
         1
     );
 
-    // After the resumed command exited, the shell is still interactive.
-    run_line(&c2, pane, "echo SHELL_ALIVE");
+    // After the resumed command exited, the shell is still interactive: only a shell running
+    // the line prints the joined word (the terminal's echo of the typed line would not).
+    run_line(&c2, pane, "printf 'SHELL_%s\\n' ALIVE");
     wait_match(&c2, pane, "SHELL_ALIVE");
 
     // Second restart without reporting again must NOT re-run the program.
@@ -302,9 +303,9 @@ fn report_persists_resumes_verbatim_without_shell_parsing_and_never_retries_twic
 
     let _daemon3 = env.start();
     let (c3, _) = env.connect();
-    run_line(&c3, pane, "echo THIRD_START");
-    wait_match(&c3, pane, "THIRD_START");
-    std::thread::sleep(Duration::from_millis(400));
+    // Untouched past the typed resume's due time (2.5 s) and a monitor tick: input would
+    // cancel a repeat this checks for.
+    std::thread::sleep(Duration::from_millis(4500));
     assert_eq!(
         std::fs::read_to_string(&count_file)
             .unwrap()
@@ -313,6 +314,8 @@ fn report_persists_resumes_verbatim_without_shell_parsing_and_never_retries_twic
         1,
         "resume ran a second time"
     );
+    run_line(&c3, pane, "printf 'THIRD_%s\\n' START");
+    wait_match(&c3, pane, "THIRD_START");
 }
 
 #[test]
@@ -532,6 +535,80 @@ fn first_process_resumes_as_first_process() {
     );
 }
 
+/// A first-process resume that fails leaves the configured shell in the pane, started with
+/// its configured arguments.
+#[test]
+fn failed_first_process_resume_starts_the_configured_shell_with_its_arguments() {
+    if running_as_root() {
+        return;
+    }
+    let env = Env::new("resume-first-fallback");
+    // A shell launcher that refuses to start without its argument.
+    let launcher = env.dir.join("bin/launcher");
+    write_exec(
+        &launcher,
+        "#!/bin/sh\n\
+         [ \"$1\" = --required ] || { echo LAUNCHER_NEEDS_ARG; exit 3; }\n\
+         exec /bin/sh\n",
+    );
+    write_config(
+        &env,
+        &format!(
+            "[terminal]\nshell = [\"{}\", \"--required\"]\n\
+             [session]\nsnapshot_interval_secs = 60\nresume_programs = \"all\"\n",
+            launcher.display()
+        ),
+    );
+    // The program it reports is gone by the restart.
+    let gone = env.dir.join("bin/gone");
+    write_exec(&gone, "#!/bin/sh\necho GONE_RAN\n");
+    let first_bin = env.dir.join("bin/first");
+    let enc = b64_argv(&[&gone.display().to_string()]);
+    write_exec(
+        &first_bin,
+        &format!(
+            "#!/bin/sh\n{EMIT_SH}\nemit_7577 \"$$\" \"argv={enc}\"\necho FIRST_REPORTED\nsleep 60\n"
+        ),
+    );
+
+    let mut daemon = env.start();
+    let (c, _) = env.connect();
+    let Response::PaneCreated { pane } = c
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec![first_bin.display().to_string()]),
+            cwd: Some(env.dir.display().to_string()),
+            size: PaneSize {
+                cols: 80,
+                rows: 24,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .unwrap()
+    else {
+        panic!("expected PaneCreated");
+    };
+    wait_match(&c, pane, "FIRST_REPORTED");
+    wait_records(&c, pane, "first_process record", |r| {
+        r.len() == 1 && r[0].first_process && r[0].trusted
+    });
+    c.request(Request::Shutdown { kill_panes: true }).unwrap();
+    daemon.wait_exit();
+    drop(c);
+    std::fs::remove_file(&gone).unwrap();
+
+    let _daemon2 = env.start();
+    let (c2, _) = env.connect();
+    wait_match(&c2, pane, "cannot resume");
+    // Only a shell running the line prints the joined word.
+    run_line(&c2, pane, "printf 'FALLBACK_%s\\n' SHELL");
+    wait_match(&c2, pane, "FALLBACK_SHELL");
+    assert!(
+        !capture(&c2, pane).contains("LAUNCHER_NEEDS_ARG"),
+        "the fallback shell started without its arguments"
+    );
+}
+
 #[test]
 fn cwd_from_report_requires_directory_while_os_cwd_falls_back() {
     if running_as_root() {
@@ -713,20 +790,31 @@ fn clear_reject_exit_grace_and_close_pane_remove_records() {
     })
     .unwrap();
 
-    // 3. Process exit without `clear` keeps record briefly (<2s grace), then expires it.
+    // 3. Process exit without `clear` keeps record briefly (<2s grace), then expires it. The
+    // record is on disk first (its own argv, unlike the earlier steps'), and the program exits
+    // only once the test saw it there.
     let exit_script = env.dir.join("exit.sh");
+    let exit_gate = env.dir.join("exit-now");
+    let exit_argv = b64_argv(&["/bin/echo", "exit-step"]);
     write_exec(
         &exit_script,
         &format!(
-            "#!/bin/sh\n{EMIT_SH}\nemit_7577 \"$$\" \"argv={valid_argv}\"\necho EXIT_SOON\nsleep 0.5\n"
+            "#!/bin/sh\n{EMIT_SH}\nemit_7577 \"$$\" \"argv={exit_argv}\"\necho EXIT_SOON\n\
+             while [ ! -f '{}' ]; do sleep 0.05; done\n",
+            exit_gate.display()
         ),
     );
     run_line(&c, pane, &format!("'{}'", exit_script.display()));
     wait_match(&c, pane, "EXIT_SOON");
     wait_records(&c, pane, "short-lived set", |r| r.len() == 1);
+    wait_snapshot(&env, "short-lived record saved", |snap| {
+        snap["panes"][0]["id"] == pane
+            && snap["panes"][0]["program_resume"]["argv"][1] == "exit-step"
+    });
+    std::fs::write(&exit_gate, "").unwrap();
     wait_records(&c, pane, "expired after exit grace", |r| r.is_empty());
     wait_snapshot(&env, "expired record removed from snapshot", |snap| {
-        snap["panes"][0]["program_resume"].is_null()
+        snap["panes"][0]["id"] == pane && snap["panes"][0]["program_resume"].is_null()
     });
 
     // 4. Closing a pane discards its record immediately.
@@ -797,7 +885,8 @@ fn trust_rules_enforce_allowlist_reload_and_wrapped_check() {
     let recs = wait_records(&c, pane, "untrusted record", |r| r.len() == 1);
     assert!(!recs[0].trusted);
     assert_eq!(recs[0].untrusted_reason.as_deref(), Some("no_rule"));
-    // Saved on the monitor's next tick, without the record.
+    // A save that saw the live record leaves it out.
+    c.request(Request::SaveSnapshot).unwrap();
     wait_snapshot(&env, "untrusted record not saved", |snap| {
         snap["panes"][0].is_object() && snap["panes"][0]["program_resume"].is_null()
     });
@@ -886,7 +975,8 @@ fn wrapped_child_under_non_shell_is_not_trusted_even_in_all_mode() {
         "wrapped child must not be trusted: {recs:?}"
     );
     assert_eq!(recs[0].untrusted_reason.as_deref(), Some("wrapped"));
-    // Saved on the monitor's next tick, without the record.
+    // A save that saw the live record leaves it out.
+    c.request(Request::SaveSnapshot).unwrap();
     wait_snapshot(&env, "untrusted record not saved", |snap| {
         snap["panes"][0].is_object() && snap["panes"][0]["program_resume"].is_null()
     });
