@@ -698,9 +698,15 @@ final class TerminalRenderer {
         var lastUsed: CFTimeInterval
     }
 
-    /// An oversized image's texture, filled `nextRow` rows so far for pixels of `serial`.
+    /// An oversized image's texture, filled `nextRow` rows so far, from a `srcWidth`×`srcHeight`
+    /// source first seen at serial `startSerial`. A replacement of the same size carries on in
+    /// the same texture (`mixed`): rows done are kept, so a stream of replacements can't keep
+    /// restarting it and nothing ever shows.
     private struct PendingDownscale {
-        var serial: UInt64
+        var startSerial: UInt64
+        var mixed: Bool
+        var srcWidth: UInt32
+        var srcHeight: UInt32
         var texture: MTLTexture
         var nextRow: Int
         var lastUsed: CFTimeInterval
@@ -708,6 +714,8 @@ final class TerminalRenderer {
 
     private enum ImageLookup {
         case ready(CachedImage)
+        /// An earlier version, shown while the current one is still being prepared.
+        case stale(CachedImage)
         case missing
         case invalid
     }
@@ -1174,6 +1182,9 @@ final class TerminalRenderer {
             switch imageEntry(for: placement.image, pane: p.pane, device: device, now: now) {
             case .ready(let entry):
                 cached = entry
+            case .stale(let entry):
+                cached = entry
+                wantsAnotherFrame = true
             case .missing:
                 wantsAnotherFrame = true
                 continue
@@ -1224,11 +1235,7 @@ final class TerminalRenderer {
         defer { thurm_image_unlock(client, pane, image) }
         guard let src = pixels, width > 0, height > 0, width <= 16384, height <= 16384 else { return .invalid }
 
-        #if os(iOS)
-        let maxTexDim: UInt32 = 4096
-        #else
-        let maxTexDim: UInt32 = 16384
-        #endif
+        let maxTexDim = UInt32(Self.maxImageTextureDim)
 
         let tex: MTLTexture
         if width <= maxTexDim && height <= maxTexDim {
@@ -1248,24 +1255,44 @@ final class TerminalRenderer {
             let ratio = min(Double(maxTexDim) / Double(width), Double(maxTexDim) / Double(height))
             let dstW = max(1, Int((Double(width) * ratio).rounded(.down)))
             let dstH = max(1, Int((Double(height) * ratio).rounded(.down)))
+            // An earlier version of this image, shown until this one is ready.
+            let stale: CachedImage? = imageTextures[image].map {
+                var s = $0
+                s.lastUsed = now
+                imageTextures[image] = s
+                return s
+            }
+            let waiting: ImageLookup = stale.map { .stale($0) } ?? .missing
             var job: PendingDownscale
-            if let p = pendingDownscales[image], p.serial == serial,
-               p.texture.width == dstW, p.texture.height == dstH {
+            if var p = pendingDownscales[image], p.srcWidth == width, p.srcHeight == height {
+                if serial != p.startSerial { p.mixed = true }
                 job = p
             } else {
+                pendingDownscales[image] = nil
+                // No texture for a job this draw can't start on: the next draw makes it.
+                guard downsampleBudgetLeft > 0 else { return waiting }
+                // Over the texture memory cap even after evicting what this draw doesn't show:
+                // not retried every frame, only when something else frees room.
+                guard admitImageTexture(bytes: dstW * dstH * 4, now: now) else {
+                    return stale.map { .ready($0) } ?? .invalid
+                }
                 let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: dstW,
                                                                     height: dstH, mipmapped: false)
                 desc.usage = [.shaderRead]
-                guard let made = device.makeTexture(descriptor: desc) else { return .missing }
-                job = PendingDownscale(serial: serial, texture: made, nextRow: 0, lastUsed: now)
+                guard let made = device.makeTexture(descriptor: desc) else { return waiting }
+                job = PendingDownscale(startSerial: serial, mixed: false, srcWidth: width, srcHeight: height,
+                                       texture: made, nextRow: 0, lastUsed: now)
             }
             job.lastUsed = now
-            // Source pixels one destination row reads (its footprint, partly covered rows included).
-            let rowCost = Int(width) * (Int(height) / dstH + 2)
+            let horizontal = Self.horizontalVisits(srcWidth: Int(width), dstWidth: dstW)
             let bandRows = max(1, min(dstH, TerminalRenderer.downsampleBandBytes / (dstW * 4)))
             var band: [UInt8] = []
-            while job.nextRow < dstH, downsampleBudgetLeft > 0 {
-                let rows = min(bandRows, dstH - job.nextRow, max(1, downsampleBudgetLeft / rowCost))
+            while job.nextRow < dstH {
+                let (rows, cost) = Self.rowsWithin(budget: downsampleBudgetLeft, from: job.nextRow,
+                                                   maxRows: min(bandRows, dstH - job.nextRow),
+                                                   srcHeight: Int(height), dstHeight: dstH,
+                                                   horizontalVisits: horizontal)
+                guard rows > 0 else { break }
                 if band.isEmpty { band = [UInt8](repeating: 0, count: bandRows * dstW * 4) }
                 let y0 = job.nextRow
                 band.withUnsafeMutableBufferPointer { dst in
@@ -1277,13 +1304,21 @@ final class TerminalRenderer {
                                         withBytes: dstBase, bytesPerRow: dstW * 4)
                 }
                 job.nextRow += rows
-                downsampleBudgetLeft -= rows * rowCost
+                downsampleBudgetLeft -= cost
             }
             guard job.nextRow >= dstH else {
                 pendingDownscales[image] = job
-                return .missing
+                return waiting
             }
             pendingDownscales[image] = nil
+            if job.mixed {
+                // Rows from more than one version: shown now, but filed under the version it
+                // started from, so the current one is prepared next (with this one showing).
+                let entry = CachedImage(serial: job.startSerial, texture: job.texture, origWidth: width,
+                                        origHeight: height, lastUsed: now)
+                imageTextures[image] = entry
+                return .ready(entry)
+            }
             tex = job.texture
         }
         let entry = CachedImage(serial: serial, texture: tex, origWidth: width, origHeight: height, lastUsed: now)
@@ -1295,6 +1330,82 @@ final class TerminalRenderer {
     func resetImages() {
         imageTextures.removeAll()
         pendingDownscales.removeAll()
+    }
+
+    /// Makes room for a new image texture of `bytes` under `imageTextureBudget`, evicting the
+    /// least recently drawn textures this draw doesn't use. False when it can't fit.
+    private func admitImageTexture(bytes: Int, now: CFTimeInterval) -> Bool {
+        // Keys: image id × 2, + 1 for a downscale in progress.
+        var resident: [(key: Int, bytes: Int, lastUsed: Double)] = []
+        for (id, c) in imageTextures {
+            resident.append((Int(id) * 2, c.texture.width * c.texture.height * 4, c.lastUsed))
+        }
+        for (id, j) in pendingDownscales {
+            resident.append((Int(id) * 2 + 1, j.texture.width * j.texture.height * 4, j.lastUsed))
+        }
+        guard let evict = Self.evictions(adding: bytes, resident: resident,
+                                         cap: Self.imageTextureBudget, now: now) else { return false }
+        for key in evict {
+            let id = UInt32(key / 2)
+            if key % 2 == 0 { imageTextures[id] = nil } else { pendingDownscales[id] = nil }
+        }
+        return true
+    }
+
+    /// The largest image texture side; bigger images are downscaled to fit.
+    #if os(iOS)
+    static let maxImageTextureDim = 4096
+    #else
+    static let maxImageTextureDim = 16384
+    #endif
+    /// The most texture memory images may hold when a downscale needs a new texture: room for
+    /// two of the largest (an image's earlier version and its replacement).
+    static let imageTextureBudget = 2 * maxImageTextureDim * maxImageTextureDim * 4
+
+    /// Which `resident` textures to evict so `bytes` more fit under `cap`: the least recently
+    /// drawn first, never one drawn this draw (`lastUsed == now`). Nil when it can't fit.
+    static func evictions(adding bytes: Int, resident: [(key: Int, bytes: Int, lastUsed: Double)],
+                          cap: Int, now: Double) -> [Int]? {
+        var total = resident.reduce(bytes) { $0 + $1.bytes }
+        var out: [Int] = []
+        for r in resident.filter({ $0.lastUsed < now }).sorted(by: { $0.lastUsed < $1.lastUsed }) {
+            if total <= cap { break }
+            total -= r.bytes
+            out.append(r.key)
+        }
+        return total <= cap ? out : nil
+    }
+
+    /// Source pixels one destination row reads along x: each output pixel's footprint, edge
+    /// pixels it shares with a neighbour counted for both (they are read twice).
+    static func horizontalVisits(srcWidth srcW: Int, dstWidth dstW: Int) -> Int {
+        var n = 0
+        for x in 0..<dstW {
+            let sx0 = x * srcW / dstW
+            let sx1 = min(srcW, ((x + 1) * srcW + dstW - 1) / dstW)
+            n += sx1 - sx0
+        }
+        return n
+    }
+
+    /// How many destination rows from `y0` (at most `maxRows`) `downsample` can do within
+    /// `budget` source-pixel reads, and what they cost: a row reads `horizontalVisits` times its
+    /// footprint's source rows. Stops before a row would exceed the budget. A row costs at most
+    /// (srcW + dstW) × (srcH / dstH + 2), well under `downsampleBudget` for any image up to
+    /// 16384² downscaled to 4096², so a fresh draw always makes progress.
+    static func rowsWithin(budget: Int, from y0: Int, maxRows: Int, srcHeight srcH: Int,
+                           dstHeight dstH: Int, horizontalVisits: Int) -> (rows: Int, cost: Int) {
+        var rows = 0, cost = 0
+        while rows < maxRows {
+            let y = y0 + rows
+            let sy0 = y * srcH / dstH
+            let sy1 = min(srcH, ((y + 1) * srcH + dstH - 1) / dstH)
+            let row = horizontalVisits * (sy1 - sy0)
+            if cost + row > budget { break }
+            cost += row
+            rows += 1
+        }
+        return (rows, cost)
     }
 
     /// The most scratch memory an oversized image's downscale holds at once.

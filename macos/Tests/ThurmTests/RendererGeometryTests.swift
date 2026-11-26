@@ -2,6 +2,48 @@ import XCTest
 @testable import Thurm
 
 final class ImageDownsampleTests: XCTestCase {
+    /// Overlapping footprints read edge pixels twice; the budget counts every read. 4097×4000 to
+    /// 4096×3999: each output pixel reads 2 columns and 2 rows, 16 384 reads a row.
+    func testRowCostCountsRepeatedReads() {
+        let h = TerminalRenderer.horizontalVisits(srcWidth: 4097, dstWidth: 4096)
+        XCTAssertEqual(h, 8192)
+        let (rows, cost) = TerminalRenderer.rowsWithin(budget: TerminalRenderer.downsampleBudget, from: 0,
+                                                       maxRows: 3999, srcHeight: 4000, dstHeight: 3999,
+                                                       horizontalVisits: h)
+        XCTAssertEqual(rows, 122)
+        XCTAssertEqual(cost, 122 * 16384)
+        XCTAssertLessThanOrEqual(cost, TerminalRenderer.downsampleBudget)
+        // Partly spent budget: only rows that fit.
+        XCTAssertEqual(TerminalRenderer.rowsWithin(budget: 16383, from: 0, maxRows: 10, srcHeight: 4000,
+                                                   dstHeight: 3999, horizontalVisits: h).rows, 0)
+    }
+
+    /// A single row never exceeds a whole draw's budget, so a fresh draw always makes progress.
+    func testOneRowAlwaysFitsAFullBudget() {
+        for (sw, sh, dw, dh) in [(16384, 16384, 4096, 4096), (16384, 4097, 4096, 1024),
+                                 (4097, 16384, 1024, 4096), (16383, 16381, 4095, 4095)] {
+            let h = TerminalRenderer.horizontalVisits(srcWidth: sw, dstWidth: dw)
+            for y in [0, 1, dh / 2, dh - 1] {
+                XCTAssertEqual(TerminalRenderer.rowsWithin(budget: TerminalRenderer.downsampleBudget, from: y,
+                                                           maxRows: 1, srcHeight: sh, dstHeight: dh,
+                                                           horizontalVisits: h).rows, 1, "\(sw)x\(sh) row \(y)")
+            }
+        }
+    }
+
+    /// Room for a new texture comes from the least recently drawn ones, never from one this draw
+    /// shows; when that isn't enough, nothing is evicted and it doesn't fit.
+    func testTextureEvictionsSpareThisDraw() {
+        let now = 10.0
+        let resident: [(key: Int, bytes: Int, lastUsed: Double)] = [
+            (key: 1, bytes: 40, lastUsed: 5), (key: 2, bytes: 40, lastUsed: 3), (key: 3, bytes: 40, lastUsed: now),
+        ]
+        XCTAssertEqual(TerminalRenderer.evictions(adding: 20, resident: resident, cap: 200, now: now), [])
+        XCTAssertEqual(TerminalRenderer.evictions(adding: 40, resident: resident, cap: 120, now: now), [2])
+        XCTAssertEqual(TerminalRenderer.evictions(adding: 60, resident: resident, cap: 100, now: now), [2, 1])
+        XCTAssertNil(TerminalRenderer.evictions(adding: 80, resident: resident, cap: 100, now: now))
+    }
+
     private func downsample(_ src: [UInt8], _ w: Int, _ h: Int, to dw: Int, _ dh: Int,
                             bandRows: Int? = nil) -> [UInt8] {
         var out = [UInt8](repeating: 0, count: dw * dh * 4)
