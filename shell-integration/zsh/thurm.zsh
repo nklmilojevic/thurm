@@ -82,12 +82,14 @@ add-zsh-hook preexec _thurm_preexec
 # One-shot program resume after a restart (Thurm session restore). It runs as the first
 # prompt's command line once zle starts: after every precmd hook .zshrc added (direnv, mise,
 # whatever their names), as an ordinary interactive job (Ctrl-Z, fg), and outside any hook,
-# so a failure neither skips the prompt marks nor ends the shell.
-if [[ -n "${_thurm_resume_ticket-}" && -n "${_thurm_resume_exec-}" ]]; then
+# so a failure neither skips the prompt marks nor ends the shell. The ticket is a bearer
+# secret: never expanded where xtrace (set by a startup file) would print it.
+if (( ${#${_thurm_resume_ticket-}} && ${#${_thurm_resume_exec-}} )); then
   # The command line holds only this function's name: zsh redraws an accepted line, and
   # preexec hooks (Thurm's command-line report among them) see it, so the single-use ticket
   # and the helper's path stay in these private variables until it runs.
   _thurm_resume_run() {
+    builtin setopt LOCAL_OPTIONS NO_XTRACE
     builtin unfunction _thurm_resume_run
     local exec="${_thurm_resume_exec-}" ticket="${_thurm_resume_ticket-}"
     _thurm_resume_ticket=""
@@ -97,7 +99,7 @@ if [[ -n "${_thurm_resume_ticket-}" && -n "${_thurm_resume_exec-}" ]]; then
   }
   _thurm_resume_line_init() {
     add-zle-hook-widget -d line-init _thurm_resume_line_init
-    [[ -n "${_thurm_resume_ticket-}" ]] || return 0
+    (( ${#${_thurm_resume_ticket-}} )) || return 0
     # Typed ahead of this prompt: that line is the user's, and the resume is dropped (the
     # daemon refuses the ticket after typing anyway).
     if (( ${PENDING:-0} || ${KEYS_QUEUED_COUNT:-0} )); then

@@ -384,8 +384,16 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
                 env_dump.display()
             ),
         );
+        // Traced from the rc file on (as when debugging startup): the trace goes to the pane,
+        // and must not show the single-use ticket or the helper.
+        let (xtrace, untrace) = if shell_name == "zsh" {
+            ("setopt xtrace", "unsetopt xtrace")
+        } else {
+            ("set -x", "set +x")
+        };
         let rc_body = format!(
-            "export PATH=\"{}:$PATH\"\n\
+            "{xtrace}\n\
+             export PATH=\"{}:$PATH\"\n\
              export FROM_RC=yes\n\
              myresumeprog() {{ touch '{}'; }}\n\
              alias myresumeprog='touch {}'\n",
@@ -453,6 +461,10 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
         // it runs, which holds only a function's name.
         let shown = capture(&c2, pane);
         assert!(
+            shown.contains("FROM_RC=yes"),
+            "{shell_name}: no trace: {shown}"
+        );
+        assert!(
             !shown.contains("--exec-resume") && !shown.contains("thurmd"),
             "{shell_name}: {shown}"
         );
@@ -465,6 +477,9 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
         })
         .unwrap();
         std::thread::sleep(Duration::from_millis(250));
+        // Untraced from here: zsh's prompt hooks trace hundreds of lines, which would scroll
+        // the output below off the screen.
+        run_line(&c2, pane, untrace);
         // Only a shell running it prints the joined word (an echo of the typed line would not).
         run_line(&c2, pane, "printf 'SUSPENDED_%s\\n' BACK");
         wait_match(&c2, pane, "SUSPENDED_BACK");

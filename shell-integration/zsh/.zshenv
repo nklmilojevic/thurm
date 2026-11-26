@@ -1,12 +1,16 @@
 # Thurm shell integration bootstrap.
 #
 # Capture and remove one-shot program resume handoff variables before user startup files run
-# so subshells or multiplexers launched from startup files never inherit them.
-if [[ -n "${THURM_RESUME_TICKET-}" && -n "${THURM_RESUME_EXEC-}" ]]; then
-  typeset -g _thurm_resume_ticket="$THURM_RESUME_TICKET"
-  typeset -g _thurm_resume_exec="$THURM_RESUME_EXEC"
+# so subshells or multiplexers launched from startup files never inherit them. Untraced: the
+# ticket is a bearer secret, and xtrace (`zsh -x`, a system zshenv) would print it.
+() {
+  builtin setopt LOCAL_OPTIONS NO_XTRACE
+  if [[ -n "${THURM_RESUME_TICKET-}" && -n "${THURM_RESUME_EXEC-}" ]]; then
+    typeset -g _thurm_resume_ticket="$THURM_RESUME_TICKET"
+    typeset -g _thurm_resume_exec="$THURM_RESUME_EXEC"
+  fi
   builtin unset THURM_RESUME_TICKET THURM_RESUME_EXEC
-fi
+}
 #
 # Thurm points ZDOTDIR here so this file runs first. Restore the user's ZDOTDIR, source
 # their .zshenv, then load the integration for interactive shells. zsh reads .zprofile,
