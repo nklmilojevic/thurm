@@ -257,6 +257,20 @@ pub fn validate_device_name(device: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Legacy shell-safe validation for revoking previously paired entries whose names predated the
+/// strict `[A-Za-z0-9._-]` whitelist (e.g. `iPhone+work`): one word, no quotes or backslashes.
+fn validate_legacy_device_name(device: &str) -> Result<(), String> {
+    if device.is_empty()
+        || device.len() > 128
+        || device
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '\'' || c == '\\')
+    {
+        return Err(format!("unsupported device name {device:?}"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingError {
     Invalid(String),
@@ -323,10 +337,11 @@ const EDIT: &str = concat!(
     "R=\"${L#restrict,port-forwarding ecdsa-sha2-nistp256 }\"; B=\"${R%% *}\"; [ -n \"$B\" ] || return 1; ",
     "C=\"${R#\"$B\" }\"; case \"$C\" in *\" \"*) return 1 ;; thurm-ios:?*) ;; *) return 1 ;; esac; ",
     "D0=\"${C#thurm-ios:}\"; if [ -z \"$A\" ]; then [ \"$D0\" = \"$V\" ]; return $?; fi; ",
+    "if [ \"$D0\" = \"$V\" ] && [ \"$B\" != \"$KB\" ]; then RK=1; return 0; fi; ",
     "[ \"$D0\" = \"$V\" ] || [ \"$B\" = \"$KB\" ]; }; ",
     // E: the line read had no newline (the last one). P: the last line written has none. M: a
-    // line of the device was dropped.
-    "P=; M=; { if [ -f \"$F\" ]; then while :; do E=; IFS= read -r L || E=1; ",
+    // line of the device was dropped. RK: an existing different key for the same device was replaced.
+    "P=; M=; RK=; { if [ -f \"$F\" ]; then while :; do E=; IFS= read -r L || E=1; ",
     "if [ -n \"$E\" ] && [ -z \"$L\" ]; then break; fi; ",
     "if ours; then M=1; ",
     "elif [ -n \"$E\" ]; then printf \"%s\" \"$L\"; P=1; else printf \"%s$N\" \"$L\"; fi; ",
@@ -335,7 +350,8 @@ const EDIT: &str = concat!(
     "printf \"%s$N\" \"restrict,port-forwarding $1 thurm-ios:$2\"; fi; ",
     "} > \"$T\" || { rm -f \"$T\"; nw; }; ",
     "if [ -z \"$1\" ] && [ -z \"$M\" ]; then rm -f \"$T\"; exit 0; fi; ",
-    "chmod 600 \"$T\" && mv -f \"$T\" \"$F\" || { rm -f \"$T\"; nw; }"
+    "chmod 600 \"$T\" && mv -f \"$T\" \"$F\" || { rm -f \"$T\"; nw; }; ",
+    "if [ -n \"$RK\" ]; then printf \"replaced$N\"; fi"
 );
 
 /// Prints the device names of the keys Thurm wrote in `authorized_keys` (the lines [`EDIT`] would
@@ -351,10 +367,14 @@ const LIST: &str = concat!(
     "case \"$C\" in *\" \"*) ;; thurm-ios:?*) printf \"%s$N\" \"${C#thurm-ios:}\" ;; esac; done < \"$F\""
 );
 
-fn edit(ssh: &dyn RemoteExec, key: &str, device: &str) -> Result<(), PairingError> {
-    validate_device_name(device).map_err(PairingError::Invalid)?;
+fn edit(ssh: &dyn RemoteExec, key: &str, device: &str) -> Result<bool, PairingError> {
+    if key.is_empty() {
+        validate_legacy_device_name(device).map_err(PairingError::Invalid)?;
+    } else {
+        validate_device_name(device).map_err(PairingError::Invalid)?;
+    }
     match ssh.run(EDIT, &[key, device], None, Duration::from_secs(30)) {
-        Ok(_) => Ok(()),
+        Ok(out) => Ok(out.lines().any(|l| l.trim() == "replaced")),
         Err(SshError::Remote { code, stderr }) if code == NOT_WRITABLE => {
             Err(PairingError::NotWritable {
                 nixos: stderr.lines().any(|l| l.trim() == "nixos"),
@@ -366,12 +386,18 @@ fn edit(ssh: &dyn RemoteExec, key: &str, device: &str) -> Result<(), PairingErro
 
 /// Adds the device key (or replaces the device's earlier one) in the host's `authorized_keys`.
 pub fn authorize(ssh: &dyn RemoteExec, key: &DeviceKey) -> Result<(), PairingError> {
+    authorize_with_status(ssh, key).map(|_| ())
+}
+
+/// Like [`authorize`], also reporting whether an existing *different* public key under the same
+/// device name was replaced (so callers can revoke the replaced phone's push registration).
+pub fn authorize_with_status(ssh: &dyn RemoteExec, key: &DeviceKey) -> Result<bool, PairingError> {
     edit(ssh, &key.key, &key.device)
 }
 
 /// Removes the device's keys from the host's `authorized_keys`.
 pub fn revoke(ssh: &dyn RemoteExec, device: &str) -> Result<(), PairingError> {
-    edit(ssh, "", device)
+    edit(ssh, "", device).map(|_| ())
 }
 
 /// The devices with a key in the host's `authorized_keys`.
@@ -1006,6 +1032,43 @@ mod tests {
             revoke(&local, "a b"),
             Err(PairingError::Invalid(_))
         ));
+        assert!(matches!(
+            revoke(&local, "a'b"),
+            Err(PairingError::Invalid(_))
+        ));
+
+        // Legacy paired device names accepted before the stricter whitelist (e.g. `iPhone+work`)
+        // are still rejected for new keys, listed by `devices()`, and revocable via `revoke()`.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(DeviceKey::parse(&KEY.replace("iPhone", "iPhone+work")).is_err());
+        let legacy_line = format!("{KEY_OPTIONS} {} thurm-ios:iPhone+work\n", key.key);
+        let keep_line = "ssh-ed25519 AAAA keep@laptop\n";
+        std::fs::write(&file, format!("{keep_line}{legacy_line}")).unwrap();
+        assert_eq!(devices(&local).unwrap(), ["iPhone+work"]);
+        revoke(&local, "iPhone+work").unwrap();
+        assert!(devices(&local).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), keep_line);
+
+        // `authorize_with_status` reports `true` only when a *different* key under the same name
+        // is replaced (not on initial add, re-add of the same key, or renaming the same key).
+        let mut blob2 = base64::engine::general_purpose::STANDARD
+            .decode(KEY.split(' ').nth(1).unwrap())
+            .unwrap();
+        blob2[103] ^= 0x02;
+        let other_same_name = DeviceKey::parse(&format!(
+            "ecdsa-sha2-nistp256 {} thurm-ios:iPhone",
+            base64::engine::general_purpose::STANDARD.encode(&blob2)
+        ))
+        .unwrap();
+        assert!(!authorize_with_status(&local, &key).unwrap());
+        assert!(!authorize_with_status(&local, &key).unwrap());
+        let renamed_same = DeviceKey {
+            key: key.key.clone(),
+            device: "iPhone-new".into(),
+        };
+        assert!(!authorize_with_status(&local, &renamed_same).unwrap());
+        assert!(!authorize_with_status(&local, &key).unwrap());
+        assert!(authorize_with_status(&local, &other_same_name).unwrap());
         let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -807,8 +807,8 @@ fn call(c: Call) -> Result<Value, String> {
         Call::AuthorizeDevice { name, key } => {
             let key = pairing::DeviceKey::parse(&key)?;
             let (_, ssh) = ssh_for(&name)?;
-            match pairing::authorize(&ssh, &key) {
-                Ok(()) => json!({ "device": key.device }),
+            match pairing::authorize_with_status(&ssh, &key) {
+                Ok(replaced) => json!({ "device": key.device, "replaced": replaced }),
                 Err(e @ pairing::PairingError::NotWritable { nixos }) => json!({
                     "error": e.to_string(),
                     "not_writable": true,

@@ -77,11 +77,17 @@ final class PairPhoneTests: XCTestCase {
 
         // Pairing the same public key under a unique name and then a generic name (and vice versa)
         // must deduplicate by key blob so revoking removes all access for that key.
-        try PhonePairing.add(key: key, device: "iPhone-7f3a", to: file)
-        try PhonePairing.add(key: key, device: "iPhone", to: file)
+        XCTAssertFalse(try PhonePairing.add(key: key, device: "iPhone-7f3a", to: file))
+        XCTAssertFalse(try PhonePairing.add(key: key, device: "iPhone", to: file))
         devices = PhonePairing.devices(in: file)
         XCTAssertEqual(devices.map(\.name), ["iPhone"])
-        try PhonePairing.add(key: key, device: "iPhone-7f3a", to: file)
+        XCTAssertFalse(try PhonePairing.add(key: key, device: "iPhone-7f3a", to: file))
+        devices = PhonePairing.devices(in: file)
+        XCTAssertEqual(devices.map(\.name), ["iPhone-7f3a"])
+        // Replacing a different key under the same device name reports replacement so push
+        // registrations for the previous phone are revoked.
+        let otherKey = "ecdsa-sha2-nistp256 AAAAotherKeyBlobForSameNamePhone"
+        XCTAssertTrue(try PhonePairing.add(key: otherKey, device: "iPhone-7f3a", to: file))
         devices = PhonePairing.devices(in: file)
         XCTAssertEqual(devices.map(\.name), ["iPhone-7f3a"])
         try PhonePairing.revoke(devices[0], in: file)

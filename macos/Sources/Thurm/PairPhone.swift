@@ -268,18 +268,26 @@ enum PhonePairing {
 
     /// Adds a device key, deduplicating by public key blob (so renaming a phone never leaves an
     /// unrevoked duplicate line) and by device name (so key rotation replaces old keys and each
-    /// device name maps 1:1 to `RevokePhone`). Creates ~/.ssh (0700) and the file (0600).
-    static func add(key: String, device: String, to file: URL = authorizedKeys) throws {
+    /// device name maps 1:1 to `RevokePhone`). Returns `true` when an existing *different* public
+    /// key under the same device name was replaced. Creates ~/.ssh (0700) and the file (0600).
+    @discardableResult
+    static func add(key: String, device: String, to file: URL = authorizedKeys) throws -> Bool {
         let fm = FileManager.default
         try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
                                attributes: [.posixPermissions: 0o700])
         var lines = try lines(of: file)
+        var replacedDifferentKey = false
         lines.removeAll { line in
             guard let existing = parseDeviceLine(line[...]) else { return false }
+            if existing.device == device && existing.key != key {
+                replacedDifferentKey = true
+                return true
+            }
             return existing.key == key || existing.device == device
         }
         lines.append("\(keyOptions) \(key) \(commentPrefix)\(device)")
         try write(lines, to: file)
+        return replacedDifferentKey
     }
 
     static func revoke(_ device: Device, in file: URL = authorizedKeys) throws {
@@ -730,8 +738,9 @@ struct PairPhoneSheet: View {
     private func addKey() {
         guard let (key, device) = PhonePairing.validDeviceKey(deviceKey) else { return }
         let line = deviceKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let replacedLocal: Bool
         do {
-            try PhonePairing.add(key: key, device: device)
+            replacedLocal = try PhonePairing.add(key: key, device: device)
             message = "Added \(device) on this Mac. The app can connect now."
             deviceKey = ""
         } catch {
@@ -742,6 +751,9 @@ struct PairPhoneSheet: View {
             return
         }
         devices = PhonePairing.devices()
+        if replacedLocal {
+            forgetPhone(device, on: localHost, label: device, replacing: true)
+        }
         for h in PhonePairing.keyHosts(remoteHosts) {
             authorize(line, on: h.name)
         }
@@ -754,6 +766,9 @@ struct PairPhoneSheet: View {
             DispatchQueue.main.async {
                 if let r, r["error"] == nil {
                     keyResults[name] = .added
+                    if jsonBool(r["replaced"]) == true, let replacedDevice = jsonString(r["device"]) {
+                        forgetPhone(replacedDevice, on: name, label: "\(replacedDevice) on \(name)", replacing: true)
+                    }
                     loadDevices(on: name)
                 } else if let r, jsonBool(r["not_writable"]) == true {
                     if let nix = jsonString(r["nixos"]) {
@@ -804,11 +819,13 @@ struct PairPhoneSheet: View {
         }
     }
 
-    private func forgetPhone(_ name: String, on host: HostId, label: String) {
+    private func forgetPhone(_ name: String, on host: HostId, label: String, replacing: Bool = false) {
         Core.shared.requestAsync(object: ["RevokePhone": ["name": name]], host: host, timeout: 15) { resp in
             if resp == nil || (resp as? [String: Any])?["error"] != nil {
                 let why = ((resp as? [String: Any])?["error"] as? String) ?? "the daemon did not answer"
-                message = "Revoked \(label)'s key, but it may still get notifications: \(why)"
+                message = replacing
+                    ? "Replaced \(label)'s key, but the previous phone may still get notifications: \(why)"
+                    : "Revoked \(label)'s key, but it may still get notifications: \(why)"
             }
         }
     }
