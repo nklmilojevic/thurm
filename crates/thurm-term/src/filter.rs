@@ -253,6 +253,29 @@ impl StreamFilter {
         }
     }
 
+    /// Whether an oversized OSC 7577 is being discarded: `1` inside its body, `2` right after
+    /// an ESC in it, `0` otherwise. Its start is gone (never buffered), so an in-place upgrade
+    /// carries this instead, and [`StreamFilter::restore_osc_7577_discard`] puts it back: the
+    /// rest of the report must not reach the terminal or clients.
+    pub fn osc_7577_discard(&self) -> u8 {
+        match self.state {
+            State::DiscardOsc => 1,
+            State::DiscardOscEsc => 2,
+            _ => 0,
+        }
+    }
+
+    /// Resumes discarding an oversized OSC 7577 (see [`StreamFilter::osc_7577_discard`]).
+    pub fn restore_osc_7577_discard(&mut self, state: u8) {
+        let next = match state {
+            1 => State::DiscardOsc,
+            2 => State::DiscardOscEsc,
+            _ => return,
+        };
+        self.buf = Vec::new();
+        self.state = next;
+    }
+
     /// The scroll region set (DECSTBM, or reset by RIS) in what was fed since the last call:
     /// `Some(None)` when it went back to the full screen.
     pub fn take_scroll_region(&mut self) -> Option<Option<(u16, u16)>> {
@@ -1116,6 +1139,54 @@ mod tests {
             assert_eq!(pass, b"ab");
             assert_eq!(resumes, 0);
         }
+
+        // While an oversized OSC 7577 is still arriving (no terminator yet) its body is never
+        // copied: in one chunk four times the cap, or in pieces that cross it.
+        {
+            let mut f = StreamFilter::new();
+            let mut out = Vec::new();
+            let mut chunk = b"\x1b]7577;".to_vec();
+            chunk.extend(std::iter::repeat_n(b'A', MAX_OSC_7577 * 4));
+            f.feed(&chunk, &mut out);
+            assert_eq!(f.osc_7577_discard(), 1);
+            assert!(f.buf.capacity() <= 2 * MAX_OSC_7577, "{}", f.buf.capacity());
+            let piece = vec![b'A'; MAX_OSC_7577 / 3];
+            let mut out = Vec::new();
+            let mut f = StreamFilter::new();
+            f.feed(b"\x1b]7577;", &mut out);
+            for _ in 0..8 {
+                f.feed(&piece, &mut out);
+                assert!(f.buf.capacity() <= 2 * MAX_OSC_7577, "{}", f.buf.capacity());
+            }
+            assert_eq!(f.osc_7577_discard(), 1);
+        }
+
+        // A discard handed to a new filter (an in-place upgrade) keeps the rest out.
+        for (state, rest) in [
+            (1u8, &b"AAAA\x07b"[..]),
+            (2, &b"\\b"[..]),
+            (1, &b"AA\x1b\\b"[..]),
+        ] {
+            let mut f = StreamFilter::new();
+            f.restore_osc_7577_discard(state);
+            assert_eq!(f.osc_7577_discard(), state);
+            let mut out = Vec::new();
+            f.feed(rest, &mut out);
+            let pass: Vec<u8> = out
+                .iter()
+                .filter_map(|c| match c {
+                    Chunk::Pass(b) => Some(b.to_vec()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert_eq!(pass, b"b", "state {state}");
+            assert_eq!(f.osc_7577_discard(), 0);
+        }
+        // Nothing to restore leaves the filter as it was.
+        let mut f = StreamFilter::new();
+        f.restore_osc_7577_discard(0);
+        assert_eq!(f.osc_7577_discard(), 0);
 
         // Oversized zero-padded OSC `07577;` across split feeds never leaks to clients or VT.
         {

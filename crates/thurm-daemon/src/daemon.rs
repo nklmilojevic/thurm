@@ -2459,6 +2459,7 @@ impl Daemon {
                     )
                 }),
                 typed: st.typed,
+                osc_7577_discard: st.term.osc_7577_discard(),
             });
         }
         let now = Instant::now();
@@ -2548,6 +2549,8 @@ impl Daemon {
             }
             term.set_shell_token(p.shell_token.clone());
             term.set_shell_path(p.shell_path.clone());
+            // Last, after the replay: the rest of an oversized OSC 7577 is still discarded.
+            term.restore_osc_7577_discard(p.osc_7577_discard);
             term.restore_program_status(p.programs.clone());
             let alive = p.exited.is_none();
             let info = PaneInfo {
