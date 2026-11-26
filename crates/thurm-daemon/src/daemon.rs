@@ -96,7 +96,6 @@ enum AiJob {
         notify: (String, String),
         sound: String,
         push_kind: Option<crate::push::NoticeKind>,
-        push_topic: Option<String>,
     },
 }
 
@@ -105,7 +104,6 @@ enum AiJob {
 struct Outgoing {
     event: Event,
     push_kind: Option<crate::push::NoticeKind>,
-    push_topic: Option<String>,
 }
 
 impl From<Event> for Outgoing {
@@ -113,7 +111,6 @@ impl From<Event> for Outgoing {
         Self {
             event,
             push_kind: None,
-            push_topic: None,
         }
     }
 }
@@ -126,18 +123,6 @@ fn push_notice_kind(state: NoticeState) -> Option<crate::push::NoticeKind> {
         NoticeState::Failed => Some(crate::push::NoticeKind::Error),
         NoticeState::Working | NoticeState::Idle => None,
     }
-}
-
-fn push_notice_topic(st: &PaneState, agent: &AgentState) -> Option<String> {
-    agent
-        .topic
-        .as_deref()
-        .map(crate::push::clean_title)
-        .filter(|t| !t.is_empty())
-        .or_else(|| {
-            let t = crate::push::clean_title(&st.info.title);
-            (!t.is_empty()).then_some(t)
-        })
 }
 
 /// Most of an unterminated escape sequence (or UTF-8 character) kept to replay after an
@@ -806,11 +791,7 @@ impl Daemon {
     }
 
     fn broadcast_outgoing(&self, out: Outgoing, ui_only: bool) {
-        let Outgoing {
-            event,
-            push_kind,
-            push_topic,
-        } = out;
+        let Outgoing { event, push_kind } = out;
         let clients: Vec<_> = self.clients.lock().values().cloned().collect();
         // A phone with the app open hears it live; otherwise its lock screen does.
         let open = || -> Vec<String> {
@@ -846,7 +827,6 @@ impl Daemon {
                             title: title.clone(),
                             permission: *permission,
                             kind: push_kind,
-                            topic: push_topic.clone(),
                         },
                         &open(),
                     );
@@ -1820,7 +1800,6 @@ impl Daemon {
                     notify,
                     sound,
                     push_kind,
-                    push_topic,
                 } => {
                     let ask = if done {
                         ai::summary(&agent, &screen)
@@ -1857,7 +1836,6 @@ impl Daemon {
                                 request,
                             },
                             push_kind,
-                            push_topic,
                         }]
                     });
                 }
@@ -2832,7 +2810,6 @@ impl Daemon {
         }
         let done = matches!(state, NoticeState::Finished | NoticeState::Failed);
         let push_kind = push_notice_kind(state);
-        let push_topic = push_notice_topic(st, a);
         let body = match state {
             NoticeState::Waiting | NoticeState::Blocked => a
                 .message
@@ -2866,7 +2843,6 @@ impl Daemon {
                 notify: notify.clone(),
                 sound: notice.sound.clone(),
                 push_kind,
-                push_topic: push_topic.clone(),
             };
             if self.ai_tx.try_send(job).is_ok() {
                 return Vec::new();
@@ -2885,7 +2861,6 @@ impl Daemon {
                 request,
             },
             push_kind,
-            push_topic,
         }]
     }
 
@@ -5617,6 +5592,108 @@ mod tests {
                 .unwrap(),
             Response::PendingPrompt(None)
         ));
+        daemon.close_pane(pane);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn push_relay_notice_omits_private_agent_topic() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let dir = std::env::temp_dir().join(format!("thurm-push-priv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (tx, rx) = crossbeam_channel::unbounded::<String>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) <= 2 {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                let _ = reader.read_exact(&mut body);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
+            }
+        });
+
+        let mut cfg = Config::default();
+        cfg.push.relay = relay.clone();
+        let daemon = Daemon::new(
+            cfg,
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        daemon
+            .push
+            .register(crate::push::Device {
+                device: "d1".into(),
+                relay,
+                secret: "s".repeat(32),
+                host: "studio".into(),
+                name: "iPhone-7f3a".into(),
+            })
+            .unwrap();
+
+        let pane = daemon
+            .create_pane(
+                CreatePane {
+                    command: Some(vec!["cat".into()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let events = {
+            let p = daemon.pane(pane).unwrap();
+            let mut st = p.state.lock();
+            st.info.title = "previous-secret-shell-title".into();
+            st.agent.saw_foreground(Some(1));
+            st.agent.apply_hook(
+                Some(1),
+                "claude",
+                "Claude Code",
+                "session-title",
+                Some("s1".into()),
+                Some("Deploy API_KEY=supersecret".into()),
+            );
+            st.agent.apply_hook(
+                Some(1),
+                "claude",
+                "Claude Code",
+                "permission-prompt",
+                Some("s1".into()),
+                Some("Bash: curl -H 'Authorization: Bearer supersecret'".into()),
+            );
+            let new = st.agent.refresh().flatten();
+            daemon.agent_notifications(pane, &st, None, new.as_ref())
+        };
+        assert!(!events.is_empty());
+        for ev in events {
+            daemon.broadcast_outgoing(ev, true);
+        }
+
+        let raw = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("push posted");
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(json.get("topic").is_none(), "relay payload leaked topic: {raw}");
+        assert!(!raw.contains("supersecret"), "relay payload leaked secret: {raw}");
+        assert!(!raw.contains("previous-secret-shell-title"), "relay payload leaked pane title: {raw}");
+        assert_eq!(json["kind"], "permission");
+        assert_eq!(json["body"], "asks for permission");
+
         daemon.close_pane(pane);
         let _ = std::fs::remove_dir_all(dir);
     }

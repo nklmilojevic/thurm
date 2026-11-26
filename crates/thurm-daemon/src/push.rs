@@ -125,8 +125,6 @@ pub struct Notice {
     pub permission: Option<u64>,
     /// What kind of agent state triggered the notice (optional for older callers).
     pub kind: Option<NoticeKind>,
-    /// Sanitized session topic or pane title (never terminal content).
-    pub topic: Option<String>,
 }
 
 /// Locks: `devices` before `follows`, never the other way round.
@@ -369,19 +367,24 @@ impl Pusher {
         }
         let pane = notice.pane;
         let ids: Vec<String> = devices.iter().map(|d| d.device.clone()).collect();
-        // Held across sequence allocation, enqueueing, persistence and recording so seqs stay
-        // strictly monotonic on disk and a read can't race between queueing and recording.
+        // Held across sequence persistence, enqueueing, and recording so seqs stay strictly
+        // monotonic on disk even if the process exits immediately after posting and a read can't
+        // race between queueing and recording.
         let mut notified = self.notified.lock();
         let seq = self.next_seq.load(Ordering::Relaxed);
+        if let Err(e) = save_json(&self.seq_path, &seq) {
+            log::warn!("persist push sequence: {e}");
+            self.last_notice.lock().remove(&pane);
+            return;
+        }
+        self.next_seq
+            .store(seq.saturating_add(1), Ordering::Relaxed);
         if self.tx.try_send(Job::Notice(notice, seq, devices)).is_err() {
             // Dropped: no device will see it, so no device has it to take down, and the next
             // notice may buzz at once.
             self.last_notice.lock().remove(&pane);
             return;
         }
-        self.next_seq
-            .store(seq.saturating_add(1), Ordering::Relaxed);
-        let _ = save_json(&self.seq_path, &seq);
         let (last, sent) = notified.entry(pane).or_default();
         *last = seq;
         for id in ids {
@@ -662,8 +665,9 @@ enum PostError {
     /// The relay has no such device: a 404 with `X-Thurm-Device: unknown`. Any other 404 (a
     /// proxy, a route an older relay lacks) is not that.
     Gone,
-    /// The relay/APNs rejected a single Live Activity token (HTTP 410 or
-    /// `X-Thurm-Activity: unknown`): drop only that follow, keep the device.
+    /// The relay explicitly rejected a single Live Activity token (`404` or `410` with
+    /// `X-Thurm-Activity: unknown`): drop only that follow, keep the device. Any plain `404`/`410`
+    /// without that header (e.g. from a proxy or an unverified relay) keeps both.
     ActivityGone,
     Other(String),
 }
@@ -784,14 +788,6 @@ pub fn body(device: &Device, notice: &Notice, seq: u64) -> String {
     if let Some(k) = kind {
         payload["kind"] = serde_json::json!(k);
     }
-    if let Some(topic) = notice
-        .topic
-        .as_deref()
-        .map(clean_title)
-        .filter(|t| !t.is_empty())
-    {
-        payload["topic"] = serde_json::Value::String(topic);
-    }
     payload.to_string()
 }
 
@@ -844,8 +840,9 @@ fn post(agent: &ureq::Agent, device: &Device, path: &str, body: &str) -> Result<
             match status.as_u16() {
                 200..=299 => Ok(()),
                 404 if unknown_device => Err(PostError::Gone),
-                410 if path == "/v1/activity" => Err(PostError::ActivityGone),
-                _ if path == "/v1/activity" && unknown_activity => Err(PostError::ActivityGone),
+                404 | 410 if path == "/v1/activity" && unknown_activity => {
+                    Err(PostError::ActivityGone)
+                }
                 _ => Err(PostError::Other(format!("http status: {status}"))),
             }
         })
@@ -875,7 +872,6 @@ mod tests {
             title: "Claude Code".into(),
             permission,
             kind: None,
-            topic: None,
         };
         assert!(p.fresh(&n(1, None)));
         assert!(
@@ -913,7 +909,6 @@ mod tests {
             title: "Claude Code".into(),
             permission: None,
             kind: None,
-            topic: None,
         };
         p.notify(n(1), &[]);
         let _stuck = held.join().unwrap();
@@ -994,7 +989,6 @@ mod tests {
             title: "Claude Code".into(),
             permission: None,
             kind: None,
-            topic: None,
         };
         let wait = Duration::from_secs(10);
         p.notify(n(1), &[]);
@@ -1091,14 +1085,13 @@ mod tests {
                 title: "Claude Code".into(),
                 permission: Some(9),
                 kind: Some(NoticeKind::Permission),
-                topic: Some("⠴ Fix the sidebar".into()),
             },
             42,
         ))
         .unwrap();
         assert_eq!(b["body"], "asks for permission");
         assert_eq!(b["kind"], "permission");
-        assert_eq!(b["topic"], "Fix the sidebar");
+        assert!(b.get("topic").is_none(), "relay notices must not carry session topics");
         assert_eq!(b["thread_id"], "studio/3");
         assert_eq!(b["seq"], 42);
         assert_eq!(b["host"], "studio");
@@ -1116,7 +1109,6 @@ mod tests {
                     title: "Codex".into(),
                     permission: None,
                     kind: Some(kind),
-                    topic: None,
                 },
                 99,
             ))
@@ -1217,7 +1209,6 @@ mod tests {
             title: "Codex".into(),
             permission: None,
             kind: None,
-            topic: None,
         };
         p.notify(notice(1), &[]);
         posts
@@ -1280,7 +1271,6 @@ mod tests {
             title: "Codex".into(),
             permission: None,
             kind: None,
-            topic: None,
         };
         p.notify(notice(1), &[]);
         posts
@@ -1469,7 +1459,6 @@ mod tests {
                 title: "Codex".into(),
                 permission: Some(1),
                 kind: Some(NoticeKind::Permission),
-                topic: None,
             },
             &["d2".to_owned()],
         );
@@ -1525,7 +1514,6 @@ mod tests {
                     title: "Codex".into(),
                     permission: Some(1),
                     kind: Some(NoticeKind::Permission),
-                    topic: None,
                 },
                 &[],
             );
@@ -1666,7 +1654,7 @@ mod tests {
     fn dead_activity_token_prunes_only_that_follow_and_keeps_device() {
         use std::io::{BufRead, BufReader, Write};
         for response in [
-            "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 410 Gone\r\nX-Thurm-Activity: unknown\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 404 Not Found\r\nX-Thurm-Activity: unknown\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         ] {
             let tag = if response.contains("410") { "410" } else { "hdr" };
@@ -1730,6 +1718,60 @@ mod tests {
             assert_eq!(again.follows.lock()[0].token, "bbbb");
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+        // A plain 410 without `X-Thurm-Activity: unknown` keeps both the device and follow.
+        let dir = std::env::temp_dir().join(format!("thurm-push-plain410-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (answered, answers) = crossbeam_channel::unbounded();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                    line.clear();
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = answered.send(());
+            }
+        });
+        let p = Pusher::new(&dir, true);
+        p.register(Device {
+            device: "d1".into(),
+            relay,
+            secret: "s".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+        })
+        .unwrap();
+        let working = ActivityState {
+            agent: "Codex".into(),
+            status: "working".into(),
+            title: "proj".into(),
+            since: 1,
+            permission: None,
+        };
+        p.follow("d1", 1, "aaaa".into(), Some(working.clone()))
+            .unwrap();
+        p.agent_changed(
+            1,
+            Some(ActivityState {
+                status: "done".into(),
+                ..working
+            }),
+            &[],
+        );
+        answers
+            .recv_timeout(Duration::from_secs(10))
+            .expect("activity post");
+        p.settle();
+        assert_eq!(p.devices.lock().len(), 1);
+        assert_eq!(p.follows.lock().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1756,7 +1798,6 @@ mod tests {
                 title: "Claude Code".into(),
                 permission: Some(1),
                 kind: Some(NoticeKind::Permission),
-                topic: None,
             },
             &[],
         );
@@ -1773,7 +1814,6 @@ mod tests {
                 title: "Claude Code".into(),
                 permission: Some(2),
                 kind: Some(NoticeKind::Permission),
-                topic: None,
             },
             &[],
         );
@@ -1781,6 +1821,27 @@ mod tests {
             serde_json::from_str(&posts.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
         let seq2 = second["seq"].as_u64().unwrap();
         assert_eq!(seq2, seq1 + 1);
+
+        // If `push-seq.json` cannot be persisted (e.g. replaced by a directory), notify drops the
+        // push without enqueueing, advancing `next_seq`, or marking the pane notified.
+        let _ = std::fs::remove_file(dir.join("push-seq.json"));
+        std::fs::create_dir_all(dir.join("push-seq.json")).unwrap();
+        let seq_before = p2.next_seq.load(Ordering::Relaxed);
+        p2.notify(
+            Notice {
+                pane: 3,
+                title: "Claude Code".into(),
+                permission: Some(3),
+                kind: Some(NoticeKind::Permission),
+            },
+            &[],
+        );
+        assert_eq!(p2.next_seq.load(Ordering::Relaxed), seq_before);
+        assert!(!p2.notified.lock().contains_key(&3));
+        assert!(
+            posts.recv_timeout(Duration::from_millis(250)).is_err(),
+            "notice must not be published when seq persistence fails"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

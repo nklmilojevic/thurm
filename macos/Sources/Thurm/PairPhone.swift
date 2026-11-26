@@ -266,13 +266,9 @@ enum PhonePairing {
         parseDeviceLine(line)?.device
     }
 
-    private static func isGenericDeviceName(_ device: String) -> Bool {
-        device == "iPhone" || device == "iPad"
-    }
-
-    /// Adds a device key, deduplicating by public key blob (and by unique non-generic device name
-    /// so key rotation replaces old keys without pairing a second "iPhone" revoking the first).
-    /// Creates ~/.ssh (0700) and the file (0600).
+    /// Adds a device key, deduplicating by public key blob (so renaming a phone never leaves an
+    /// unrevoked duplicate line) and by device name (so key rotation replaces old keys and each
+    /// device name maps 1:1 to `RevokePhone`). Creates ~/.ssh (0700) and the file (0600).
     static func add(key: String, device: String, to file: URL = authorizedKeys) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
@@ -280,9 +276,6 @@ enum PhonePairing {
         var lines = try lines(of: file)
         lines.removeAll { line in
             guard let existing = parseDeviceLine(line[...]) else { return false }
-            if isGenericDeviceName(device) {
-                return existing.key == key && existing.device == device
-            }
             return existing.key == key || existing.device == device
         }
         lines.append("\(keyOptions) \(key) \(commentPrefix)\(device)")

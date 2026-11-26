@@ -74,6 +74,18 @@ final class PairPhoneTests: XCTestCase {
         devices = PhonePairing.devices(in: file)
         XCTAssertTrue(devices.isEmpty)
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "ssh-ed25519 AAAA other@laptop\n")
+
+        // Pairing the same public key under a unique name and then a generic name (and vice versa)
+        // must deduplicate by key blob so revoking removes all access for that key.
+        try PhonePairing.add(key: key, device: "iPhone-7f3a", to: file)
+        try PhonePairing.add(key: key, device: "iPhone", to: file)
+        devices = PhonePairing.devices(in: file)
+        XCTAssertEqual(devices.map(\.name), ["iPhone"])
+        try PhonePairing.add(key: key, device: "iPhone-7f3a", to: file)
+        devices = PhonePairing.devices(in: file)
+        XCTAssertEqual(devices.map(\.name), ["iPhone-7f3a"])
+        try PhonePairing.revoke(devices[0], in: file)
+        XCTAssertTrue(PhonePairing.devices(in: file).isEmpty)
     }
 
     func testAFailedWriteChangesNothing() throws {

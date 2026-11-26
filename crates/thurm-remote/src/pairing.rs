@@ -284,10 +284,10 @@ impl std::error::Error for PairingError {}
 const NOT_WRITABLE: i32 = 4;
 
 /// Replaces the device's key in `authorized_keys`: on revoke (`$1` empty), drops every line Thurm
-/// wrote for device `$2`; on authorize (`$1` non-empty), deduplicates generic names (`iPhone`,
-/// `iPad`) by matching both key blob and device name so pairing a second iPhone does not silently
-/// revoke the first, while deduplicating unique device names by name so key rotation replaces the
-/// old key. Appends `$1` (when given) with Thurm's options, through a temporary file and `mv`.
+/// wrote for device `$2`; on authorize (`$1` non-empty), drops any existing Thurm line matching
+/// either device `$2` (key rotation) or key blob `$1` (device rename), so renaming a phone never
+/// leaves an unrevoked duplicate line behind. Appends `$1` (when given) with Thurm's options,
+/// through a temporary file and `mv`.
 /// Every other line stays byte for byte, a last line without a newline included (one is put before
 /// the appended key only); a revoke that matches nothing leaves the file alone. A link (managed
 /// elsewhere) or an unreadable file is not touched.
@@ -323,7 +323,7 @@ const EDIT: &str = concat!(
     "R=\"${L#restrict,port-forwarding ecdsa-sha2-nistp256 }\"; B=\"${R%% *}\"; [ -n \"$B\" ] || return 1; ",
     "C=\"${R#\"$B\" }\"; case \"$C\" in *\" \"*) return 1 ;; thurm-ios:?*) ;; *) return 1 ;; esac; ",
     "D0=\"${C#thurm-ios:}\"; if [ -z \"$A\" ]; then [ \"$D0\" = \"$V\" ]; return $?; fi; ",
-    "case \"$V\" in iPhone|iPad) [ \"$D0\" = \"$V\" ] && [ \"$B\" = \"$KB\" ] ;; *) [ \"$D0\" = \"$V\" ] ;; esac; }; ",
+    "[ \"$D0\" = \"$V\" ] || [ \"$B\" = \"$KB\" ]; }; ",
     // E: the line read had no newline (the last one). P: the last line written has none. M: a
     // line of the device was dropped.
     "P=; M=; { if [ -f \"$F\" ]; then while :; do E=; IFS= read -r L || E=1; ",
@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_second_generic_iphone_keeps_first_key() {
+    fn renaming_device_deduplicates_key_and_revokes_cleanly() {
         let home = std::env::temp_dir().join(format!("thurm-pair-multi-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
@@ -669,45 +669,41 @@ mod tests {
         let file = home.join(".ssh/authorized_keys");
 
         let k1 = DeviceKey::parse(KEY).unwrap();
-        // Second distinct P-256 blob with the same generic device name ("iPhone").
+        // Second distinct P-256 blob for a second uniquely-named phone.
         let mut blob2 = base64::engine::general_purpose::STANDARD
             .decode(KEY.split(' ').nth(1).unwrap())
             .unwrap();
         blob2[103] ^= 0x01;
         let k2 = DeviceKey::parse(&format!(
-            "ecdsa-sha2-nistp256 {} thurm-ios:iPhone",
+            "ecdsa-sha2-nistp256 {} thurm-ios:iPhone-9c04",
             base64::engine::general_purpose::STANDARD.encode(&blob2)
         ))
         .unwrap();
 
         authorize(&local, &k1).unwrap();
         authorize(&local, &k2).unwrap();
-        // Re-pairing k1 deduplicates k1 without touching k2.
-        authorize(&local, &k1).unwrap();
-        let content = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(content.lines().count(), 2);
-        assert!(content.contains(&k1.line()));
-        assert!(content.contains(&k2.line()));
+        assert_eq!(devices(&local).unwrap(), ["iPhone", "iPhone-9c04"]);
 
-        // Unique non-generic device name rotates by name.
-        let named1 = DeviceKey {
+        // Renaming k1 from generic "iPhone" to unique "iPhone-7f3a" removes the old "iPhone" line
+        // so revoking "iPhone-7f3a" leaves zero entries for k1.
+        let renamed = DeviceKey {
             key: k1.key.clone(),
             device: "iPhone-7f3a".into(),
         };
-        let named2 = DeviceKey {
-            key: k2.key.clone(),
-            device: "iPhone-7f3a".into(),
-        };
-        authorize(&local, &named1).unwrap();
-        authorize(&local, &named2).unwrap();
+        authorize(&local, &renamed).unwrap();
         let content = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(content.lines().count(), 3);
-        assert!(!content.contains(&named1.line()));
-        assert!(content.contains(&named2.line()));
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(!lines.contains(&k1.line().as_str()));
+        assert!(lines.contains(&renamed.line().as_str()));
+        assert!(lines.contains(&k2.line().as_str()));
 
-        // Revoke by name still removes matching entries.
-        revoke(&local, "iPhone").unwrap();
-        assert_eq!(devices(&local).unwrap(), ["iPhone-7f3a"]);
+        // Revoking "iPhone-7f3a" removes only k1, preserving k2 ("iPhone-9c04").
+        revoke(&local, "iPhone-7f3a").unwrap();
+        assert_eq!(devices(&local).unwrap(), ["iPhone-9c04"]);
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(!content.contains(&k1.key));
+        assert!(content.contains(&k2.line()));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -747,7 +743,15 @@ mod tests {
                     } else {
                         vec![LINK]
                     };
-                    let k = DeviceKey::parse(&KEY.replace("iPhone", name)).unwrap();
+                    let mut blob = base64::engine::general_purpose::STANDARD
+                        .decode(KEY.split(' ').nth(1).unwrap())
+                        .unwrap();
+                    blob[103] ^= (i as u8) + 1;
+                    let k = DeviceKey::parse(&format!(
+                        "ecdsa-sha2-nistp256 {} thurm-ios:{name}",
+                        base64::engine::general_purpose::STANDARD.encode(&blob)
+                    ))
+                    .unwrap();
                     std::thread::spawn(move || authorize(&Local(home, env), &k).unwrap())
                 })
                 .collect();
@@ -874,8 +878,10 @@ mod tests {
         assert_eq!(mode(&file), 0o600);
         assert_eq!(mode(&home.join(".ssh")), 0o700);
 
-        // Other lines (no trailing newline, odd characters) stay as they are.
-        let old = format!("{KEY_OPTIONS} {} thurm-ios:iPhone-old", key.key);
+        // Other lines (no trailing newline, odd characters) stay as they are; a distinct key
+        // under another device name is preserved.
+        let other_key = "ecdsa-sha2-nistp256 AAAAotherKeyBlobForDistinctPhone";
+        let old = format!("{KEY_OPTIONS} {other_key} thurm-ios:iPhone-old");
         let other = format!(
             "command=\"echo \\\"hi\\\" %s\",no-pty ssh-ed25519 AAAA  me@laptop\n  # a comment\n\n{old}"
         );
@@ -884,6 +890,17 @@ mod tests {
         authorize(&local, &key).unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
         assert_eq!(text, format!("{other}\n{}\n", key.line()));
+        assert_eq!(devices(&local).unwrap(), ["iPhone-old", "iPhone"]);
+
+        // Re-authorizing the SAME key under a new device name replaces the old line so revoking
+        // the new name does not leave the same key authorized under its previous name.
+        let renamed = DeviceKey {
+            key: key.key.clone(),
+            device: "iPhone-7f3a".into(),
+        };
+        authorize(&local, &renamed).unwrap();
+        assert_eq!(devices(&local).unwrap(), ["iPhone-old", "iPhone-7f3a"]);
+        authorize(&local, &key).unwrap();
         assert_eq!(devices(&local).unwrap(), ["iPhone-old", "iPhone"]);
 
         // Another device of a similar name is not this one.
