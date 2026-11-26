@@ -89,6 +89,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAP_CLIP_QUERY,
     CAP_COPY,
     CAP_DAEMON_ID,
+    CAP_PUSH_REPLACE,
 ];
 
 /// The daemon accepts `SearchPaths` and returns `PathMatches` only for that request.
@@ -199,6 +200,12 @@ pub const CAP_AGENT_ACTIVITY: &str = "agent-activity";
 /// [`Event::Notify`] to clients that advertise this capability. Older clients receive
 /// [`Event::Notify`]; older daemons ignore this capability and send [`Event::Notify`].
 pub const CAP_PENDING_PROMPT: &str = "pending-prompt";
+
+/// The daemon answers [`Request::ListPushRegistrations`] and [`Request::RevokePushRegistrations`],
+/// allowing SSH key replacement to snapshot and revoke only the displaced phone's
+/// `(device, generation)` push registration without disturbing Tailscale-only or newly paired
+/// phones that share a display name.
+pub const CAP_PUSH_REPLACE: &str = "push-replace";
 
 /// Sent only by remote clients (the iOS app over ssh or the tailnet, the web client): the daemon
 /// deflates the events it sends them, as [`Event::Compressed`] (see [`codec::encode_frame`]).
@@ -678,6 +685,29 @@ pub enum Request {
     GetPendingPrompt {
         pane: PaneId,
     },
+    /// Lists non-Tailscale push registrations matching normalized phone `name` (`thurm-ios:<name>`),
+    /// returning [`Response::PushRegistrations`] so SSH key replacement can capture the retired
+    /// phone's `(device, generation)` before writing the new SSH key. Requires [`CAP_PUSH_REPLACE`].
+    ListPushRegistrations {
+        name: String,
+    },
+    /// Forgets only the exact `(device, generation)` push registrations captured before an SSH key
+    /// replacement, along with their Live Activity follows, and drops open non-Tailscale mobile
+    /// connections whose push device was removed (or unregistered when `drop_unregistered_ssh`).
+    /// Requires [`CAP_PUSH_REPLACE`].
+    RevokePushRegistrations {
+        registrations: Vec<PushRegistrationRef>,
+        #[serde(default)]
+        drop_unregistered_ssh: bool,
+    },
+}
+
+/// Identifies a specific push device registration instance so delayed replacement cleanup never
+/// revokes a newer registration for the same phone name or device ID.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PushRegistrationRef {
+    pub device: String,
+    pub generation: u64,
 }
 
 /// The most files a batch of [`Request::UploadBegin`] holds (its `count`).
@@ -857,6 +887,9 @@ pub enum Response {
     /// The answer to [`Request::GetPendingPrompt`]: the pane's active untouched permission
     /// prompt, or `None` when none is waiting.
     PendingPrompt(Option<PendingPrompt>),
+    /// The answer to [`Request::ListPushRegistrations`]: matching non-Tailscale push
+    /// registrations captured prior to an SSH key replacement.
+    PushRegistrations(Vec<PushRegistrationRef>),
 }
 
 /// An agent's untouched permission prompt in a pane, as returned by [`Request::GetPendingPrompt`].
@@ -2208,6 +2241,65 @@ mod tests {
                 permission: Some(42),
                 sound: Some(ref s),
             }) if title == "Claude Code" && body == "needs permission" && s == "Glass"
+        ));
+    }
+
+    #[test]
+    fn push_replace_requests_postcard_and_json() {
+        let list = Request::ListPushRegistrations {
+            name: "iPhone".into(),
+        };
+        assert_eq!(to_json(&list), r#"{"ListPushRegistrations":{"name":"iPhone"}}"#);
+        let bytes = postcard::to_allocvec(&Envelope { id: 1, request: list }).expect("encodes");
+        let back: Envelope = postcard::from_bytes(&bytes).expect("decodes");
+        assert!(matches!(
+            back.request,
+            Request::ListPushRegistrations { ref name } if name == "iPhone"
+        ));
+
+        let refs = vec![PushRegistrationRef {
+            device: "d1".into(),
+            generation: 3,
+        }];
+        let resp = ServerMessage::Response {
+            id: 1,
+            result: Ok(Response::PushRegistrations(refs.clone())),
+        };
+        let bytes = postcard::to_allocvec(&resp).expect("encodes");
+        let back: ServerMessage = postcard::from_bytes(&bytes).expect("decodes");
+        assert!(matches!(
+            back,
+            ServerMessage::Response {
+                id: 1,
+                result: Ok(Response::PushRegistrations(r))
+            } if r == refs
+        ));
+
+        let revoke = Request::RevokePushRegistrations {
+            registrations: refs.clone(),
+            drop_unregistered_ssh: true,
+        };
+        let json_str = to_json(&revoke);
+        let from_json: Request = serde_json::from_str(&json_str).expect("json decodes");
+        assert!(matches!(
+            from_json,
+            Request::RevokePushRegistrations {
+                ref registrations,
+                drop_unregistered_ssh: true
+            } if *registrations == refs
+        ));
+        let bytes = postcard::to_allocvec(&Envelope {
+            id: 2,
+            request: revoke,
+        })
+        .expect("encodes");
+        let back: Envelope = postcard::from_bytes(&bytes).expect("decodes");
+        assert!(matches!(
+            back.request,
+            Request::RevokePushRegistrations {
+                ref registrations,
+                drop_unregistered_ssh: true
+            } if *registrations == refs
         ));
     }
 }

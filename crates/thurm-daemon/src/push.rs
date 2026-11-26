@@ -24,7 +24,20 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thurm_proto::PaneId;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+/// How a push device registered with the daemon.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceTransport {
+    /// Persisted by an older daemon before transport tracking.
+    #[default]
+    Unknown,
+    /// Registered through a local Unix socket peer (including SSH streamlocal forwarding).
+    Peer,
+    /// Registered through the Tailscale listener (no SSH key required).
+    Tailscale,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Device {
     pub device: String,
     pub relay: String,
@@ -32,6 +45,15 @@ pub struct Device {
     /// What the app calls this daemon.
     pub host: String,
     pub name: String,
+    /// Monotonic registration generation assigned on each [`Pusher::register`], so a delayed
+    /// SSH key-replacement cleanup targeting an earlier `(device, generation)` never evicts a
+    /// newer registration for the same name or device ID.
+    #[serde(default)]
+    pub generation: u64,
+    /// Transport on which the device registered (`Tailscale` registrations do not depend on
+    /// `authorized_keys` and are not evicted by SSH key replacement).
+    #[serde(default)]
+    pub transport: DeviceTransport,
 }
 
 /// A Live Activity following a pane's agent.
@@ -146,6 +168,9 @@ pub struct Pusher {
     /// The next notice's sequence number. Initialized from `max(persisted + 1, now_ms)` and
     /// persisted on each sent notice so backward clock steps never break `seq <= upTo` read-sync.
     next_seq: std::sync::atomic::AtomicU64,
+    /// Monotonic generation assigned to each [`Device`] registration. Seeded like `next_seq`, so a
+    /// generation is never reused after a restart that found no devices.
+    next_device_gen: std::sync::atomic::AtomicU64,
     /// Monotonic generation assigned to each new [`Follow`].
     next_follow_gen: std::sync::atomic::AtomicU64,
     /// Shared with the push thread, which forgets a device the relay no longer knows.
@@ -183,10 +208,16 @@ impl Pusher {
         let path = state_dir.join("push-devices.json");
         let follows_path = state_dir.join("push-activities.json");
         let seq_path = state_dir.join("push-seq.json");
-        let devices = std::fs::read(&path)
+        let devices: Vec<Device> = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        let next_device_gen = devices
+            .iter()
+            .map(|d| d.generation)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         let follows: Vec<Follow> = std::fs::read(&follows_path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -212,6 +243,7 @@ impl Pusher {
             last_notice: Mutex::new(std::collections::HashMap::new()),
             notified: Mutex::new(std::collections::HashMap::new()),
             next_seq: std::sync::atomic::AtomicU64::new(initial_seq),
+            next_device_gen: std::sync::atomic::AtomicU64::new(now_ms.max(next_device_gen)),
             next_follow_gen: std::sync::atomic::AtomicU64::new(next_follow_gen),
             devices: Arc::new(Mutex::new(devices)),
             follows: Arc::new(Mutex::new(follows)),
@@ -302,7 +334,7 @@ impl Pusher {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    pub fn register(&self, device: Device) -> Result<(), String> {
+    pub fn register(&self, mut device: Device) -> Result<(), String> {
         if !self.enabled() {
             return Err("push notifications are off on this host ([push] relay is empty)".into());
         }
@@ -311,27 +343,23 @@ impl Pusher {
             return Err("push registration needs a device id and a secret".into());
         }
         let mut devices = self.devices.lock();
-        // Pairing (`authorized_keys`) maps one SSH key per normalized device name (`thurm-ios:<name>`).
-        // Replacing a device by ID or by normalized name therefore evicts the prior registration and
-        // its Live Activity follows so a phone whose same-name key was replaced stops receiving
-        // agent notices and activity updates immediately. Distinctly named devices coexist.
-        let key_name = normalize_device_name(&device.name);
-        let replaced: Vec<String> = devices
-            .iter()
-            .filter(|d| {
-                d.device == device.device
-                    || (!key_name.is_empty() && normalize_device_name(&d.name) == key_name)
-            })
-            .map(|d| d.device.clone())
-            .collect();
-        devices.retain(|d| !replaced.contains(&d.device));
+        // Deduplicate ordinary registrations strictly by stable device ID so independent phones
+        // (such as two Tailscale-paired iPhones sharing a display name) never evict each other.
+        // Displacing a different device on SSH key replacement is handled explicitly via
+        // `ssh_registrations_named` + `revoke_registrations`.
+        device.generation = self.next_device_gen.fetch_add(1, Ordering::Relaxed);
+        let replaced_id = devices.iter().any(|d| d.device == device.device);
+        let device_id = device.device.clone();
+        devices.retain(|d| d.device != device_id);
         devices.push(device);
         self.save(&devices)?;
-        let mut follows = self.follows.lock();
-        let before = follows.len();
-        follows.retain(|f| !replaced.contains(&f.device));
-        if follows.len() != before {
-            save_json(&self.follows_path, &*follows)?;
+        if replaced_id {
+            let mut follows = self.follows.lock();
+            let before = follows.len();
+            follows.retain(|f| f.device != device_id);
+            if follows.len() != before {
+                save_json(&self.follows_path, &*follows)?;
+            }
         }
         Ok(())
     }
@@ -358,7 +386,8 @@ impl Pusher {
 
     /// Forgets every device registered under the phone name `name` (spaces as dashes, as its
     /// device key's comment has it), and its activities. Returns their ids. Use [`Self::unregister`]
-    /// to remove a specific registration by device id.
+    /// to remove a specific registration by device id, or [`Self::revoke_registrations`] for
+    /// generation-scoped SSH key-replacement cleanup.
     pub fn revoke_named(&self, name: &str) -> Result<Vec<String>, String> {
         let target = normalize_device_name(name);
         let gone: Vec<String> = self
@@ -372,6 +401,41 @@ impl Pusher {
             self.store().forget(&gone)?;
         }
         Ok(gone)
+    }
+
+    /// Snapshots non-Tailscale push registrations matching normalized phone `name`
+    /// (`thurm-ios:<name>`), captured BEFORE replacing that name's SSH key so cleanup targets
+    /// only the displaced registration instances and leaves Tailscale-paired or later-registered
+    /// phones untouched.
+    pub fn ssh_registrations_named(&self, name: &str) -> Vec<thurm_proto::PushRegistrationRef> {
+        let target = normalize_device_name(name);
+        if target.is_empty() {
+            return Vec::new();
+        }
+        self.devices
+            .lock()
+            .iter()
+            .filter(|d| {
+                d.transport != DeviceTransport::Tailscale
+                    && normalize_device_name(&d.name) == target
+            })
+            .map(|d| thurm_proto::PushRegistrationRef {
+                device: d.device.clone(),
+                generation: d.generation,
+            })
+            .collect()
+    }
+
+    /// Forgets only the exact `(device, generation)` registrations in `targets` and their
+    /// Live Activity follows. A newer registration for the same device ID or display name stays.
+    pub fn revoke_registrations(
+        &self,
+        targets: &[thurm_proto::PushRegistrationRef],
+    ) -> Result<Vec<String>, String> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.store().forget_matching(targets)
     }
 
     /// Queues `notice` for every registered device but those in `open` (phones with the app
@@ -463,9 +527,13 @@ impl Pusher {
     }
 
     /// `device` follows `pane` in a Live Activity with push `token` (replacing an earlier one).
-    /// When `state` is `Some`, seeds `last` without posting an immediate update so the daemon does
-    /// not overwrite the richer state the app started the Live Activity with. When `state` is
-    /// `None` (the agent already exited), ends the activity immediately.
+    ///
+    /// When `state` is `Some` with an active permission prompt (`permission.is_some()`), seeds
+    /// `last` without posting an immediate update so the daemon does not overwrite the phone's
+    /// locally shown verbatim permission request and Allow button with a request-less relay
+    /// payload. For any non-permission state (`working`, `needs_input`, `done`, `error`, `idle`)
+    /// or when the agent already exited (`None`), posts immediately so a permission prompt or
+    /// earlier state resolved before `FollowAgent` arrived is never left stale on the Lock Screen.
     pub fn follow(
         &self,
         device: &str,
@@ -482,6 +550,7 @@ impl Pusher {
         if token.is_empty() || token.len() > 400 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err("bad activity token".into());
         }
+        let seed_without_post = state.as_ref().is_some_and(|s| s.permission.is_some());
         {
             let generation = self.next_follow_gen.fetch_add(1, Ordering::Relaxed);
             let mut follows = self.follows.lock();
@@ -490,13 +559,17 @@ impl Pusher {
                 device: device.to_owned(),
                 pane,
                 token,
-                last: state.clone(),
+                last: if seed_without_post {
+                    state.clone()
+                } else {
+                    None
+                },
                 generation,
             });
             save_json(&self.follows_path, &*follows)?;
         }
-        if state.is_none() {
-            self.agent_changed(pane, None, &[]);
+        if !seed_without_post {
+            self.agent_changed(pane, state, &[]);
         }
         Ok(())
     }
@@ -614,6 +687,36 @@ impl Store {
         let mut follows = self.follows.lock();
         follows.retain(|f| !gone.contains(&f.device));
         save_json(&self.follows_path, &*follows)
+    }
+
+    /// Atomically forgets only registered devices matching an exact `(device, generation)` pair
+    /// in `targets`, plus their Live Activity follows. Returns the removed device ids.
+    fn forget_matching(
+        &self,
+        targets: &[thurm_proto::PushRegistrationRef],
+    ) -> Result<Vec<String>, String> {
+        let mut devices = self.devices.lock();
+        let mut gone = Vec::new();
+        devices.retain(|d| {
+            let matched = targets
+                .iter()
+                .any(|t| t.device == d.device && t.generation == d.generation);
+            if matched {
+                gone.push(d.device.clone());
+            }
+            !matched
+        });
+        if gone.is_empty() {
+            return Ok(gone);
+        }
+        save_json(&self.path, &*devices)?;
+        let mut follows = self.follows.lock();
+        let before = follows.len();
+        follows.retain(|f| !gone.contains(&f.device));
+        if follows.len() != before {
+            save_json(&self.follows_path, &*follows)?;
+        }
+        Ok(gone)
     }
 
     /// `device` is registered as it is (not revoked, not registered again since).
@@ -949,6 +1052,7 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
+            ..Default::default()
         })
         .unwrap();
         let n = |pane| Notice {
@@ -1029,6 +1133,7 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
+            ..Default::default()
         })
         .unwrap();
         let n = |pane| Notice {
@@ -1124,6 +1229,7 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
+            ..Default::default()
         };
         let b: serde_json::Value = serde_json::from_str(&body(
             &d,
@@ -1178,15 +1284,28 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
+            transport: DeviceTransport::Peer,
+            ..Default::default()
         };
         assert!(p.register(d.clone()).is_err());
         d.relay = "https://push.example.net".into();
         p.register(d.clone()).unwrap();
+        let first = p.devices.lock()[0].generation;
         p.register(d.clone()).unwrap();
         let again = Pusher::new(&dir, true);
-        assert_eq!(*again.devices.lock(), vec![d.clone()]);
+        assert_eq!(again.devices.lock().len(), 1);
+        assert_eq!(again.devices.lock()[0].device, "d1");
+        let second = again.devices.lock()[0].generation;
+        assert!(second > first, "registering again takes a newer generation");
+        // A daemon that restarts with no devices left still never hands out an earlier generation.
+        let empty = std::env::temp_dir().join(format!("thurm-push-gen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        let fresh = Pusher::new(&empty, true);
+        fresh.register(d.clone()).unwrap();
+        assert!(fresh.devices.lock()[0].generation > second);
+        let _ = std::fs::remove_dir_all(&empty);
         // Same device id through another relay replaces it; a second iPhone with a distinct
-        // device id and a distinct name ("iPhone-9c04") stays registered alongside it.
+        // device id stays registered alongside it, even with the same display name.
         let moved = Device {
             relay: "https://other.example.net".into(),
             ..d.clone()
@@ -1204,7 +1323,20 @@ mod tests {
             ..d.clone()
         };
         p.register(ipad.clone()).unwrap();
-        assert_eq!(*p.devices.lock(), vec![moved, second_iphone, ipad]);
+        let ids: Vec<(String, String)> = p
+            .devices
+            .lock()
+            .iter()
+            .map(|dev| (dev.device.clone(), dev.relay.clone()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("d1".into(), "https://other.example.net".into()),
+                ("d2".into(), "https://push.example.net".into()),
+                ("d3".into(), "https://push.example.net".into()),
+            ]
+        );
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(dir.join("push-devices.json"))
             .unwrap()
@@ -1220,57 +1352,157 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Replacing a paired phone under the same device name (different key and push device ID)
-    /// drops the first phone's push registration and Live Activity follows so it stops receiving
-    /// agent notices and activity updates.
+    /// Two independent Tailscale-paired phones with distinct device IDs, different host aliases,
+    /// and the SAME normalized display name must coexist without evicting each other's push
+    /// registrations or Live Activity follows.
     #[test]
-    fn replacing_same_name_phone_stops_notices_and_activity_updates() {
-        let dir = std::env::temp_dir().join(format!("thurm-push-replace-{}", std::process::id()));
+    fn distinct_tailnet_phones_with_same_display_name_keep_registrations_and_follows() {
+        let dir = std::env::temp_dir().join(format!("thurm-push-tailnet-coexist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (relay1, posts1) = capturing_relay();
         let (relay2, posts2) = capturing_relay();
         let p = Pusher::new(&dir, true);
         p.register(Device {
-            device: "d1".into(),
+            device: "tailnet-1".into(),
             relay: relay1,
             secret: "s".repeat(32),
             host: "studio".into(),
-            name: "iPhone".into(),
+            name: "My iPhone".into(),
+            transport: DeviceTransport::Tailscale,
+            ..Default::default()
         })
         .unwrap();
-        let working = ActivityState {
+        let asking = ActivityState {
             agent: "Claude Code".into(),
-            status: "working".into(),
+            status: "permission".into(),
             title: "private-task".into(),
             since: 1,
-            permission: None,
+            permission: Some(11),
         };
-        p.follow("d1", 7, "aaaa".into(), Some(working.clone()))
+        p.follow("tailnet-1", 7, "aaaa".into(), Some(asking.clone()))
             .unwrap();
-        assert_eq!(p.follows.lock().len(), 1);
 
-        // Second phone pairs under the same normalized device name ("iPhone") with a different
-        // push device ID (and even a different host label): d1 and its follow must be dropped.
+        // Second independent Tailscale phone with the same normalized display name ("My-iPhone")
+        // and a different host alias registers and follows the same pane.
         p.register(Device {
-            device: "d2".into(),
+            device: "tailnet-2".into(),
             relay: relay2,
             secret: "t".repeat(32),
             host: "work-mac".into(),
-            name: "iPhone".into(),
+            name: "My-iPhone".into(),
+            transport: DeviceTransport::Tailscale,
+            ..Default::default()
         })
         .unwrap();
-        assert_eq!(p.devices.lock().len(), 1);
-        assert_eq!(p.devices.lock()[0].device, "d2");
-        assert!(
-            p.follows.lock().is_empty(),
-            "replaced phone's Live Activity follows must be dropped"
+        p.follow("tailnet-2", 7, "bbbb".into(), Some(asking.clone()))
+            .unwrap();
+
+        assert_eq!(p.devices.lock().len(), 2);
+        assert_eq!(p.follows.lock().len(), 2);
+
+        // Both phones receive subsequent Live Activity updates and notices.
+        p.agent_changed(
+            7,
+            Some(ActivityState {
+                status: "done".into(),
+                permission: None,
+                ..asking
+            }),
+            &[],
         );
+        let b1: serde_json::Value =
+            serde_json::from_str(&posts1.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+        let b2: serde_json::Value =
+            serde_json::from_str(&posts2.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+        assert_eq!(b1["device"], "tailnet-1");
+        assert_eq!(b1["state"]["status"], "done");
+        assert_eq!(b2["device"], "tailnet-2");
+        assert_eq!(b2["state"]["status"], "done");
+
+        let reloaded = Pusher::new(&dir, true);
+        assert_eq!(reloaded.devices.lock().len(), 2);
+        assert_eq!(reloaded.follows.lock().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pre-captured `(device, generation)` SSH key-replacement cleanup revokes ONLY the displaced
+    /// SSH phone and its follows, preserving:
+    /// 1. a replacement phone that registered over Tailscale BEFORE its fallback SSH key was added,
+    /// 2. a replacement phone that registered over SSH BEFORE delayed cleanup arrived (different ID
+    ///    or even the same ID at a newer generation).
+    #[test]
+    fn scoped_replacement_revokes_only_precaptured_ssh_registration() {
+        let dir = std::env::temp_dir().join(format!("thurm-push-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (relay_old, posts_old) = capturing_relay();
+        let (relay_tailnet, posts_tailnet) = capturing_relay();
+        let (relay_new_ssh, posts_new_ssh) = capturing_relay();
+        let p = Pusher::new(&dir, true);
+
+        // Old SSH-paired phone registered and following pane 7.
+        p.register(Device {
+            device: "d-old".into(),
+            relay: relay_old,
+            secret: "s".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+            transport: DeviceTransport::Peer,
+            ..Default::default()
+        })
+        .unwrap();
+        let asking = ActivityState {
+            agent: "Claude Code".into(),
+            status: "permission".into(),
+            title: "private-task".into(),
+            since: 1,
+            permission: Some(1),
+        };
+        p.follow("d-old", 7, "1111".into(), Some(asking.clone()))
+            .unwrap();
+
+        // Replacement phone registers over Tailscale BEFORE its SSH fallback key is pasted.
+        p.register(Device {
+            device: "d-tailnet".into(),
+            relay: relay_tailnet,
+            secret: "t".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+            transport: DeviceTransport::Tailscale,
+            ..Default::default()
+        })
+        .unwrap();
+        p.follow("d-tailnet", 7, "2222".into(), Some(asking.clone()))
+            .unwrap();
+
+        // Snapshot non-Tailscale registrations matching "iPhone" BEFORE writing the new SSH key:
+        // captures ONLY `d-old`, NOT `d-tailnet`.
+        let captured = p.ssh_registrations_named("iPhone");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].device, "d-old");
+
+        // Before delayed cleanup runs, another SSH replacement phone connects and registers.
+        p.register(Device {
+            device: "d-new-ssh".into(),
+            relay: relay_new_ssh,
+            secret: "u".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+            transport: DeviceTransport::Peer,
+            ..Default::default()
+        })
+        .unwrap();
+        p.follow("d-new-ssh", 7, "3333".into(), Some(asking.clone()))
+            .unwrap();
+
+        // Delayed cleanup revokes ONLY the pre-captured `(d-old, gen)` registration.
+        let gone = p.revoke_registrations(&captured).unwrap();
+        assert_eq!(gone, ["d-old"]);
 
         p.notify(
             Notice {
                 pane: 7,
                 title: "Claude Code".into(),
-                permission: Some(1),
+                permission: Some(2),
                 kind: Some(NoticeKind::Permission),
             },
             &[],
@@ -1279,23 +1511,62 @@ mod tests {
             7,
             Some(ActivityState {
                 status: "done".into(),
-                ..working
+                permission: None,
+                ..asking.clone()
             }),
             &[],
         );
 
-        // Phone 2 receives the notice; Phone 1 receives neither the notice nor an activity update.
-        let body2: serde_json::Value =
-            serde_json::from_str(&posts2.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
-        assert_eq!(body2["device"], "d2");
+        let t1: serde_json::Value =
+            serde_json::from_str(&posts_tailnet.recv_timeout(Duration::from_secs(10)).unwrap())
+                .unwrap();
+        let t2: serde_json::Value =
+            serde_json::from_str(&posts_tailnet.recv_timeout(Duration::from_secs(10)).unwrap())
+                .unwrap();
+        assert_eq!(t1["device"], "d-tailnet");
+        assert_eq!(t2["device"], "d-tailnet");
+        let n1: serde_json::Value =
+            serde_json::from_str(&posts_new_ssh.recv_timeout(Duration::from_secs(10)).unwrap())
+                .unwrap();
+        let n2: serde_json::Value =
+            serde_json::from_str(&posts_new_ssh.recv_timeout(Duration::from_secs(10)).unwrap())
+                .unwrap();
+        assert_eq!(n1["device"], "d-new-ssh");
+        assert_eq!(n2["device"], "d-new-ssh");
         assert!(
-            posts1.recv_timeout(Duration::from_millis(300)).is_err(),
-            "replaced phone d1 must not receive notices or Live Activity updates"
+            posts_old.recv_timeout(Duration::from_millis(300)).is_err(),
+            "displaced SSH phone must receive neither notices nor Live Activity updates"
         );
+
+        // Even if the SAME device ID re-registered at a higher generation before stale cleanup
+        // arrived, revoking the old generation must leave the new registration and follow intact.
+        let before_rereg = p.ssh_registrations_named("iPhone");
+        assert_eq!(before_rereg.len(), 1);
+        assert_eq!(before_rereg[0].device, "d-new-ssh");
+        p.register(Device {
+            device: "d-new-ssh".into(),
+            relay: "https://push.example.net".into(),
+            secret: "v".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+            transport: DeviceTransport::Peer,
+            ..Default::default()
+        })
+        .unwrap();
+        p.follow("d-new-ssh", 9, "4444".into(), Some(asking)).unwrap();
+        assert!(p.revoke_registrations(&before_rereg).unwrap().is_empty());
+        assert!(p.devices.lock().iter().any(|d| d.device == "d-new-ssh"));
+        assert!(p.follows.lock().iter().any(|f| f.device == "d-new-ssh" && f.pane == 9));
+
         let reloaded = Pusher::new(&dir, true);
-        assert_eq!(reloaded.devices.lock().len(), 1);
-        assert_eq!(reloaded.devices.lock()[0].device, "d2");
-        assert!(reloaded.follows.lock().is_empty());
+        let mut ids: Vec<String> = reloaded
+            .devices
+            .lock()
+            .iter()
+            .map(|d| d.device.clone())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["d-new-ssh", "d-tailnet"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1330,6 +1601,7 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
+            ..Default::default()
         })
         .unwrap();
         let notice = |pane| Notice {
@@ -1385,6 +1657,7 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
+            ..Default::default()
         })
         .unwrap();
         let working = ActivityState {
@@ -1451,6 +1724,7 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: name.into(),
+                ..Default::default()
             })
             .unwrap();
         }
@@ -1516,6 +1790,7 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: "Nikola's iPhone".into(),
+                ..Default::default()
             },
             Device {
                 device: "d2".into(),
@@ -1523,6 +1798,7 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "laptop".into(),
                 name: "Nikola's iPhone".into(),
+                ..Default::default()
             },
             Device {
                 device: "d3".into(),
@@ -1530,6 +1806,7 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: "iPad".into(),
+                ..Default::default()
             },
             // Unrelated device whose device ID happens to match the revoked phone's name.
             Device {
@@ -1538,6 +1815,7 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: "Work Phone".into(),
+                ..Default::default()
             },
         ];
         save_json(&dir.join("push-devices.json"), &seeded).unwrap();
@@ -1601,6 +1879,7 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: id.into(),
+                ..Default::default()
             })
             .unwrap();
         }
@@ -1658,6 +1937,7 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
+            ..Default::default()
         })
         .unwrap();
         for pane in 1..=2 {
@@ -1696,16 +1976,19 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
+            ..Default::default()
         };
         p.register(old.clone()).unwrap();
+        let stored_old = p.devices.lock()[0].clone();
         let new = Device {
             relay: "https://new.example.net".into(),
             ..old.clone()
         };
-        p.register(new.clone()).unwrap();
-        p.store().check(&old, "push", Err(PostError::Gone));
-        assert_eq!(*p.devices.lock(), vec![new.clone()]);
-        p.store().check(&new, "push", Err(PostError::Gone));
+        p.register(new).unwrap();
+        let stored_new = p.devices.lock()[0].clone();
+        p.store().check(&stored_old, "push", Err(PostError::Gone));
+        assert_eq!(*p.devices.lock(), vec![stored_new.clone()]);
+        p.store().check(&stored_new, "push", Err(PostError::Gone));
         assert!(p.devices.lock().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1753,6 +2036,7 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
+            ..Default::default()
         })
         .unwrap();
         let next = || -> serde_json::Value {
@@ -1765,15 +2049,29 @@ mod tests {
             since: 1,
             permission: None,
         };
+        // Following a non-permission state immediately pushes it so a resolved permission prompt
+        // or stale Lock Screen state is cleared right away.
         p.follow("d1", 4, "aa".into(), Some(working.clone()))
             .unwrap();
-        // Following an active agent seeds `last` without posting an immediate update that could
-        // overwrite richer local Live Activity state (such as a verbatim permission request).
+        let initial = next();
+        assert_eq!(initial["event"], "update");
+        assert_eq!(initial["state"]["status"], "working");
+
+        // Following while a permission prompt is active seeds `last` without posting a
+        // request-less overwrite that would wipe the phone's verbatim request and Allow button.
+        let active_perm = ActivityState {
+            status: "permission".into(),
+            title: "Fix the sidebar".into(),
+            permission: Some(6),
+            ..working.clone()
+        };
+        p.follow("d1", 4, "ab".into(), Some(active_perm)).unwrap();
         assert!(
             posts.recv_timeout(Duration::from_millis(250)).is_err(),
-            "follow with Some(state) must not post an immediate /v1/activity overwrite"
+            "follow with active permission prompt must not post a request-less overwrite"
         );
-        // A real state transition does post an update when the app is not open.
+
+        // A real state transition after following an active permission prompt does post.
         let done = ActivityState {
             status: "done".into(),
             ..working.clone()
@@ -1805,7 +2103,7 @@ mod tests {
 
     #[test]
     fn dead_activity_token_prunes_only_that_follow_and_keeps_device() {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::{BufRead, BufReader, Read, Write};
         for response in [
             "HTTP/1.1 410 Gone\r\nX-Thurm-Activity: unknown\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 404 Not Found\r\nX-Thurm-Activity: unknown\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -1823,11 +2121,25 @@ mod tests {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { return };
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut len = 0usize;
                     let mut line = String::new();
                     while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
                         line.clear();
                     }
-                    let _ = stream.write_all(resp.as_bytes());
+                    let mut body = vec![0u8; len];
+                    let _ = reader.read_exact(&mut body);
+                    let body_str = String::from_utf8_lossy(&body);
+                    // Only token `"aaaa"` is unknown at the relay; `"bbbb"` is still live.
+                    if body_str.contains("\"aaaa\"") {
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
                 }
             });
             let p = Pusher::new(&dir, true);
@@ -1837,6 +2149,7 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: "iPhone".into(),
+                ..Default::default()
             })
             .unwrap();
             let working = ActivityState {
@@ -1899,6 +2212,7 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
+            ..Default::default()
         })
         .unwrap();
         let working = ActivityState {
@@ -1910,6 +2224,9 @@ mod tests {
         };
         p.follow("d1", 1, "aaaa".into(), Some(working.clone()))
             .unwrap();
+        answers
+            .recv_timeout(Duration::from_secs(10))
+            .expect("initial activity post");
         p.agent_changed(
             1,
             Some(ActivityState {
@@ -1945,18 +2262,24 @@ mod tests {
             let (in_flight_tx, in_flight_rx) = crossbeam_channel::unbounded();
             let (release_tx, release_rx) = crossbeam_channel::unbounded::<()>();
             std::thread::spawn(move || {
-                for stream in listener.incoming() {
+                for (i, stream) in listener.incoming().enumerate() {
                     let Ok(mut stream) = stream else { return };
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut line = String::new();
                     while reader.read_line(&mut line).unwrap_or(0) > 2 {
                         line.clear();
                     }
-                    let _ = in_flight_tx.send(());
-                    let _ = release_rx.recv();
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 410 Gone\r\nX-Thurm-Activity: unknown\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    );
+                    if i == 0 {
+                        let _ = in_flight_tx.send(());
+                        let _ = release_rx.recv();
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 410 Gone\r\nX-Thurm-Activity: unknown\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    } else {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
                 }
             });
             let p = Pusher::new(&dir, true);
@@ -1966,6 +2289,7 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: "iPhone".into(),
+                ..Default::default()
             };
             p.register(dev1.clone()).unwrap();
             let working = ActivityState {
@@ -1975,16 +2299,9 @@ mod tests {
                 since: 1,
                 permission: None,
             };
+            // Following `"working"` starts the first `/v1/activity` request immediately.
             p.follow("d1", 1, "aaaa".into(), Some(working.clone()))
                 .unwrap();
-            p.agent_changed(
-                1,
-                Some(ActivityState {
-                    status: "done".into(),
-                    ..working.clone()
-                }),
-                &[],
-            );
             // Wait until the first `/v1/activity` request is held at the relay.
             in_flight_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -2041,6 +2358,7 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
+            ..Default::default()
         })
         .unwrap();
         p.notify(
@@ -2129,6 +2447,7 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
+            ..Default::default()
         };
         p.register(d.clone()).unwrap();
         let working = ActivityState {

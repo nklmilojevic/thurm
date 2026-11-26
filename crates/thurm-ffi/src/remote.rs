@@ -806,8 +806,29 @@ fn call(c: Call) -> Result<Value, String> {
         }
         Call::AuthorizeDevice { name, key } => {
             let key = pairing::DeviceKey::parse(&key)?;
-            let (_, ssh) = ssh_for(&name)?;
-            match pairing::authorize_with_status(&ssh, &key) {
+            let (r, ssh) = ssh_for(&name)?;
+            let existing_local_socket = MANAGER.lock().as_ref().and_then(|m| {
+                let s = m.supervisors.get(&name)?.status();
+                (s.phase == thurm_remote::tunnel::Phase::Connected)
+                    .then(|| PathBuf::from(s.socket))
+            });
+            let pending_store = pairing::PendingPushRevokes::default();
+            let host_key = format!("remote:{name}");
+            match pairing::authorize_with_push_cleanup(
+                &ssh,
+                &key,
+                &name,
+                &pending_store,
+                &host_key,
+                || {
+                    pairing::connect_remote_daemon(
+                        &ssh,
+                        &name,
+                        r.socket.as_deref(),
+                        existing_local_socket.as_deref(),
+                    )
+                },
+            ) {
                 Ok(replaced) => json!({ "device": key.device, "replaced": replaced }),
                 Err(e @ pairing::PairingError::NotWritable { nixos }) => json!({
                     "error": e.to_string(),
