@@ -848,7 +848,7 @@ fn clear_reject_exit_grace_and_close_pane_remove_records() {
     wait_records(&c, pane, "short-lived set", |r| r.len() == 1);
     wait_snapshot(&env, "short-lived record saved", |snap| {
         snap["panes"][0]["id"] == pane
-            && snap["panes"][0]["program_resume"]["argv"][1] == "exit-step"
+            && opened_record(&env, snap, 0)["argv"][1] == "exit-step"
     });
     std::fs::write(&exit_gate, "").unwrap();
     wait_records(&c, pane, "expired after exit grace", |r| r.is_empty());
