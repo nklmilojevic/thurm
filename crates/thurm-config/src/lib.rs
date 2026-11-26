@@ -10,6 +10,7 @@ pub mod hooks;
 pub mod plugins;
 mod overlay;
 mod programs;
+mod resume;
 pub mod settings;
 mod themes;
 
@@ -20,6 +21,9 @@ use thurm_proto::AgentStatus;
 
 pub use agents::{AgentDef, builtin_agents};
 pub use programs::{CATEGORIES, ProgramDef, builtin_programs, executable_name, identify, marks};
+pub use resume::{
+    FlagArity, ResumeProgramsMode, ResumeRule, builtin_resume_rules, resolve_resume_rules,
+};
 pub use themes::{Theme, builtin_theme, builtin_theme_names, is_own_theme};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -790,6 +794,12 @@ pub struct SessionConfig {
     pub quit: QuitBehavior,
     /// When a restored pane was running an agent with a `resume` command, run it again.
     pub resume_agents: bool,
+    /// Whether and how to resume programs that reported a resume command via OSC 7577.
+    pub resume_programs: ResumeProgramsMode,
+    /// Include Thurm's built-in trust rules for OSC 7577 program resume.
+    pub resume_default_rules: bool,
+    /// User trust rules for OSC 7577 program resume (`[[session.resume_rules]]`).
+    pub resume_rules: Vec<ResumeRule>,
     /// Exit the daemon this many seconds after the last pane closed (0 = never).
     pub daemon_idle_exit_secs: u64,
 }
@@ -802,6 +812,9 @@ impl Default for SessionConfig {
             snapshot_interval_secs: 15,
             quit: QuitBehavior::Detach,
             resume_agents: true,
+            resume_programs: ResumeProgramsMode::Rules,
+            resume_default_rules: true,
+            resume_rules: Vec::new(),
             daemon_idle_exit_secs: 0,
         }
     }
@@ -1766,6 +1779,11 @@ impl Config {
             .into_iter()
             .filter(|b| !user.iter().any(|d| d.id == b.id));
         user.iter().cloned().chain(builtins).collect()
+    }
+
+    /// Effective trust rules for OSC 7577 program resume.
+    pub fn resume_rules(&self) -> Vec<ResumeRule> {
+        resolve_resume_rules(self.session.resume_default_rules, &self.session.resume_rules)
     }
 
     /// Launch presets: explicit ones from the config, otherwise one per built-in agent

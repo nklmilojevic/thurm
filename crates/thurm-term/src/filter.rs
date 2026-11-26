@@ -16,6 +16,7 @@ const INTERCEPTED_OSC: &[u32] = &[
     633,  // VS Code shell integration (same semantics as 133 for our purposes)
     3008, // context signalling (OSC 3008) – swallowed
     7501, // program status
+    7577, // program resume (daemon-only; never forwarded to clients or libghostty-vt)
 ];
 
 /// Intercepted OSC numbers libghostty-vt gets too (it handles other parts of them).
@@ -84,6 +85,10 @@ fn title_start(bytes: &[u8]) -> bool {
 
 /// Longest OSC we buffer before giving up and passing it through untouched.
 const MAX_OSC: usize = 8 * 1024 * 1024;
+/// Longest OSC 7577 body we buffer before discarding until its terminator (ignored per spec).
+/// Well above the spec's 2048-byte minimum and the daemon's 64 KiB protocol limit so oversized
+/// reports up to 128 KiB can still be MAC-verified and rejected, while huge streams stay bounded.
+const MAX_OSC_7577: usize = 128 * 1024;
 /// Longest APC we accept (kitty chunks are ≤ 4 KiB, but be generous).
 const MAX_APC: usize = 64 * 1024 * 1024;
 
@@ -97,6 +102,9 @@ pub enum Chunk<'a> {
     Osc(Vec<u8>),
     /// A whole OSC for the VT parser, not to forward (see `PRIVATE_OSC`).
     Private(Vec<u8>),
+    /// Program Resume Protocol (OSC 7577) body after `7577;` and the full sequence byte length
+    /// (including `ESC ]`, `7577;`, body, and BEL/ST). Daemon-only: never forwarded or sent to VT.
+    ProgramResume { body: Vec<u8>, total_len: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -435,11 +443,15 @@ impl StreamFilter {
                     {
                         Some(off) if matches!(input[i + off], CAN | SUB) => {
                             // CAN/SUB cancel the sequence: hand it to the terminal as it came,
-                            // which drops it.
-                            self.buf.extend_from_slice(&input[i..i + off]);
-                            let mut raw = b"\x1b]".to_vec();
-                            raw.append(&mut self.buf);
-                            out.push(Chunk::Pass(Cow::Owned(raw)));
+                            // which drops it (except OSC 7577, which stays daemon-only).
+                            if osc_number(&self.buf) == Some(7577) {
+                                self.buf.clear();
+                            } else {
+                                self.buf.extend_from_slice(&input[i..i + off]);
+                                let mut raw = b"\x1b]".to_vec();
+                                raw.append(&mut self.buf);
+                                out.push(Chunk::Pass(Cow::Owned(raw)));
+                            }
                             self.state = State::Ground;
                             i += off;
                         }
@@ -459,7 +471,15 @@ impl StreamFilter {
                             i = input.len();
                         }
                     }
-                    if self.state == State::Osc && self.buf.len() > MAX_OSC {
+                    if self.state == State::Osc
+                        && self.buf.starts_with(b"7577;")
+                        && self.buf.len() > MAX_OSC_7577
+                    {
+                        // OSC 7577 longer than our parser holds: discard without emitting or
+                        // forwarding so the daemon ignores it (and clients never see it).
+                        self.buf = Vec::new();
+                        self.state = State::Discard;
+                    } else if self.state == State::Osc && self.buf.len() > MAX_OSC {
                         // Give up intercepting: replay what we have and pass the rest through.
                         let mut raw = b"\x1b]".to_vec();
                         raw.append(&mut self.buf);
@@ -475,17 +495,29 @@ impl StreamFilter {
                         i += 1;
                         pass_start = i;
                     } else {
-                        // ESC aborted the OSC: replay it raw and reprocess ESC + b.
-                        let mut raw = b"\x1b]".to_vec();
-                        raw.append(&mut self.buf);
-                        out.push(Chunk::Pass(Cow::Owned(raw)));
-                        out.push(Chunk::Pass(Cow::Owned(vec![0x1b])));
-                        self.state = State::Ground;
-                        pass_start = i;
-                        if b == b']' || b == b'_' {
-                            // Pop the ESC we just emitted and treat this as a new sequence.
-                            out.pop();
-                            self.state = State::Esc;
+                        // ESC aborted the OSC: replay it raw and reprocess ESC + b
+                        // (except OSC 7577, which stays daemon-only and is dropped).
+                        if osc_number(&self.buf) == Some(7577) {
+                            self.buf.clear();
+                            self.state = State::Ground;
+                            pass_start = i;
+                            if b == b']' || b == b'_' {
+                                self.state = State::Esc;
+                            } else {
+                                out.push(Chunk::Pass(Cow::Owned(vec![0x1b])));
+                            }
+                        } else {
+                            let mut raw = b"\x1b]".to_vec();
+                            raw.append(&mut self.buf);
+                            out.push(Chunk::Pass(Cow::Owned(raw)));
+                            out.push(Chunk::Pass(Cow::Owned(vec![0x1b])));
+                            self.state = State::Ground;
+                            pass_start = i;
+                            if b == b']' || b == b'_' {
+                                // Pop the ESC we just emitted and treat this as a new sequence.
+                                out.pop();
+                                self.state = State::Esc;
+                            }
                         }
                     }
                 }
@@ -732,7 +764,18 @@ impl StreamFilter {
         self.state = State::Ground;
         let body = std::mem::take(&mut self.buf);
         let num = osc_number(&body);
-        if num.is_some_and(|n| PRIVATE_OSC.contains(&n)) {
+        if num == Some(7577) {
+            if body.len() <= MAX_OSC_7577
+                && let Some(payload) = body.strip_prefix(b"7577;")
+            {
+                let term_len = if self.osc_bel { 1 } else { 2 };
+                let total_len = 2 + body.len() + term_len;
+                out.push(Chunk::ProgramResume {
+                    body: payload.to_vec(),
+                    total_len,
+                });
+            }
+        } else if num.is_some_and(|n| PRIVATE_OSC.contains(&n)) {
             let mut raw = Vec::with_capacity(body.len() + 4);
             raw.extend_from_slice(b"\x1b]");
             raw.extend_from_slice(&body);
@@ -945,6 +988,9 @@ mod tests {
                         Chunk::Apc(a) => seqs.push(Chunk::Apc(a)),
                         Chunk::Osc(o) => seqs.push(Chunk::Osc(o)),
                         Chunk::Private(o) => seqs.push(Chunk::Private(o)),
+                        Chunk::ProgramResume { body, total_len } => {
+                            seqs.push(Chunk::ProgramResume { body, total_len })
+                        }
                     }
                 }
             }
@@ -971,6 +1017,51 @@ mod tests {
                 Chunk::Private(b"\x1b]7501;?\x1b\\".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn program_resume_osc_is_daemon_only_and_bounded() {
+        let (pass, seqs) = run(b"a\x1b]7577;pid=1:time=2:clear=1:mac=aa\x07b\x1b]7577;?\x1b\\c");
+        assert_eq!(pass, b"abc");
+        assert_eq!(
+            seqs,
+            vec![
+                Chunk::ProgramResume {
+                    body: b"pid=1:time=2:clear=1:mac=aa".to_vec(),
+                    total_len: b"\x1b]7577;pid=1:time=2:clear=1:mac=aa\x07".len(),
+                },
+                Chunk::ProgramResume {
+                    body: b"?".to_vec(),
+                    total_len: b"\x1b]7577;?\x1b\\".len(),
+                },
+            ]
+        );
+        // Bare `OSC 7577` without semicolon is dropped without leaking.
+        let (pass, seqs) = run(b"a\x1b]7577\x07b");
+        assert_eq!(pass, b"ab");
+        assert!(seqs.is_empty());
+        // Aborted OSC 7577 is dropped (ignored) and does not leak bytes to clients.
+        let (pass, seqs) = run(b"a\x1b]7577;pid=1\x18b\x1b]7577;pid=2\x1b[1mc");
+        assert_eq!(pass, b"a\x18b\x1b[1mc");
+        assert!(seqs.is_empty());
+        // Oversized OSC 7577 (> MAX_OSC_7577) is discarded until its terminator and ignored.
+        let mut huge = b"a\x1b]7577;".to_vec();
+        huge.extend(std::iter::repeat_n(b'A', MAX_OSC_7577 + 128));
+        huge.extend_from_slice(b"\x1b\\b");
+        let mut f = StreamFilter::new();
+        let mut out = Vec::new();
+        f.feed(&huge, &mut out);
+        let mut pass = Vec::new();
+        let mut resumes = 0;
+        for c in out {
+            match c {
+                Chunk::Pass(b) => pass.extend_from_slice(&b),
+                Chunk::ProgramResume { .. } => resumes += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(pass, b"ab");
+        assert_eq!(resumes, 0);
     }
 
     #[test]

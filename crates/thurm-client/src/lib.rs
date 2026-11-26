@@ -805,6 +805,15 @@ impl Client {
                     .into(),
             ));
         }
+        if matches!(env.request, Request::ResumeRecords { .. })
+            && !matches!(&*self.hello.lock(), Some(Response::Hello { capabilities, .. })
+                if capabilities.iter().any(|c| c == thurm_proto::CAP_PROGRAM_RESUME))
+        {
+            return Err(ClientError::Daemon(
+                "this Thurm daemon does not support program resume yet; restart it with `thurm daemon upgrade`"
+                    .into(),
+            ));
+        }
         Ok(codec::encode(env)?)
     }
 

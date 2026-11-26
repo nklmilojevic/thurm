@@ -47,6 +47,36 @@ When `session.resume_agents = true`, restored panes can run configured agent
 resume commands. This starts an agent process again; it does not recover its
 previous process memory. Hooks can provide session IDs for a specific resume.
 
+## Program resume (OSC 7577)
+
+Thurm implements the [Program Resume Protocol](https://www.superlogical.com/rex/docs/build/program-resume)
+(`OSC 7577`), which lets a running program tell the terminal how to resume it after a
+daemon restart or reboot.
+
+Each pane gets a unique random `OSC7577_TOKEN` in its initial environment (omitted when
+running as `root`). Programs prove they belong to the pane by signing reports with a
+SHA-256 `mac` over the report body and token, together with their owning `pid` and Unix
+timestamp (`time`, verified within a 60-second window). On restore, Thurm runs the
+command directly with `execvp` inside the user's shell environment (after startup files
+run) without shell parsing, and never retries a resume that failed or crashed.
+
+By default (`session.resume_programs = "rules"`), Thurm only resumes commands that match
+a trust rule and whose owning process is not wrapped inside a sandbox or another
+non-shell program. Built-in rules (`session.resume_default_rules = true`) cover Claude
+Code, Codex, OpenCode, Pi, and Antigravity. Add your own rules in `config.toml`:
+
+```toml
+[[session.resume_rules]]
+name = "nvim"
+command = ["nvim", "-S", "<under:~/.local/state/nvim/sessions>"]
+dirs = ["~/code"]
+```
+
+To disable a built-in rule, add an entry with its `name` and `enabled = false`. Set
+`session.resume_programs = "all"` to trust any verified report from an unwrapped process,
+or `"off"` to disable OSC 7577 resumption. Inspect held records and their trust status
+with `thurm resume` (or `thurm resume --all --json`).
+
 ## Daemon controls
 
 ```sh

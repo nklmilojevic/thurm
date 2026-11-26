@@ -15,6 +15,9 @@ mod layouts;
 #[path = "e2e/program_status.rs"]
 mod program_status;
 
+#[path = "e2e/program_resume.rs"]
+mod program_resume;
+
 #[path = "e2e/mobile.rs"]
 mod mobile;
 

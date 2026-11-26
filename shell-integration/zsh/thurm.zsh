@@ -72,6 +72,15 @@ _thurm_precmd_last() {
     fi
     export PATH
   fi
+  if [[ -n "${_thurm_resume_file-}" && -n "${_thurm_resume_exec-}" ]]; then
+    local _rf="$_thurm_resume_file" _re="$_thurm_resume_exec"
+    _thurm_resume_file=""
+    _thurm_resume_exec=""
+    # Run common prompt environment hooks (direnv, mise) configured in .zshrc before resuming.
+    (( $+functions[_direnv_hook] )) && _direnv_hook
+    (( $+functions[_mise_hook] )) && _mise_hook
+    command "$_re" --exec-resume "$_rf"
+  fi
   _thurm_precmd
 }
 

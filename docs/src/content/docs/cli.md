@@ -89,6 +89,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `set KEY VALUE` | Write a setting and reload |
 | `theme [SPEC]` | List themes, or select a theme |
 | `save` | Write a session snapshot |
+| `resume` | Inspect OSC 7577 program resume records; `--pane ID`, `--all`; see [Sessions](/sessions/#program-resume-osc-7577) |
 | `layout [export\|apply]` | Print layout JSON, export a tab template, or apply a template; see [Layouts and events](/workflows/) |
 | `daemon ACTION` | Control the daemon; see [Sessions](/sessions/) |
 | `socket-path` | Print the daemon socket path |

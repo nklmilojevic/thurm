@@ -1,5 +1,13 @@
 # Thurm bash integration: OSC 133 prompt marks, OSC 7 working directory.
 #
+# Capture and remove one-shot program resume handoff variables before user startup files run
+# so subshells or multiplexers launched from startup files never inherit them.
+if [[ -n "${THURM_RESUME_FILE-}" && -n "${THURM_RESUME_EXEC-}" ]]; then
+  _thurm_resume_file="$THURM_RESUME_FILE"
+  _thurm_resume_exec="$THURM_RESUME_EXEC"
+  builtin unset THURM_RESUME_FILE THURM_RESUME_EXEC
+fi
+#
 # Bash is started as `bash --rcfile <this file> -i`. Emulate the usual startup files first.
 if [[ -n "${THURM_BASH_LOGIN-}" ]]; then
   builtin unset THURM_BASH_LOGIN
@@ -70,6 +78,12 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
     if [[ -n "$_thurm_token" && "$PATH" != "${_thurm_last_path-}" ]]; then
       builtin printf '\e]633;P;ThurmPath=%s:%s\a' "$_thurm_token" "${PATH//;/\\x3b}"
       _thurm_last_path=$PATH
+    fi
+    if [[ -n "${_thurm_resume_file-}" && -n "${_thurm_resume_exec-}" ]]; then
+      local _rf="$_thurm_resume_file" _re="$_thurm_resume_exec"
+      _thurm_resume_file=""
+      _thurm_resume_exec=""
+      command "$_re" --exec-resume "$_rf"
     fi
     builtin printf '\e]133;A\a'
     if [[ "$PS1" != *'133;B'* ]]; then

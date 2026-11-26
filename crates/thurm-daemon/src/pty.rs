@@ -24,6 +24,8 @@ pub struct Pty {
     master: File,
     pid: libc::pid_t,
     exited: Option<Option<i32>>,
+    /// Device number (`st_rdev`) of the PTY slave, for verifying controlling terminals.
+    slave_rdev: Option<u64>,
 }
 
 fn winsize(size: PaneSize) -> libc::winsize {
@@ -110,6 +112,8 @@ impl Pty {
         for var in STRIPPED_SSH_ENV {
             cmd.env_remove(var);
         }
+        // Never pass on a parent terminal's OSC 7577 token; each pane sets its own.
+        cmd.env_remove(thurm_proto::ENV_OSC7577_TOKEN);
         for (k, v) in &opts.env {
             cmd.env(k, v);
         }
@@ -151,6 +155,7 @@ impl Pty {
                 Ok(())
             });
         }
+        let slave_rdev = fd_rdev(slave.as_raw_fd());
         let child = cmd.spawn().map_err(|e| {
             io::Error::new(e.kind(), format!("failed to spawn {:?}: {e}", opts.program))
         })?;
@@ -159,25 +164,37 @@ impl Pty {
             master: File::from(master),
             pid: child.id() as libc::pid_t,
             exited: None,
+            slave_rdev,
         })
     }
 
     /// Takes over a PTY whose master fd and child survived an in-place upgrade (the child is
     /// still ours: exec keeps the pid). `exited` is the status already collected, if any.
-    pub fn adopt(fd: RawFd, pid: u32, exited: Option<Option<i32>>) -> io::Result<Pty> {
+    pub fn adopt(
+        fd: RawFd,
+        pid: u32,
+        exited: Option<Option<i32>>,
+        slave_rdev: Option<u64>,
+    ) -> io::Result<Pty> {
         if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
             return Err(io::Error::last_os_error());
         }
         set_cloexec(fd, true)?;
+        let slave_rdev = slave_rdev.or_else(|| master_slave_rdev(fd));
         Ok(Pty {
             master: unsafe { File::from_raw_fd(fd) },
             pid: pid as libc::pid_t,
             exited,
+            slave_rdev,
         })
     }
 
     pub fn pid(&self) -> u32 {
         self.pid as u32
+    }
+
+    pub fn slave_rdev(&self) -> Option<u64> {
+        self.slave_rdev
     }
 
     pub fn master_fd(&self) -> RawFd {
@@ -332,6 +349,48 @@ const READ_SPINS: u32 = 32;
 pub fn foreground_of(fd: &impl AsRawFd) -> Option<u32> {
     let pg = unsafe { libc::tcgetpgrp(fd.as_raw_fd()) };
     (pg > 0).then_some(pg as u32)
+}
+
+fn fd_rdev(fd: RawFd) -> Option<u64> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    Some(st.st_rdev as u64)
+}
+
+#[cfg(target_os = "macos")]
+fn master_slave_rdev(master_fd: RawFd) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut buf = [0 as libc::c_char; 128];
+    #[allow(clippy::useless_conversion)]
+    let rc = unsafe { libc::ioctl(master_fd, libc::TIOCPTYGNAME.into(), buf.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+        .to_str()
+        .ok()?;
+    std::fs::metadata(path).ok().map(|m| m.rdev())
+}
+
+#[cfg(target_os = "linux")]
+fn master_slave_rdev(master_fd: RawFd) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut buf = [0 as libc::c_char; 256];
+    let rc = unsafe { libc::ptsname_r(master_fd, buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+        .to_str()
+        .ok()?;
+    std::fs::metadata(path).ok().map(|m| m.rdev())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn master_slave_rdev(_master_fd: RawFd) -> Option<u64> {
+    None
 }
 
 /// Make the PTY master non-blocking, for [`read_pty`]. The flag belongs to the open file, so

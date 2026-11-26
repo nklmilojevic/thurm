@@ -107,6 +107,15 @@ pub struct PaneHandoff {
     /// The process group the program records were reported in (see `PaneState::programs_pgrp`).
     #[serde(default)]
     pub programs_pgrp: Option<u32>,
+    /// Device number (`st_rdev`) of the PTY slave.
+    #[serde(default)]
+    pub slave_rdev: Option<u64>,
+    /// Per-pane `OSC7577_TOKEN` (sealed inside the encrypted hand-off file).
+    #[serde(default)]
+    pub resume_token: Option<String>,
+    /// Accepted Program Resume Protocol (OSC 7577) state for this pane.
+    #[serde(default)]
+    pub resume_state: Option<crate::program_resume::ResumeHandoff>,
 }
 
 impl PaneHandoff {

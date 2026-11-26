@@ -33,6 +33,7 @@ use crate::agents::{self, AgentTracker, AiWant};
 use crate::ai;
 use crate::persist::{self, PaneSnapshot, SessionSnapshot, Store};
 use crate::procinfo;
+use crate::program_resume::{self, ProgramResumeState, ResumeExecSpec, TrustSubject, TrustVerdict};
 use crate::pty::{self, Pty};
 use crate::shell;
 use crate::upgrade;
@@ -542,6 +543,9 @@ pub struct PaneState {
     /// its end as text.
     forwarded_carry: Vec<u8>,
     pending_input: Option<(Instant, Vec<u8>)>,
+    /// Input sent strictly on the first `OSC 133;A` prompt mark (no fallback timer), used for
+    /// fish session resume so slow or interactive startup files are never interrupted.
+    pending_prompt_input: Option<Vec<u8>>,
     shell_integration_seen: bool,
     /// Last git probe: when, for which directory, and whether one is in flight.
     git_probe: Option<(Instant, String)>,
@@ -561,6 +565,8 @@ pub struct PaneState {
     programs_pgrp: Option<u32>,
     /// The foreground process group when the output being parsed was read (see `reader_loop`).
     output_pgrp: Option<u32>,
+    /// Program Resume Protocol (OSC 7577) token, records, and replay tracking.
+    resume: ProgramResumeState,
 }
 
 impl PaneState {
@@ -571,6 +577,19 @@ impl PaneState {
         state.extend_from_slice(&self.forwarded_carry);
         state
     }
+}
+
+/// How [`Daemon::create_pane_with_resume`] starts a restored pane with an OSC 7577 command.
+enum RestoreLaunch<'a> {
+    Normal,
+    /// Interactive shell (`zsh` / `bash`) with shell integration running `--exec-resume` at prompt.
+    Hook { exec: &'a Path, file: &'a Path },
+    /// Owning process was the PTY's first process: `exec thurmd --exec-resume <file>` via login shell.
+    FirstProcess {
+        exec: &'a Path,
+        file: &'a Path,
+        title: String,
+    },
 }
 
 /// What [`Daemon::install_pane`] needs: a new pane, or one handed over by the previous daemon.
@@ -588,6 +607,8 @@ struct InstallPane {
     forwarded_carry: Vec<u8>,
     /// The program records' group (see `PaneState::programs_pgrp`).
     programs_pgrp: Option<u32>,
+    /// Program Resume Protocol (OSC 7577) state for this pane.
+    resume: ProgramResumeState,
 }
 
 pub struct Daemon {
@@ -626,6 +647,7 @@ pub struct Daemon {
     save_lock: Mutex<()>,
     readers: ReaderGate,
     pub socket: PathBuf,
+    state_dir: PathBuf,
     integration_dir: Option<PathBuf>,
     session_dirty: AtomicBool,
     restored: AtomicBool,
@@ -665,6 +687,7 @@ impl Daemon {
             .map_err(|e| log::warn!("shell integration unavailable: {e}"))
             .ok();
         persist::remove_old_scrollback(&state_dir);
+        program_resume::prune_resume_files(&state_dir);
         let store = config
             .session
             .persist
@@ -703,6 +726,7 @@ impl Daemon {
             save_lock: Mutex::new(()),
             readers: ReaderGate::new().expect("reader gate pipe"),
             socket,
+            state_dir,
             integration_dir,
             session_dirty: AtomicBool::new(false),
             restored: AtomicBool::new(false),
@@ -1004,6 +1028,15 @@ impl Daemon {
         req: CreatePane,
         restore: Option<PaneId>,
     ) -> anyhow::Result<PaneId> {
+        self.create_pane_with_resume(req, restore, RestoreLaunch::Normal)
+    }
+
+    fn create_pane_with_resume(
+        self: &Arc<Self>,
+        req: CreatePane,
+        restore: Option<PaneId>,
+        resume_launch: RestoreLaunch<'_>,
+    ) -> anyhow::Result<PaneId> {
         let id = match restore {
             Some(id) => {
                 self.next_pane.fetch_max(id + 1, Ordering::Relaxed);
@@ -1032,9 +1065,25 @@ impl Daemon {
             ensure_hooks(command.as_deref());
         }
         let token = shell_token()?;
+        let resume_token = (!program_resume::is_root())
+            .then(program_resume::generate_token)
+            .transpose()?;
+        let (spawn_command, resume_hook, title_override) = match resume_launch {
+            RestoreLaunch::Normal => (command.clone(), None, None),
+            RestoreLaunch::Hook { exec, file } => (None, Some((exec, file)), None),
+            RestoreLaunch::FirstProcess { exec, file, title } => (
+                Some(vec![
+                    exec.display().to_string(),
+                    "--exec-resume".into(),
+                    file.display().to_string(),
+                ]),
+                None,
+                Some(title),
+            ),
+        };
         let opts = shell::spawn_options(shell::PaneLaunch {
             id,
-            command: command.clone(),
+            command: spawn_command,
             cwd: cwd.clone(),
             extra_env: req.env.clone(),
             size,
@@ -1042,6 +1091,8 @@ impl Daemon {
             socket: &self.socket,
             integration_dir: self.integration_dir.as_deref(),
             token: &token,
+            resume_token: resume_token.as_deref(),
+            resume_hook,
         });
         let mut term = Terminal::new(size, self.engine.read().clone());
         term.set_shell_token(Some(token));
@@ -1056,9 +1107,8 @@ impl Daemon {
         let pid = pty.pid();
         let info = PaneInfo {
             id,
-            title: command
-                .as_ref()
-                .and_then(|c| c.first().cloned())
+            title: title_override
+                .or_else(|| command.as_ref().and_then(|c| c.first().cloned()))
                 .unwrap_or_else(|| "shell".into()),
             cwd: cwd.clone(),
             pid: Some(pid),
@@ -1079,6 +1129,7 @@ impl Daemon {
                 carry: Vec::new(),
                 forwarded_carry: Vec::new(),
                 programs_pgrp: None,
+                resume: ProgramResumeState::with_token(resume_token),
             },
             true,
         )?;
@@ -1124,6 +1175,7 @@ impl Daemon {
                 carry: p.carry,
                 forwarded_carry: p.forwarded_carry,
                 pending_input: None,
+                pending_prompt_input: None,
                 shell_integration_seen: p.shell_integration_seen,
                 git_probe: None,
                 git_pending: false,
@@ -1134,6 +1186,7 @@ impl Daemon {
                 command_check: None,
                 programs_pgrp: p.programs_pgrp,
                 output_pgrp: None,
+                resume: p.resume,
             }),
         });
         self.panes.lock().insert(id, pane.clone());
@@ -1419,6 +1472,7 @@ impl Daemon {
         }
         let cfg = self.config.read().notifications.clone();
         let mut info_changed = false;
+        let mut resume_changed = false;
         let mut outgoing = Vec::new();
         {
             let mut st = pane.state.lock();
@@ -1482,6 +1536,9 @@ impl Daemon {
                             info_changed = true;
                         }
                         if let Some((_, input)) = st.pending_input.take() {
+                            pane.write(input);
+                        }
+                        if let Some(input) = st.pending_prompt_input.take() {
                             pane.write(input);
                         }
                     }
@@ -1550,6 +1607,20 @@ impl Daemon {
                         outgoing.extend(self.sync_programs(pane.id, &mut st, records));
                         info_changed = true;
                     }
+                    TermEvent::ProgramResume { body, total_len } => {
+                        let pane_pid = st.pty.pid();
+                        let slave_rdev = st.pty.slave_rdev();
+                        let has_explicit_cmd = st.command.is_some();
+                        if st.resume.handle_report(
+                            &body,
+                            total_len,
+                            pane_pid,
+                            slave_rdev,
+                            has_explicit_cmd,
+                        ) {
+                            resume_changed = true;
+                        }
+                    }
                     // Subscribers run their own copy of the terminal and free images there.
                     TermEvent::ImageFreed(_) => {}
                 }
@@ -1560,6 +1631,11 @@ impl Daemon {
             for ev in outgoing {
                 self.broadcast(ev, true);
             }
+        }
+        if resume_changed {
+            // Spec SHOULD: save each resume record and each removal when it happens.
+            self.session_dirty.store(true, Ordering::Relaxed);
+            let _ = self.save_session();
         }
     }
 
@@ -1668,7 +1744,10 @@ impl Daemon {
         let mut st = pane.state.lock();
         st.closed = true;
         st.pty.hangup();
+        drop(st);
         self.broadcast(Event::PaneClosed { pane: id }, false);
+        // Spec SHOULD: discard a record when the user closes the terminal on purpose.
+        let _ = self.save_session();
         true
     }
 
@@ -1938,6 +2017,9 @@ impl Daemon {
             };
             let defs = self.agent_defs.read().clone();
             let program_defs = self.program_defs.read().clone();
+            let mut resume_expired = false;
+            let resume_now_ms = program_resume::now_ms();
+            let daemon_stopping = self.stopping.load(Ordering::Relaxed);
             for pane in self.all_panes() {
                 let mut events = Vec::new();
                 {
@@ -1966,6 +2048,9 @@ impl Daemon {
                     let before = st.info.clone();
                     if st.agent.invalidate_dead_report_owner() {
                         st.info.agent = st.agent.state().cloned();
+                    }
+                    if !daemon_stopping && st.resume.poll_liveness(resume_now_ms) {
+                        resume_expired = true;
                     }
                     let fg = st.pty.foreground_pgrp().and_then(procinfo::process_info);
                     st.info.password_input = st.pty.password_mode();
@@ -2106,8 +2191,9 @@ impl Daemon {
                 }
             }
             if self.store.is_some()
-                && (self.session_dirty.load(Ordering::Relaxed)
-                    && last_save.elapsed() > Duration::from_secs(1)
+                && (resume_expired
+                    || self.session_dirty.load(Ordering::Relaxed)
+                        && last_save.elapsed() > Duration::from_secs(1)
                     || last_save.elapsed() > interval)
             {
                 let _ = self.save_session();
@@ -2156,11 +2242,18 @@ impl Daemon {
             }
         }
         saving.sort_by_key(|p| p.id);
+        let (resume_mode, resume_rules) = {
+            let cfg = self.config.read();
+            (cfg.session.resume_programs, cfg.resume_rules())
+        };
         for pane in saving {
             let st = pane.state.lock();
             if !st.info.alive && !teardown.iter().any(|p| p.id == pane.id) {
                 continue;
             }
+            let program_resume =
+                st.resume
+                    .chosen_for_save(st.pty.foreground_pgrp(), resume_mode, &resume_rules);
             panes.push(PaneSnapshot {
                 id: pane.id,
                 cwd: st.info.cwd.clone(),
@@ -2173,6 +2266,7 @@ impl Daemon {
                     .and(st.agent.session_id())
                     .map(str::to_owned),
                 agent_resume: st.agent.resume_argv().map(<[String]>::to_vec),
+                program_resume,
                 size: st.info.size.into(),
             });
         }
@@ -2261,6 +2355,9 @@ impl Daemon {
                 terminal_size_after_detach: st.terminal_attachment.map(|(_, size)| size.into()),
                 programs: st.term.program_status_handoff(),
                 programs_pgrp: st.programs_pgrp,
+                slave_rdev: st.pty.slave_rdev(),
+                resume_token: st.resume.token().map(str::to_owned),
+                resume_state: Some(st.resume.handoff()),
             });
         }
         upgrade::Handoff {
@@ -2297,7 +2394,7 @@ impl Daemon {
         let mut adopted = 0;
         for p in h.panes {
             let mut size = sanitize_size(p.size.into());
-            let pty = match Pty::adopt(p.fd, p.pid, p.exited) {
+            let pty = match Pty::adopt(p.fd, p.pid, p.exited, p.slave_rdev) {
                 Ok(pty) => pty,
                 Err(e) => {
                     log::warn!("pane {}: cannot adopt fd {}: {e}", p.id, p.fd);
@@ -2336,6 +2433,10 @@ impl Daemon {
                 ..Default::default()
             };
             self.next_pane.fetch_max(p.id + 1, Ordering::Relaxed);
+            let mut resume = ProgramResumeState::with_token(p.resume_token.clone());
+            if let Some(rs) = p.resume_state {
+                resume.restore_handoff(rs);
+            }
             let installed = self.install_pane(
                 InstallPane {
                     term,
@@ -2349,6 +2450,7 @@ impl Daemon {
                     carry: pending,
                     forwarded_carry,
                     programs_pgrp: p.programs_pgrp,
+                    resume,
                 },
                 alive,
             );
@@ -2387,11 +2489,247 @@ impl Daemon {
     /// Recreate panes from the last snapshot (after a reboot or daemon restart).
     pub fn restore_session(self: &Arc<Self>) {
         let Some(store) = &self.store else { return };
-        let Some(snap) = store.load() else { return };
+        let Some(mut snap) = store.load() else { return };
         let cfg = self.config.read().clone();
         let defs = cfg.agent_defs();
+        let resume_rules = cfg.resume_rules();
+        let my_uid = unsafe { libc::geteuid() };
+        let (shell_prog, _) = shell::interactive_shell(&cfg);
+        let thurmd_exe = std::env::current_exe().ok();
+
+        struct PlannedResume {
+            spec: ResumeExecSpec,
+            cwd: Option<String>,
+            first_process: bool,
+            program_label: String,
+            rule: Option<String>,
+        }
+
+        // First pass: validate every saved OSC 7577 record against current config, UID, canonical
+        // paths, directory existence, and shell support; mark accepted ones `attempted = true` on
+        // disk BEFORE spawning so a crash or failed command never retries.
+        let mut plans: Vec<Option<PlannedResume>> = Vec::with_capacity(snap.panes.len());
+        let mut marked_attempted = false;
+        for p in &mut snap.panes {
+            let Some(rec) = p.program_resume.as_mut() else {
+                plans.push(None);
+                continue;
+            };
+            let prog = rec
+                .argv
+                .first()
+                .map(|a| program_resume::escape_display(a))
+                .unwrap_or_default();
+            if rec.attempted {
+                log::info!(
+                    "pane {}: not resuming saved program {prog}, starting a shell (reason=already_tried)",
+                    p.id
+                );
+                plans.push(None);
+                continue;
+            }
+            if program_resume::is_root() || cfg.session.resume_programs == thurm_config::ResumeProgramsMode::Off {
+                log::info!(
+                    "pane {}: not resuming saved program {prog}, starting a shell (reason=program_resume_off)",
+                    p.id
+                );
+                plans.push(None);
+                continue;
+            }
+            if rec.uid != my_uid {
+                log::warn!(
+                    "pane {}: discarding saved program {prog} (reason=uid_mismatch)",
+                    p.id
+                );
+                p.program_resume = None;
+                marked_attempted = true;
+                plans.push(None);
+                continue;
+            }
+            let trust = program_resume::evaluate_trust(
+                &TrustSubject {
+                    argv: &rec.argv,
+                    cwd: rec.cwd.as_deref(),
+                    process_name: &rec.process_name,
+                    process_exe: &rec.process_exe,
+                    process_argv: &rec.process_argv,
+                    wrapped: rec.wrapped,
+                },
+                cfg.session.resume_programs,
+                &resume_rules,
+                true,
+            );
+            let rule = match trust {
+                TrustVerdict::Trusted { rule } => rule,
+                TrustVerdict::Untrusted(reason) => {
+                    log::info!(
+                        "pane {}: not resuming saved program {prog}, starting a shell (reason=not_trusted trust_reason={reason})",
+                        p.id
+                    );
+                    plans.push(None);
+                    continue;
+                }
+            };
+            // Working directory resolution per spec: if `cwd` came from the report's `cwd` key and
+            // no longer exists, DO NOT resume. For other sources, fall back to a new shell's cwd.
+            let resolved_cwd = if rec.cwd_from_report {
+                match &rec.cwd {
+                    Some(dir) if Path::new(dir).is_dir() => Some(dir.clone()),
+                    _ => {
+                        log::info!(
+                            "pane {}: not resuming saved program {prog}, starting a shell (reason=dir_gone)",
+                            p.id
+                        );
+                        plans.push(None);
+                        continue;
+                    }
+                }
+            } else {
+                rec.cwd
+                    .as_ref()
+                    .filter(|d| Path::new(d).is_dir())
+                    .cloned()
+                    .or_else(|| p.cwd.clone())
+            };
+            if !rec.first_process && !program_resume::shell_supports_job_resume(&shell_prog) {
+                log::info!(
+                    "pane {}: not resuming saved program {prog}, starting a shell (reason=shell_unsupported)",
+                    p.id
+                );
+                plans.push(None);
+                continue;
+            }
+            if thurmd_exe.is_none() {
+                log::warn!(
+                    "pane {}: not resuming saved program {prog} (cannot locate thurmd binary)",
+                    p.id
+                );
+                plans.push(None);
+                continue;
+            }
+            rec.attempted = true;
+            marked_attempted = true;
+            let title = rec
+                .argv
+                .first()
+                .map(|a| program_resume::escape_display(a.rsplit('/').next().unwrap_or(a)))
+                .unwrap_or_else(|| "shell".into());
+            plans.push(Some(PlannedResume {
+                spec: ResumeExecSpec {
+                    argv: rec.argv.clone(),
+                    cwd: if rec.cwd_from_report {
+                        resolved_cwd.clone()
+                    } else {
+                        None
+                    },
+                    require_cwd: rec.cwd_from_report,
+                },
+                cwd: resolved_cwd,
+                first_process: rec.first_process,
+                program_label: title,
+                rule,
+            }));
+        }
+        if marked_attempted {
+            let _ = store.save(&snap);
+        }
+
+        let use_hook = shell::uses_hook_resume(&cfg, self.integration_dir.as_deref());
+        let is_fish = shell::is_fish_with_integration(&cfg, self.integration_dir.as_deref());
         let mut restored = 0;
-        for p in &snap.panes {
+        for (p, plan) in snap.panes.iter().zip(plans) {
+            if let Some(plan) = plan {
+                let exe = thurmd_exe.as_ref().expect("checked above");
+                match program_resume::write_resume_file(&self.state_dir, &plan.spec) {
+                    Ok(file) => {
+                        let req = CreatePane {
+                            command: if plan.first_process {
+                                p.command.clone()
+                            } else {
+                                None
+                            },
+                            cwd: plan.cwd.clone(),
+                            size: p.size.into(),
+                            ..Default::default()
+                        };
+                        let launch = if plan.first_process {
+                            RestoreLaunch::FirstProcess {
+                                exec: exe,
+                                file: &file,
+                                title: plan.program_label.clone(),
+                            }
+                        } else if use_hook {
+                            RestoreLaunch::Hook {
+                                exec: exe,
+                                file: &file,
+                            }
+                        } else {
+                            RestoreLaunch::Normal
+                        };
+                        match self.create_pane_with_resume(req, Some(p.id), launch) {
+                            Ok(id) => {
+                                restored += 1;
+                                log::info!(
+                                    "pane {id}: resuming saved program {} (rule={})",
+                                    plan.program_label,
+                                    plan.rule.as_deref().unwrap_or("all")
+                                );
+                                if !plan.first_process && !use_hook {
+                                    // Leading space avoids shell history in fish/zsh/bash when
+                                    // configured; only fixed paths are quoted, never `argv`.
+                                    let line = format!(
+                                        " {} --exec-resume {}\r",
+                                        shell::shell_quote(&exe.display().to_string()),
+                                        shell::shell_quote(&file.display().to_string()),
+                                    )
+                                    .into_bytes();
+                                    if let Some(pane) = self.pane(id) {
+                                        let mut st = pane.state.lock();
+                                        if is_fish {
+                                            st.pending_prompt_input = Some(line);
+                                        } else {
+                                            st.pending_input = Some((
+                                                Instant::now() + Duration::from_millis(2500),
+                                                line,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = std::fs::remove_file(&file);
+                                log::warn!("failed to restore pane {}: {e}", p.id);
+                            }
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "pane {}: failed to write resume file for {}: {e}",
+                            p.id,
+                            plan.program_label
+                        );
+                    }
+                }
+            }
+
+            // If an OSC 7577 record existed for this pane but was not resumed (untrusted,
+            // dir_gone, already_tried, off, shell_unsupported), restore as a plain shell in
+            // the pane's saved cwd rather than falling back to `p.command` or `agent_resume`.
+            if p.program_resume.is_some() {
+                let req = CreatePane {
+                    command: None,
+                    cwd: p.cwd.clone(),
+                    size: p.size.into(),
+                    ..Default::default()
+                };
+                match self.create_pane(req, Some(p.id)) {
+                    Ok(_) => restored += 1,
+                    Err(e) => log::warn!("failed to restore pane {}: {e}", p.id),
+                }
+                continue;
+            }
+
             let reported_resume = p.agent_resume.as_ref().filter(|argv| {
                 cfg.session.resume_agents
                     && p.agent_session.is_some()
@@ -3729,6 +4067,27 @@ impl Daemon {
             Request::DaemonId => thurm_config::daemon_id()
                 .map(Response::Text)
                 .map_err(|e| format!("the daemon's identifier: {e}")),
+            Request::ResumeRecords { pane } => {
+                let (mode, rules) = {
+                    let cfg = self.config.read();
+                    (cfg.session.resume_programs, cfg.resume_rules())
+                };
+                let targets: Vec<Arc<Pane>> = match pane {
+                    Some(id) => vec![self.pane(id).ok_or_else(|| format!("unknown pane {id}"))?],
+                    None => self.all_panes(),
+                };
+                let list = targets
+                    .into_iter()
+                    .map(|p| {
+                        let st = p.state.lock();
+                        thurm_proto::PaneResumeRecords {
+                            pane: p.id,
+                            records: st.resume.inspect(st.pty.foreground_pgrp(), mode, &rules),
+                        }
+                    })
+                    .collect();
+                Ok(Response::ResumeRecords(list))
+            }
         }
     }
 
@@ -3911,10 +4270,16 @@ impl Daemon {
     }
 
     pub fn apply_config(&self, cfg: Config) {
-        if cfg.ai != self.config.read().ai {
-            // Turned off, or on again: ask the model afresh (it may have become available).
-            self.ai.stop();
-        }
+        let resume_changed = {
+            let prev = self.config.read();
+            if cfg.ai != prev.ai {
+                // Turned off, or on again: ask the model afresh (it may have become available).
+                self.ai.stop();
+            }
+            cfg.session.resume_programs != prev.session.resume_programs
+                || cfg.session.resume_default_rules != prev.session.resume_default_rules
+                || cfg.session.resume_rules != prev.session.resume_rules
+        };
         *self.engine.write() = EngineConfig::from_config(&cfg, self.dark.load(Ordering::Relaxed));
         *self.agent_defs.write() = cfg.agent_defs();
         *self.program_defs.write() = cfg.program_defs();
@@ -3929,6 +4294,10 @@ impl Daemon {
             st.term.set_config(engine.clone());
             st.agent.titles = session_titles;
             drop(st);
+        }
+        if resume_changed {
+            self.session_dirty.store(true, Ordering::Relaxed);
+            let _ = self.save_session();
         }
         self.broadcast(Event::ConfigReloaded, false);
     }

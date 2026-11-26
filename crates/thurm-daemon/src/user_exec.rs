@@ -266,6 +266,7 @@ fn command(launch: &Launch) -> Command {
         .join(" ");
     let mut cmd = Command::new(shell::user_shell());
     cmd.args(["-l", "-c", &line]);
+    cmd.env_remove(thurm_proto::ENV_OSC7577_TOKEN);
     let cwd = launch
         .cwd
         .map(thurm_config::expand_home)

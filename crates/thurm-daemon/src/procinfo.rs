@@ -1207,6 +1207,162 @@ pub fn process_birth(pid: u32) -> Option<u64> {
 /// (`atuin pty-proxy`, `script`).
 const PTY_PROXIES: &[&str] = &["atuin", "script"];
 
+/// Whether `name` is one of the known PTY proxy executables.
+pub fn is_pty_proxy(name: &str) -> bool {
+    PTY_PROXIES.contains(&name)
+}
+
+/// Real and effective user IDs of `pid`.
+#[cfg(target_os = "linux")]
+pub fn process_uids(pid: u32) -> Option<(u32, u32)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            let mut parts = rest.split_whitespace();
+            let ruid = parts.next()?.parse().ok()?;
+            let euid = parts.next()?.parse().ok()?;
+            return Some((ruid, euid));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_uids(pid: u32) -> Option<(u32, u32)> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (n == size).then_some((info.pbi_ruid, info.pbi_uid))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_uids(_pid: u32) -> Option<(u32, u32)> {
+    None
+}
+
+/// Full resolved path to `pid`'s executable.
+#[cfg(target_os = "linux")]
+pub fn exe_path(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn exe_path(pid: u32) -> Option<std::path::PathBuf> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let n = unsafe { libc::proc_pidpath(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    use std::os::unix::ffi::OsStringExt;
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn exe_path(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Controlling terminal device number (`rdev`) of `pid`, if it has one.
+pub fn controlling_tty(pid: u32) -> Option<u64> {
+    job(pid).and_then(|j| j.tty)
+}
+
+/// Whether `pid` shares the same root directory as `reference_pid` (or the daemon itself when
+/// `reference_pid`'s root cannot be inspected, e.g. setuid `login(1)` on macOS).
+#[cfg(target_os = "linux")]
+pub fn same_root(pid: u32, reference_pid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m1) = std::fs::metadata(format!("/proc/{pid}/root")) else {
+        return false;
+    };
+    let m2 = std::fs::metadata(format!("/proc/{reference_pid}/root"))
+        .or_else(|_| std::fs::metadata("/proc/self/root"));
+    match m2 {
+        Ok(m2) => m1.dev() == m2.dev() && m1.ino() == m2.ino(),
+        Err(_) => true,
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn same_root(pid: u32, reference_pid: u32) -> bool {
+    fn root_dir(p: u32) -> Option<String> {
+        let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+        let n = unsafe {
+            libc::proc_pidinfo(
+                p as i32,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+                size,
+            )
+        };
+        if n != size {
+            return None;
+        }
+        let bytes: Vec<u8> = info
+            .pvi_rdir
+            .vip_path
+            .iter()
+            .flatten()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+    let Some(r1) = root_dir(pid) else {
+        return false;
+    };
+    let r2 = root_dir(reference_pid).or_else(|| root_dir(std::process::id()));
+    match r2 {
+        Some(r2) => r1 == r2,
+        None => r1.is_empty() || r1 == "/",
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn same_root(_pid: u32, _reference_pid: u32) -> bool {
+    true
+}
+
+/// Walks parent pointers from `pid` up toward `stop_at` (at most 64 hops).
+/// Returns `(ancestors, reached_stop_at)` where `ancestors` starts with `pid`'s parent and
+/// includes `stop_at` when reached (`ancestors` is empty and `reached_stop_at` is `true`
+/// when `pid == stop_at`).
+pub fn ancestors(pid: u32, stop_at: u32) -> (Vec<u32>, bool) {
+    if pid == stop_at {
+        return (Vec::new(), true);
+    }
+    let mut chain = Vec::new();
+    let mut cur = pid;
+    for _ in 0..64 {
+        let Some(ppid) = parent(cur) else {
+            return (chain, false);
+        };
+        if ppid == 0 || ppid == cur || chain.contains(&ppid) {
+            return (chain, false);
+        }
+        chain.push(ppid);
+        if ppid == stop_at {
+            return (chain, true);
+        }
+        if ppid == 1 {
+            return (chain, false);
+        }
+        cur = ppid;
+    }
+    (chain, false)
+}
+
 /// The foreground group of the pane's terminal (`pgrp`), seen through PTY proxies. While a
 /// proxy runs, its shell and everything that shell starts are on the proxy's terminal, and
 /// the pane's shows the proxy's group in front (login(1) and `atuin pty-proxy` under it). So

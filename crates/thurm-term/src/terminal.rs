@@ -137,6 +137,8 @@ pub enum TermEvent {
     Progress(Option<proto::Progress>),
     /// The program status records (OSC 7501) changed; these are all of them now.
     ProgramStatus(Vec<proto::ProgramRecord>),
+    /// A Program Resume Protocol (OSC 7577) report received whole (daemon-only).
+    ProgramResume { body: Vec<u8>, total_len: usize },
     ImageFreed(u32),
 }
 
@@ -747,6 +749,10 @@ impl Terminal {
                 Chunk::Private(b) => {
                     self.vt.write(&b);
                     self.collect_events();
+                }
+                Chunk::ProgramResume { body, total_len } => {
+                    self.events
+                        .push(TermEvent::ProgramResume { body, total_len });
                 }
                 Chunk::Osc(body) => {
                     self.handle_osc(&body);

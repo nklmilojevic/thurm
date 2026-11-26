@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use thurm_config::{Config, Osc52Mode};
-use thurm_proto::{ENV_CLIP_SHIMS, ENV_PANE_ID, ENV_SOCKET, PaneId, PaneSize};
+use thurm_proto::{ENV_CLIP_SHIMS, ENV_OSC7577_TOKEN, ENV_PANE_ID, ENV_SOCKET, PaneId, PaneSize};
 
 use crate::pty::SpawnOptions;
 
@@ -82,6 +82,39 @@ pub struct PaneLaunch<'a> {
     pub integration_dir: Option<&'a Path>,
     /// Passed to the shell integration, which puts it in front of its `$PATH` reports.
     pub token: &'a str,
+    /// Per-pane random token for the Program Resume Protocol (`OSC7577_TOKEN`), if enabled.
+    pub resume_token: Option<&'a str>,
+    /// One-shot `(thurmd_exe, resume_file)` for zsh/bash integration to run at first prompt.
+    pub resume_hook: Option<(&'a Path, &'a Path)>,
+}
+
+/// The shell program and args configured for interactive panes (with login shell fallback).
+pub fn interactive_shell(cfg: &Config) -> (String, Vec<String>) {
+    match &cfg.terminal.shell {
+        Some(v) if !v.is_empty() => (v[0].clone(), v[1..].to_vec()),
+        _ => (user_shell(), Vec::new()),
+    }
+}
+
+/// Whether `cfg` launches zsh or bash with Thurm's shell integration active, so a restored
+/// foreground job can run directly from the shell's first-prompt hook (no echo, no history,
+/// full startup-file waiting).
+pub fn uses_hook_resume(cfg: &Config, integration_dir: Option<&Path>) -> bool {
+    if !cfg.terminal.shell_integration || integration_dir.is_none() {
+        return false;
+    }
+    let (program, args) = interactive_shell(cfg);
+    let name = program.rsplit('/').next().unwrap_or(&program);
+    name == "zsh" || (name == "bash" && args.is_empty())
+}
+
+/// Whether `cfg` launches fish with Thurm's shell integration active.
+pub fn is_fish_with_integration(cfg: &Config, integration_dir: Option<&Path>) -> bool {
+    if !cfg.terminal.shell_integration || integration_dir.is_none() {
+        return false;
+    }
+    let (program, _) = interactive_shell(cfg);
+    program.rsplit('/').next().unwrap_or(&program) == "fish"
 }
 
 /// Ghostty release matching the pinned libghostty-vt (1.3.2-dev).
@@ -152,6 +185,12 @@ fn spawn_options_with(
         env.push((k.clone(), v.clone()));
     }
     env.extend(l.extra_env);
+    // OSC 7577 token is set after `[terminal.env]` and client `extra_env` so config/clients
+    // can never override or share a pane's per-terminal secret token.
+    env.retain(|(k, _)| k != ENV_OSC7577_TOKEN);
+    if let Some(tok) = l.resume_token {
+        env.push((ENV_OSC7577_TOKEN.into(), tok.to_owned()));
+    }
     // Last: on the PATH and display the pane ends up with, `[terminal.env]` and the client's
     // variables included.
     let shims = add_clip_shims(&mut env, shims, inherited);
@@ -196,12 +235,20 @@ fn spawn_options_with(
         env.push(("THURM_SHELL_TOKEN".into(), l.token.to_owned()));
         match name.as_str() {
             "zsh" => {
+                if let Some((exec, file)) = l.resume_hook {
+                    env.push(("THURM_RESUME_EXEC".into(), exec.display().to_string()));
+                    env.push(("THURM_RESUME_FILE".into(), file.display().to_string()));
+                }
                 if let Ok(orig) = std::env::var("ZDOTDIR") {
                     env.push(("THURM_ORIG_ZDOTDIR".into(), orig));
                 }
                 env.push(("ZDOTDIR".into(), dir.join("zsh").display().to_string()));
             }
             "bash" if args.is_empty() => {
+                if let Some((exec, file)) = l.resume_hook {
+                    env.push(("THURM_RESUME_EXEC".into(), exec.display().to_string()));
+                    env.push(("THURM_RESUME_FILE".into(), file.display().to_string()));
+                }
                 // bash ignores --rcfile for login shells; our rcfile emulates login startup.
                 if login {
                     env.push(("THURM_BASH_LOGIN".into(), "1".into()));
@@ -382,6 +429,8 @@ mod tests {
             socket: &sock,
             integration_dir: Some(&integ),
             token: "abc",
+            resume_token: Some("tok123"),
+            resume_hook: None,
         });
         assert_eq!(opts.program, "/bin/bash");
         assert!(
@@ -410,6 +459,8 @@ mod tests {
             socket: &sock,
             integration_dir: None,
             token: "",
+            resume_token: None,
+            resume_hook: None,
         })
         .env
     }
@@ -484,6 +535,8 @@ mod tests {
                 socket: &sock,
                 integration_dir: None,
                 token: "",
+                resume_token: None,
+                resume_hook: None,
             },
             Some(PathBuf::from("/s")),
             |k| {

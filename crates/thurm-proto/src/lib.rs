@@ -89,6 +89,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAP_CLIP_QUERY,
     CAP_COPY,
     CAP_DAEMON_ID,
+    CAP_PROGRAM_RESUME,
 ];
 
 /// The daemon accepts `SearchPaths` and returns `PathMatches` only for that request.
@@ -123,6 +124,10 @@ pub const CAP_COPY: &str = "copy";
 /// The daemon answers [`Request::DaemonId`]: an identifier it keeps across restarts, so a client
 /// can tell that two addresses reach the same daemon.
 pub const CAP_DAEMON_ID: &str = "daemon-id";
+
+/// The daemon supports the Program Resume Protocol (OSC 7577) and answers
+/// [`Request::ResumeRecords`].
+pub const CAP_PROGRAM_RESUME: &str = "program-resume";
 
 /// How a [`Request::DownloadBegin`] error for a path with nothing at it ends, so a client can
 /// tell "not there" from every other failure.
@@ -224,6 +229,8 @@ pub const ENV_CLIP_SHIMS: &str = "THURM_CLIP_SHIMS";
 pub const ENV_PANE_ID: &str = "THURM_PANE_ID";
 /// Environment variable exported into every pane with the daemon socket path.
 pub const ENV_SOCKET: &str = "THURM_SOCKET";
+/// Per-pane random token exported into every pane for the Program Resume Protocol (OSC 7577).
+pub const ENV_OSC7577_TOKEN: &str = "OSC7577_TOKEN";
 
 pub type PaneId = u64;
 pub type ImageId = u32;
@@ -666,6 +673,11 @@ pub enum Request {
     /// The daemon's identifier ([`Response::Text`]), the same across its restarts and
     /// upgrades. Requires [`CAP_DAEMON_ID`].
     DaemonId,
+    /// Program Resume Protocol (OSC 7577) records held for `pane`, or every pane when `None`.
+    /// Answers [`Response::ResumeRecords`]. Requires [`CAP_PROGRAM_RESUME`].
+    ResumeRecords {
+        pane: Option<PaneId>,
+    },
 }
 
 /// The most files a batch of [`Request::UploadBegin`] holds (its `count`).
@@ -842,6 +854,35 @@ pub enum Response {
         expires_ms: u32,
         path: String,
     },
+    /// Program Resume Protocol (OSC 7577) records for one or more panes.
+    ResumeRecords(Vec<PaneResumeRecords>),
+}
+
+/// Program Resume Protocol (OSC 7577) records currently held for one pane.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PaneResumeRecords {
+    pub pane: PaneId,
+    pub records: Vec<ResumeRecordInfo>,
+}
+
+/// One accepted OSC 7577 resume record, with its current trust evaluation.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ResumeRecordInfo {
+    pub pid: u32,
+    pub process_name: String,
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    pub cwd_from_report: bool,
+    pub first_process: bool,
+    pub reported_at: u64,
+    /// Whether this is the record a restart would select for this pane.
+    pub chosen: bool,
+    /// Whether current trust rules allow resuming this record.
+    pub trusted: bool,
+    /// Name of the matching rule, when trusted under `"rules"` mode.
+    pub rule: Option<String>,
+    /// Why this record is not currently trusted (e.g. `no_rule`, `wrapped`, `dir_not_allowed`).
+    pub untrusted_reason: Option<String>,
 }
 
 /// A pane that had keyboard focus in a UI (the Mac app, the iOS app).

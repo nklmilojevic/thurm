@@ -14,6 +14,7 @@ mod path_search;
 mod persist;
 mod ports;
 mod procinfo;
+mod program_resume;
 mod pty;
 mod push;
 mod server;
@@ -69,6 +70,13 @@ fn parse_args() -> Args {
             "--handoff-check" => {
                 upgrade::print_check();
                 std::process::exit(0);
+            }
+            "--exec-resume" => {
+                let Some(path) = it.next() else {
+                    eprintln!("thurmd: --exec-resume requires a path");
+                    std::process::exit(2);
+                };
+                program_resume::exec_resume_file(Path::new(&path));
             }
             "--socket" => args.socket = it.next().map(PathBuf::from),
             "--no-restore" => args.no_restore = true,

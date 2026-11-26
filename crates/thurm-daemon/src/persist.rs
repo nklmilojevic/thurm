@@ -37,7 +37,43 @@ pub struct PaneSnapshot {
     /// Exact executable and arguments supplied by the session owner.
     #[serde(default)]
     pub agent_resume: Option<Vec<String>>,
+    /// Program Resume Protocol (OSC 7577) record chosen for this pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_resume: Option<SavedProgramResume>,
     pub size: PaneSizeSnap,
+}
+
+/// Persisted OSC 7577 program resume record for one pane.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SavedProgramResume {
+    /// Reported command arguments (`argv[0]` + args).
+    pub argv: Vec<String>,
+    /// Working directory when the report was accepted (from `cwd` key or owning process cwd).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// True when `cwd` came from the report's `cwd` key: a missing directory skips resume.
+    #[serde(default)]
+    pub cwd_from_report: bool,
+    /// True when the owning process was the first process on the PTY (no shell above it).
+    #[serde(default)]
+    pub first_process: bool,
+    /// Effective UID of the daemon when the report was accepted; must match on restore.
+    pub uid: u32,
+    /// Unix timestamp (seconds) from the report's `time` key.
+    pub reported_at: u64,
+    /// Owning process metadata captured at accept time so trust rules re-evaluate on restore.
+    #[serde(default)]
+    pub process_name: String,
+    #[serde(default)]
+    pub process_exe: String,
+    #[serde(default)]
+    pub process_argv: Vec<String>,
+    /// Whether an ancestor between the shell and the owner was not a shell/login/proxy.
+    #[serde(default)]
+    pub wrapped: bool,
+    /// True once restore has attempted this record, so crashes or failures never retry.
+    #[serde(default)]
+    pub attempted: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -93,16 +129,40 @@ impl Store {
     }
 
     pub fn load(&self) -> Option<SessionSnapshot> {
-        let text = std::fs::read_to_string(self.session_path()).ok()?;
-        let snap: SessionSnapshot = serde_json::from_str(&text)
+        let path = self.session_path();
+        let text = std::fs::read_to_string(&path).ok()?;
+        let mut snap: SessionSnapshot = serde_json::from_str(&text)
             .map_err(|e| log::warn!("ignoring corrupt session snapshot: {e}"))
             .ok()?;
-        (snap.version == SNAPSHOT_VERSION).then_some(snap)
+        if snap.version != SNAPSHOT_VERSION {
+            return None;
+        }
+        // Saved resume records are as sensitive as a shell startup file: ignore them if
+        // another user owns or can modify the snapshot or its directory.
+        if !private_to_self(&path, &self.dir) {
+            let had_any = snap.panes.iter().any(|p| p.program_resume.is_some());
+            if had_any {
+                log::warn!(
+                    "discarding saved program resume records: {} is not private to current user",
+                    path.display()
+                );
+                for p in &mut snap.panes {
+                    p.program_resume = None;
+                }
+            }
+        }
+        Some(snap)
     }
 
     /// Atomically write the snapshot.
     pub fn save(&self, snap: &SessionSnapshot) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
+        if !self.dir.exists() {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&self.dir)?;
+        }
         let json = serde_json::to_vec_pretty(snap).map_err(std::io::Error::other)?;
         write_atomic(&self.session_path(), &json)
     }
@@ -150,6 +210,23 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether `file` and `dir` are owned by the current effective user and not writable by
+/// group or others (and `file` is a regular file with no group/other access).
+fn private_to_self(file: &Path, dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::geteuid() };
+    let Ok(fm) = std::fs::symlink_metadata(file) else {
+        return false;
+    };
+    if !fm.file_type().is_file() || fm.uid() != uid || (fm.mode() & 0o077) != 0 {
+        return false;
+    }
+    let Ok(dm) = std::fs::metadata(dir) else {
+        return false;
+    };
+    dm.is_dir() && dm.uid() == uid && (dm.mode() & 0o022) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +253,7 @@ mod tests {
                                 agent: None,
                                 agent_session: None,
                                 agent_resume: None,
+                                program_resume: None,
                                 size: PaneSize::default().into(),
                             }],
                             ..Default::default()
@@ -232,6 +310,19 @@ mod tests {
                 agent: Some("claude".into()),
                 agent_session: Some("abc-123".into()),
                 agent_resume: Some(vec!["claude".into(), "--resume".into(), "abc-123".into()]),
+                program_resume: Some(SavedProgramResume {
+                    argv: vec!["nvim".into(), "-S".into(), "/tmp/s.vim".into()],
+                    cwd: Some("/tmp".into()),
+                    cwd_from_report: true,
+                    first_process: false,
+                    uid: unsafe { libc::geteuid() },
+                    reported_at: 1795543200,
+                    process_name: "nvim".into(),
+                    process_exe: "/usr/bin/nvim".into(),
+                    process_argv: vec!["nvim".into()],
+                    wrapped: false,
+                    attempted: false,
+                }),
                 size: PaneSize::default().into(),
             }],
             next_pane_id: 4,

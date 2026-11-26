@@ -515,6 +515,15 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<layouts::LayoutCmd>,
     },
+    /// Show Program Resume Protocol (OSC 7577) records held for panes and their trust status.
+    Resume {
+        /// Pane to inspect (defaults to `$THURM_PANE_ID`, or all panes if unset).
+        #[arg(short, long)]
+        pane: Option<PaneId>,
+        /// Show records for every pane.
+        #[arg(short, long)]
+        all: bool,
+    },
     /// Stream state changes as JSON Lines.
     Events {
         #[arg(long)]
@@ -1168,6 +1177,32 @@ fn run(cli: Cli) -> R {
 
 fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control() && *c != ';').collect()
+}
+
+/// Escapes control and invisible/bidi formatting characters when displaying OSC 7577 commands.
+fn escape_resume_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let control = matches!(c, '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}');
+        let invisible = matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+        );
+        if control || invisible {
+            out.push_str(&format!("\\u{{{:04X}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn daemon_cmd(action: &str, json: bool) -> R {
@@ -1916,6 +1951,57 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool, remote: Option<&str>) -> R {
                         format!("{:?}", i.kind),
                         i.description.as_deref().unwrap_or("")
                     );
+                }
+            }
+        }
+        Cmd::Resume { pane, all } => {
+            let target = if all {
+                None
+            } else {
+                pane.or_else(|| {
+                    (!remote_mode())
+                        .then(|| std::env::var(ENV_PANE_ID).ok()?.parse().ok())
+                        .flatten()
+                })
+            };
+            let Response::ResumeRecords(list) = c.request(Request::ResumeRecords { pane: target })?
+            else {
+                return Err("unexpected response".into());
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+            } else {
+                let mut any = false;
+                println!(
+                    "{:<5} {:<7} {:<7} {:<18} COMMAND",
+                    "PANE", "PID", "CHOSEN", "TRUST"
+                );
+                for p in &list {
+                    for r in &p.records {
+                        any = true;
+                        let chosen = if r.chosen { "*" } else { "-" };
+                        let trust = if r.trusted {
+                            match &r.rule {
+                                Some(rule) => format!("trusted ({})", escape_resume_display(rule)),
+                                None => "trusted".into(),
+                            }
+                        } else {
+                            format!(
+                                "untrusted ({})",
+                                r.untrusted_reason.as_deref().unwrap_or("unknown")
+                            )
+                        };
+                        let cmd = r
+                            .argv
+                            .iter()
+                            .map(|a| escape_resume_display(a))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        println!("{:<5} {:<7} {:<7} {:<18} {cmd}", p.pane, r.pid, chosen, trust);
+                    }
+                }
+                if !any {
+                    println!("(no program resume records)");
                 }
             }
         }

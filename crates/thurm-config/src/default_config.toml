@@ -190,8 +190,21 @@ snapshot_interval_secs = 15
 quit = "detach"
 # Re-run an agent's resume command (e.g. `claude --continue`) when restoring after a reboot.
 resume_agents = true
+# Re-run programs that reported a resume command with OSC 7577: "rules" (only commands matching
+# a trust rule), "all" (any verified report from an unwrapped process), or "off".
+resume_programs = "rules"
+# Include Thurm's built-in trust rules for OSC 7577 program resume (claude, codex, opencode, pi, agy).
+resume_default_rules = true
 # Exit the daemon this many seconds after the last pane closed (0 = never).
 daemon_idle_exit_secs = 0
+
+# Trust an OSC 7577 resume command, or override/disable a built-in rule by `name`:
+# [[session.resume_rules]]
+# name = "nvim"
+# enabled = true
+# command = ["nvim", "-S", "<under:~/.local/state/nvim/sessions>"]
+# dirs = ["~/code"]                 # optional: restrict where the program may resume
+# match_process = true              # require the owning process to match command[0]
 
 [security]
 # Enable Secure Keyboard Entry while a password prompt is detected (echo off).
