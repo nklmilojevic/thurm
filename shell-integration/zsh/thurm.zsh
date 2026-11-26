@@ -72,21 +72,39 @@ _thurm_precmd_last() {
     fi
     export PATH
   fi
-  if [[ -n "${_thurm_resume_ticket-}" && -n "${_thurm_resume_exec-}" ]]; then
-    local _rt="$_thurm_resume_ticket" _re="$_thurm_resume_exec"
-    _thurm_resume_ticket=""
-    _thurm_resume_exec=""
-    # This hook runs ahead of those .zshrc added: apply the usual environment hooks (direnv,
-    # mise) first, when they are registered for this prompt.
-    local _h
-    for _h in _direnv_hook _mise_hook; do
-      (( ${precmd_functions[(Ie)$_h]} && $+functions[$_h] )) && "$_h"
-    done
-    command "$_re" --exec-resume "$_rt"
-  fi
   _thurm_precmd
 }
 
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd _thurm_precmd_last
 add-zsh-hook preexec _thurm_preexec
+
+# One-shot program resume after a restart (Thurm session restore). It runs as the first
+# prompt's command line once zle starts: after every precmd hook .zshrc added (direnv, mise,
+# whatever their names), as an ordinary interactive job (Ctrl-Z, fg), and outside any hook,
+# so a failure neither skips the prompt marks nor ends the shell.
+if [[ -n "${_thurm_resume_ticket-}" && -n "${_thurm_resume_exec-}" ]]; then
+  _thurm_resume_line_init() {
+    add-zle-hook-widget -d line-init _thurm_resume_line_init
+    [[ -n "${_thurm_resume_ticket-}" ]] || return 0
+    # Only the helper's path and the single-use ticket, never the program's arguments; the
+    # leading space and the history hook keep it out of history.
+    BUFFER=" command ${(q)_thurm_resume_exec} --exec-resume ${_thurm_resume_ticket} || :"
+    _thurm_resume_ticket=""
+    _thurm_resume_exec=""
+    add-zsh-hook zshaddhistory _thurm_resume_nohist
+    zle .accept-line
+  }
+  _thurm_resume_nohist() {
+    add-zsh-hook -d zshaddhistory _thurm_resume_nohist
+    return 1
+  }
+  # Armed at the first prompt, once .zshrc defined its own zle hooks (kept and run too).
+  _thurm_resume_arm() {
+    add-zsh-hook -d precmd _thurm_resume_arm
+    autoload -Uz add-zle-hook-widget
+    zle -N _thurm_resume_line_init
+    add-zle-hook-widget line-init _thurm_resume_line_init
+  }
+  add-zsh-hook precmd _thurm_resume_arm
+fi

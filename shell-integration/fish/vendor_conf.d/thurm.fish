@@ -8,14 +8,11 @@ if set -q THURM_ORIG_XDG_DATA_DIRS
     set -e THURM_ORIG_XDG_DATA_DIRS
 end
 
-# One-shot program resume after a restart (Thurm session restore): taken out of the
-# environment before config.fish runs, so nothing started from it inherits the handoff.
-if test -n "$THURM_RESUME_TICKET"; and test -n "$THURM_RESUME_EXEC"
-    set -g __thurm_resume_ticket "$THURM_RESUME_TICKET"
-    set -g __thurm_resume_exec "$THURM_RESUME_EXEC"
-end
+# One-shot program resume after a restart (Thurm session restore): fish never gets the
+# ticket in its environment (Thurm hands it over in the `-C` command, which fish runs after
+# config.fish), so nothing config.fish starts can inherit it.
 set -e THURM_RESUME_TICKET
-set -e THURM_RESUME_EXEC
+test -z "$THURM_RESUME_EXEC"; and set -e THURM_RESUME_EXEC
 
 if status is-interactive; and not set -q __thurm_fish_loaded
     set -g __thurm_fish_loaded 1
@@ -49,19 +46,6 @@ if status is-interactive; and not set -q __thurm_fish_loaded
         end
     end
 
-    # The restored program runs at the first prompt, once config.fish is done; the shell runs
-    # it itself (nothing is typed into the terminal), and gets the terminal back when it ends.
-    if set -q __thurm_resume_ticket
-        function __thurm_resume --on-event fish_prompt
-            functions -e __thurm_resume
-            set -l ticket $__thurm_resume_ticket
-            set -l exec $__thurm_resume_exec
-            set -e __thurm_resume_ticket
-            set -e __thurm_resume_exec
-            command $exec --exec-resume $ticket
-        end
-    end
-
     function __thurm_prompt --on-event fish_prompt
         printf '\e]7;file://%s%s\a' $hostname (string escape --style=url -- $PWD)
         # $PATH for Thurm's tab completion (only when it changed).
@@ -84,5 +68,24 @@ if status is-interactive; and not set -q __thurm_fish_loaded
 
     function __thurm_postexec --on-event fish_postexec
         printf '\e]133;D;%s\a' $status
+    end
+end
+
+# Armed by the `-C` command Thurm starts a restored fish with, which sets the ticket and
+# sources this file again after config.fish: the handler is registered after the prompt
+# handlers config.fish added (direnv's), so they run first and the program is looked up on the
+# PATH they made. It runs inside the handler, before fish queries the terminal for the prompt:
+# run as the prompt's command line instead (`commandline -f execute`), it would take the
+# terminal's answers to those queries, which fish 4 does not survive.
+if status is-interactive; and set -q __thurm_resume_ticket; and test -n "$THURM_RESUME_EXEC"
+    and not functions -q __thurm_resume
+    set -g __thurm_resume_exec $THURM_RESUME_EXEC
+    set -e THURM_RESUME_EXEC
+    function __thurm_resume --on-event fish_prompt
+        functions -e __thurm_resume
+        set -l ticket $__thurm_resume_ticket
+        set -l exec $__thurm_resume_exec
+        set -e __thurm_resume_ticket __thurm_resume_exec
+        command $exec --exec-resume $ticket
     end
 end
