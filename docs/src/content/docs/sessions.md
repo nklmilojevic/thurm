@@ -115,9 +115,11 @@ Code rule keeps `--disallowed-tools`, `--tools`, `--permission-mode`, `--restric
 keeps its sandbox and approval settings (`--sandbox`/`-s`, `--ask-for-approval`/`-a`,
 `--config`/`-c`, `--profile`/`-p`). A flag listed in both must have the same arity in both,
 including against a built-in rule's `preserve_flags` an override inherits: conflicting
-arities disable the rule (with a config warning). A preserved value that is not an absolute
-path (`--settings ./s.json`) only names the same file in the directory the program ran in,
-so the program resumes only into that directory.
+arities disable the rule (with a config warning). `path_flags` lists the flags whose value
+names a file (the Claude Code rule: `--settings`, `--mcp-config`; an override keeps them): a
+relative path there (`--settings ./s.json`) names another file wherever the program was not
+launched, and the directory it was launched in is not known, so such a program is not
+resumed. An absolute path or inline JSON is fine.
 
 `session.json` holds each saved program sealed (AES-256-GCM): the reported resume command,
 its working directory and what restore checks it against are not readable in the file or in

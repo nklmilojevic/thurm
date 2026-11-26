@@ -57,6 +57,10 @@ pub struct ResumeRule {
     /// flags must be reported again with the same values, and the report may not add any. Also
     /// allowed in reports (no need to repeat them in `flags`).
     pub preserve_flags: BTreeMap<String, FlagArity>,
+    /// Flags among these whose value names a file (Claude's `--settings`): a relative path is
+    /// only the same file in the directory the program was launched in, which cannot be
+    /// known, so a report with one is not trusted (an absolute path or inline JSON is).
+    pub path_flags: Vec<String>,
     /// Require the owning OS process to match `command[0]` (default: `true`).
     pub match_process: bool,
 }
@@ -92,6 +96,7 @@ impl Default for ResumeRule {
             dirs: Vec::new(),
             flags: BTreeMap::new(),
             preserve_flags: BTreeMap::new(),
+            path_flags: Vec::new(),
             match_process: true,
         }
     }
@@ -162,6 +167,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
                 ("--strict-mcp-config", None),
                 ("--tools", Many),
             ]),
+            path_flags: s(&["--mcp-config", "--settings"]),
             match_process: true,
         },
         ResumeRule {
@@ -187,6 +193,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
                 ("-p", One),
                 ("-s", One),
             ]),
+            path_flags: Vec::new(),
             match_process: true,
         },
         ResumeRule {
@@ -196,6 +203,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
             dirs: Vec::new(),
             flags: BTreeMap::new(),
             preserve_flags: BTreeMap::new(),
+            path_flags: Vec::new(),
             match_process: true,
         },
         ResumeRule {
@@ -205,6 +213,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
             dirs: Vec::new(),
             flags: BTreeMap::new(),
             preserve_flags: BTreeMap::new(),
+            path_flags: Vec::new(),
             match_process: true,
         },
         ResumeRule {
@@ -214,6 +223,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
             dirs: Vec::new(),
             flags: BTreeMap::new(),
             preserve_flags: BTreeMap::new(),
+            path_flags: Vec::new(),
             match_process: true,
         },
     ]
@@ -250,6 +260,12 @@ fn merge_resume_rules(include_defaults: bool, user: &[ResumeRule]) -> Vec<Resume
                 }
                 if replacement.preserve_flags.is_empty() {
                     replacement.preserve_flags = rules[idx].preserve_flags.clone();
+                }
+                // Never fewer: what names a file in the built-in still does.
+                for flag in &rules[idx].path_flags {
+                    if !replacement.path_flags.contains(flag) {
+                        replacement.path_flags.push(flag.clone());
+                    }
                 }
                 rules[idx] = replacement;
             }
@@ -292,6 +308,21 @@ pub fn resume_rule_warnings(include_defaults: bool, user: &[ResumeRule]) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An override that replaces a built-in rule keeps the built-in's file flags: a relative
+    /// path in them stays untrusted.
+    #[test]
+    fn an_override_keeps_the_builtin_file_flags() {
+        let user = ResumeRule {
+            name: "claude".into(),
+            flags: BTreeMap::from([("--model".to_owned(), FlagArity::One)]),
+            ..Default::default()
+        };
+        let rules = merge_resume_rules(true, std::slice::from_ref(&user));
+        let claude = rules.iter().find(|r| r.name == "claude").unwrap();
+        assert!(claude.path_flags.iter().any(|f| f == "--settings"));
+        assert!(claude.path_flags.iter().any(|f| f == "--mcp-config"));
+    }
 
     #[test]
     fn a_flag_with_two_arities_drops_the_rule() {

@@ -739,10 +739,6 @@ pub struct ResumeRecord {
     pub cwd: Option<String>,
     /// True when `cwd` came from the report's `cwd` key (must exist on restore).
     pub cwd_from_report: bool,
-    /// The directory the process itself ran in when it reported (the OS's): what a relative
-    /// path among its preserved launch flags is relative to.
-    #[serde(default)]
-    pub launch_cwd: Option<String>,
     pub first_process: bool,
     pub uid: u32,
     pub process_name: String,
@@ -769,7 +765,6 @@ impl ResumeRecord {
             argv: self.argv.clone(),
             cwd: self.cwd.clone(),
             cwd_from_report: self.cwd_from_report,
-            launch_cwd: self.launch_cwd.clone(),
             first_process: self.first_process,
             uid: self.uid,
             reported_at: self.reported_at,
@@ -915,7 +910,6 @@ impl ProgramResumeState {
                         }
                     };
                     self.record_time(owner.pid, owner.birth, parsed.time, now);
-                    let launch_cwd = owner.process_cwd.clone();
                     let (resolved_cwd, cwd_from_report) = match cwd {
                         Some(dir) => (Some(dir), true),
                         None => (owner.process_cwd.clone(), false),
@@ -929,7 +923,6 @@ impl ProgramResumeState {
                         argv,
                         cwd: resolved_cwd,
                         cwd_from_report,
-                        launch_cwd,
                         first_process: owner.first_process,
                         uid: owner.uid,
                         process_name: owner.process_name,
@@ -1096,7 +1089,6 @@ impl ProgramResumeState {
                     &TrustSubject {
                         argv: &r.argv,
                         cwd: r.cwd.as_deref(),
-                        launch_cwd: r.launch_cwd.as_deref(),
                         process_exe: &r.process_exe,
                         launch: Launch::Live(&r.process_argv),
                         wrapped: r.wrapped,
@@ -1142,7 +1134,6 @@ impl ProgramResumeState {
             &TrustSubject {
                 argv: &chosen.argv,
                 cwd: chosen.cwd.as_deref(),
-                launch_cwd: chosen.launch_cwd.as_deref(),
                 process_exe: &chosen.process_exe,
                 launch: Launch::Live(&chosen.process_argv),
                 wrapped: chosen.wrapped,
@@ -1173,8 +1164,6 @@ pub struct TrustSubject<'a> {
     pub argv: &'a [String],
     /// The directory the command runs in: on restore, the one it will actually start in.
     pub cwd: Option<&'a str>,
-    /// The directory the process ran in when it reported (see `ResumeRecord::launch_cwd`).
-    pub launch_cwd: Option<&'a str>,
     /// Canonical executable path from the OS (empty when unknown).
     pub process_exe: &'a str,
     pub launch: Launch<'a>,
@@ -1330,15 +1319,14 @@ fn evaluate_rule(
     let extra = &subject.argv[rule.command.len()..];
     let allowed = rule.all_checked_flags();
     let reported = parse_reported_flags(extra, &allowed)?;
-    // A preserved flag's value that is a relative path (`--settings ./s.json`) names another
-    // file in another directory: the same text only proves the same file where the program
-    // ran. Not a path (`--setting-sources user`) can't be told apart, so any relative value
-    // asks for the same directory.
-    let relative_preserved = reported.iter().any(|(flag, vals)| {
-        rule.preserve_flags.contains_key(flag) && vals.iter().any(|v| !v.starts_with('/'))
+    // A relative path in a flag that names a file (`--settings ./s.json`) is only the same
+    // file in the directory the program was launched in, which nothing records: the same text
+    // proves nothing, so such a report isn't trusted.
+    let relative_path = reported.iter().any(|(flag, vals)| {
+        rule.path_flags.iter().any(|f| f == flag) && vals.iter().any(|v| !absolute_or_inline(v))
     });
-    if relative_preserved && !same_dir(subject.cwd, subject.launch_cwd, verify_fs) {
-        return Err("flags_relative_elsewhere");
+    if relative_path {
+        return Err("flags_relative_path");
     }
     // Restricting flags must be carried over even when the report adds no flags.
     if !reported.is_empty() || !rule.preserve_flags.is_empty() {
@@ -1983,20 +1971,11 @@ fn extract_launch_flags(
 /// be the launch's, in the same order with the same values (a program may let the last one win,
 /// so a reordered list is a different restriction); every other reported occurrence uses up a
 /// distinct identical launch occurrence, in any order, and those may be left out.
-/// Whether `a` and `b` are the same directory: both known, and equal (as the filesystem
-/// resolves them, when `verify_fs`).
-fn same_dir(a: Option<&str>, b: Option<&str>, verify_fs: bool) -> bool {
-    let (Some(a), Some(b)) = (a, b) else {
-        return false;
-    };
-    if a == b {
-        return true;
-    }
-    verify_fs
-        && matches!(
-            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
-            (Ok(x), Ok(y)) if x == y
-        )
+/// A file flag's value that means the same wherever the program starts: an absolute path, or
+/// the content itself (inline JSON, as Claude's `--settings` and `--mcp-config` take).
+fn absolute_or_inline(value: &str) -> bool {
+    let v = value.trim_start();
+    v.starts_with('/') || v.starts_with('{') || v.starts_with('[')
 }
 
 fn flags_match_launch(
@@ -2245,14 +2224,16 @@ pub fn saved_pin_dirs(process_exe: &str, launch: Option<&SavedLaunchEvidence>) -
 /// The canonical directories holding the owner's executable and, for an interpreter, its
 /// script: a program a rule trusted by its executable must still be found in one of them
 /// (an update that replaces the file, or adds a version beside it, stays there).
-/// `script_target` is the script's canonical path as resolved when the report was accepted (a
-/// launcher symlinked into a `bin` directory is found again as that target): it is not
-/// resolved again, so a launcher pointed elsewhere since does not move the pin.
+/// `process_exe` and `script_target` are canonical as the OS and the daemon resolved them when
+/// the report was accepted, and are not resolved again: a directory on the way replaced by a
+/// symlink since would move the pin with it. Such an executable directory, one that no longer
+/// resolves to itself, pins nothing (the program is not resumed).
 pub fn pin_dirs(process_exe: &str, script_target: Option<&str>) -> Vec<String> {
     let exe_dir = Path::new(process_exe)
         .parent()
         .filter(|_| process_exe.starts_with('/'))
-        .and_then(|d| std::fs::canonicalize(d).ok());
+        .filter(|d| std::fs::canonicalize(d).is_ok_and(|c| c == *d))
+        .map(Path::to_path_buf);
     let script_dir = script_target
         .filter(|s| s.starts_with('/'))
         .and_then(|f| Path::new(f).parent().map(Path::to_path_buf));
@@ -2880,7 +2861,6 @@ mod tests {
             argv: vec![format!("prog{pid}")],
             cwd: None,
             cwd_from_report: false,
-            launch_cwd: None,
             first_process: false,
             uid: 1000,
             process_name: format!("prog{pid}"),
@@ -2919,7 +2899,6 @@ mod tests {
             argv: vec![format!("prog{pid}")],
             cwd: None,
             cwd_from_report: false,
-            launch_cwd: None,
             first_process: false,
             uid: 1000,
             process_name: format!("prog{pid}"),
@@ -2959,7 +2938,6 @@ mod tests {
             argv: vec![format!("prog{pid}")],
             cwd: None,
             cwd_from_report: false,
-            launch_cwd: None,
             first_process: false,
             uid: 1000,
             process_name: format!("prog{pid}"),
@@ -3022,7 +3000,6 @@ mod tests {
         let ok = TrustSubject {
             argv: &claude_argv,
             cwd: Some("/tmp"),
-            launch_cwd: Some("/tmp"),
             process_exe: "/Users/me/.local/share/claude/versions/2.1.332",
             launch: Launch::Live(&["claude".into(), "--model=opus".into()]),
             wrapped: false,
@@ -3107,13 +3084,13 @@ mod tests {
             dirs: Vec::new(),
             flags: Default::default(),
             preserve_flags: Default::default(),
+            path_flags: Vec::new(),
             match_process: true,
         }];
         let link_argv = vec!["nvim".into(), "-S".into(), link.display().to_string()];
         let link_subj = TrustSubject {
             argv: &link_argv,
             cwd: Some("/tmp"),
-            launch_cwd: Some("/tmp"),
             process_exe: "/usr/bin/nvim",
             launch: Launch::Live(&["nvim".into()]),
             wrapped: false,
@@ -3202,10 +3179,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The executable's directory is pinned as it was when the report was accepted: replaced
+    /// by a symlink since (to a directory of someone else's), it pins nothing, rather than the
+    /// directory the link now leads to.
+    #[test]
+    fn a_redirected_executable_directory_pins_nothing() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("thurm-pin-moved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (bin, other) = (root.join("bin"), root.join("other"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let exe = bin.join("prog").display().to_string();
+        assert_eq!(pin_dirs(&exe, None), vec![bin.display().to_string()]);
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&other, &bin).unwrap();
+        assert!(pin_dirs(&exe, None).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn pinned_program_must_resolve_into_the_trusted_directory() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("thurm-pin-{}", std::process::id()));
+        // Canonical, as an executable's path the OS reports is (macOS's temp dir is behind
+        // the `/var` symlink).
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("thurm-pin-{}", std::process::id()));
         let (good, evil) = (root.join("good"), root.join("evil"));
         for d in [&good, &evil] {
             std::fs::create_dir_all(d).unwrap();
@@ -3250,7 +3251,6 @@ mod tests {
                 &TrustSubject {
                     argv: &argv,
                     cwd: Some("/tmp"),
-                    launch_cwd: Some("/tmp"),
                     process_exe: &exe,
                     launch: Launch::Live(&launch),
                     wrapped: false,
@@ -3283,7 +3283,11 @@ mod tests {
     #[test]
     fn pinned_program_passes_over_what_path_lookup_skips() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("thurm-pin-skip-{}", std::process::id()));
+        // Canonical, as an executable's path the OS reports is (macOS's temp dir is behind
+        // the `/var` symlink).
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("thurm-pin-skip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (plain, folder, dangling, good, evil) = (
             root.join("plain"),
@@ -3347,7 +3351,6 @@ mod tests {
             argv: strings(&["tool"]),
             cwd: None,
             cwd_from_report: false,
-            launch_cwd: None,
             first_process: false,
             uid: 0,
             process_name: "node".into(),
@@ -3537,13 +3540,14 @@ mod tests {
         std::process::exit(126);
     }
 
-    /// A relative path among the preserved flags (`--settings ./s.json`) is only the same file
-    /// in the directory the program ran in: restored anywhere else, the record isn't trusted.
+    /// A relative path in a flag that names a file (`--settings ./s.json`) is only the same file
+    /// in the directory the program was launched in, which isn't known: not trusted, wherever
+    /// it would resume. An absolute path, inline JSON or a flag that names no file is.
     #[test]
-    fn relative_preserved_flags_need_the_launch_directory() {
+    fn relative_file_flags_are_not_trusted() {
         let rules = thurm_config::builtin_resume_rules();
         let id = "4394937c-b07a-4bd5-b6d0-034e7091ff1f";
-        let check = |flags: &[&str], cwd: &str, launch_cwd: Option<&str>| {
+        let check = |flags: &[&str]| {
             let argv: Vec<String> = ["claude", "--resume", id]
                 .iter()
                 .chain(flags)
@@ -3557,8 +3561,7 @@ mod tests {
             evaluate_trust_with_root(
                 &TrustSubject {
                     argv: &argv,
-                    cwd: Some(cwd),
-                    launch_cwd,
+                    cwd: Some("/work"),
                     process_exe: "/Users/me/.local/share/claude/versions/2.1.332",
                     launch: Launch::Live(&launch),
                     wrapped: false,
@@ -3569,19 +3572,14 @@ mod tests {
                 false,
             )
         };
-        let elsewhere = TrustVerdict::Untrusted("flags_relative_elsewhere");
-        let relative = ["--settings", "./s.json"];
-        assert!(matches!(
-            check(&relative, "/work", Some("/work")),
-            TrustVerdict::Trusted { .. }
-        ));
-        assert_eq!(check(&relative, "/elsewhere", Some("/work")), elsewhere);
-        assert_eq!(check(&relative, "/work", None), elsewhere);
-        // An absolute path is the same file wherever the program starts.
-        assert!(matches!(
-            check(&["--settings", "/s.json"], "/elsewhere", Some("/work")),
-            TrustVerdict::Trusted { .. }
-        ));
+        let relative = TrustVerdict::Untrusted("flags_relative_path");
+        assert_eq!(check(&["--settings", "./s.json"]), relative);
+        assert_eq!(check(&["--settings", "s.json"]), relative);
+        assert_eq!(check(&["--mcp-config", "/m.json", "m2.json"]), relative);
+        let trusted = |v| matches!(v, TrustVerdict::Trusted { .. });
+        assert!(trusted(check(&["--settings", "/s.json"])));
+        assert!(trusted(check(&["--settings", r#"{"permissions":{}}"#])));
+        assert!(trusted(check(&["--setting-sources", "user"])));
     }
 
     #[test]
@@ -3602,7 +3600,6 @@ mod tests {
                 &TrustSubject {
                     argv: &argv,
                     cwd: Some("/tmp"),
-                    launch_cwd: Some("/tmp"),
                     process_exe: "/Users/me/.local/share/claude/versions/2.1.332",
                     launch: Launch::Live(&launch),
                     wrapped: false,
@@ -3691,7 +3688,6 @@ mod tests {
                 &TrustSubject {
                     argv: &argv(&[]),
                     cwd: Some("/tmp"),
-                    launch_cwd: Some("/tmp"),
                     process_exe: "",
                     launch: Launch::Live(&[]),
                     wrapped: false,
@@ -3710,7 +3706,6 @@ mod tests {
                 &TrustSubject {
                     argv: &argv(&[]),
                     cwd: Some("/tmp"),
-                    launch_cwd: Some("/tmp"),
                     process_exe: "/usr/bin/python3",
                     launch: Launch::Live(&["claude".into()]),
                     wrapped: false,
@@ -3771,7 +3766,6 @@ mod tests {
                 &TrustSubject {
                     argv,
                     cwd: Some("/tmp"),
-                    launch_cwd: Some("/tmp"),
                     process_exe: exe,
                     launch: Launch::Saved { evidence, key },
                     wrapped: false,
@@ -3816,7 +3810,6 @@ mod tests {
                 &TrustSubject {
                     argv: &report,
                     cwd: Some("/tmp"),
-                    launch_cwd: Some("/tmp"),
                     process_exe: exe,
                     launch: Launch::Saved {
                         evidence: Some(&saved),
@@ -3925,7 +3918,6 @@ mod tests {
                 &TrustSubject {
                     argv: &argv,
                     cwd: Some("/tmp"),
-                    launch_cwd: Some("/tmp"),
                     process_exe: "/opt/homebrew/bin/codex",
                     launch: Launch::Live(&launch),
                     wrapped: false,

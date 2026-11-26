@@ -287,6 +287,9 @@ struct ReportScan {
     tail: Vec<u8>,
     /// Inside a report: its end is still to come.
     open: bool,
+    /// The last read ended on the ESC of a report's ST (`ESC \`): the report is complete (and
+    /// parsed) on the next read, with the backslash, so that read counts as the report's too.
+    esc_pending: bool,
 }
 
 impl ReportScan {
@@ -298,12 +301,16 @@ impl ReportScan {
             marker,
             tail: Vec::new(),
             open: false,
+            esc_pending: false,
         }
     }
 
     /// Whether this read has a part of a report from its marker on.
     fn read(&mut self, data: &[u8]) -> bool {
-        let mut touched = self.open;
+        let mut touched = self.open || (self.esc_pending && !data.is_empty());
+        if !data.is_empty() {
+            self.esc_pending = false;
+        }
         let mut at = 0;
         let mut joined = std::mem::take(&mut self.tail);
         let kept = joined.len();
@@ -321,6 +328,9 @@ impl ReportScan {
                     break;
                 };
                 self.open = false;
+                // An ESC as the read's last byte: its backslash, and so the report's end, is
+                // in the next read.
+                self.esc_pending = data[at + i] == 0x1b && at + i + 1 == data.len();
                 at += i + 1;
             }
             let Some(i) = memchr::memmem::find(&data[at..], self.marker) else {
@@ -2970,7 +2980,6 @@ impl Daemon {
                 &TrustSubject {
                     argv: &rec.argv,
                     cwd: resolved_cwd.as_deref(),
-                    launch_cwd: rec.launch_cwd.as_deref(),
                     process_exe: &rec.process_exe,
                     launch: program_resume::Launch::Saved {
                         evidence: rec.launch.as_ref(),
@@ -5684,13 +5693,15 @@ mod tests {
     #[test]
     fn reports_are_found_across_reads() {
         let stream = b"ab\x1b]7501;state=working:app=x\x1b\\cd\x1b]7501;app=y\x07ef";
-        // Where each report ends: the first ESC or BEL after its marker.
+        // Where each report is complete (and parsed): its BEL, or the backslash of its ST
+        // (`ESC \`), which a read may split from the ESC.
         let ends: Vec<usize> = memchr::memmem::find_iter(stream, ReportScan::STATUS)
             .map(|m| {
-                m + stream[m..]
+                let at = m + stream[m..]
                     .iter()
                     .position(|&b| b == 0x1b || b == 0x07)
-                    .unwrap()
+                    .unwrap();
+                if stream[at] == 0x1b { at + 1 } else { at }
             })
             .collect();
         assert_eq!(ends.len(), 2);

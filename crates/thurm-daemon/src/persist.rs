@@ -57,9 +57,6 @@ pub struct SavedProgramResume {
     /// True when `cwd` came from the report's `cwd` key: a missing directory skips resume.
     #[serde(default)]
     pub cwd_from_report: bool,
-    /// The directory the process ran in when it reported (`ResumeRecord::launch_cwd`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch_cwd: Option<String>,
     /// True when the owning process was the first process on the PTY (no shell above it).
     #[serde(default)]
     pub first_process: bool,
@@ -565,7 +562,6 @@ mod tests {
                     argv: vec!["nvim".into(), "-S".into(), "/tmp/s.vim".into()],
                     cwd: Some("/tmp".into()),
                     cwd_from_report: true,
-                    launch_cwd: None,
                     first_process: false,
                     uid: unsafe { libc::geteuid() },
                     reported_at: 1795543200,
