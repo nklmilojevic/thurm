@@ -4528,6 +4528,12 @@ impl Daemon {
                 Response::PendingPrompt(st.agent.pending_prompt(pane))
             }),
             Request::ResumeRecords { pane } => {
+                // The records hold programs' arguments, which can carry credentials (sealed on
+                // disk for that reason): only this user's own processes on this machine (the
+                // `thurm resume` CLI), never a remote or mobile client.
+                if !client.is_local_peer() {
+                    return Err("not allowed".into());
+                }
                 let (mode, rules) = {
                     let cfg = self.config.read();
                     (cfg.session.resume_programs, cfg.resume_rules())
@@ -6683,6 +6689,30 @@ mod tests {
         let got = daemon.dispatch(&client, Request::TakeResume { ticket: t3 });
         assert!(matches!(&got, Ok(Response::Text(_))), "{got:?}");
         daemon.close_pane(id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The resume records hold programs' arguments (credentials too): only a local process of
+    /// this user may list them, not a tailnet or mobile client.
+    #[test]
+    fn resume_records_are_for_local_peers_only() {
+        let dir = test_dir("records-local");
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (local, _rx) = daemon.add_client();
+        let got = daemon.dispatch(&local, Request::ResumeRecords { pane: None });
+        assert!(matches!(&got, Ok(Response::ResumeRecords(_))), "{got:?}");
+        let (remote, _rx2) = daemon.add_client();
+        *remote.principal.lock() = Some(thurm_proto::Principal {
+            kind: thurm_proto::PrincipalKind::Tailscale,
+            ..Default::default()
+        });
+        let got = daemon.dispatch(&remote, Request::ResumeRecords { pane: None });
+        assert!(matches!(&got, Err(e) if e == "not allowed"), "{got:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
