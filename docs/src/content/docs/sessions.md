@@ -115,7 +115,9 @@ Code rule keeps `--disallowed-tools`, `--tools`, `--permission-mode`, `--restric
 keeps its sandbox and approval settings (`--sandbox`/`-s`, `--ask-for-approval`/`-a`,
 `--config`/`-c`, `--profile`/`-p`). A flag listed in both must have the same arity in both,
 including against a built-in rule's `preserve_flags` an override inherits: conflicting
-arities disable the rule (with a config warning).
+arities disable the rule (with a config warning). A preserved value that is not an absolute
+path (`--settings ./s.json`) only names the same file in the directory the program ran in,
+so the program resumes only into that directory.
 
 `session.json` holds each saved program sealed (AES-256-GCM): the reported resume command,
 its working directory and what restore checks it against are not readable in the file or in

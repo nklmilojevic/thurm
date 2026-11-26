@@ -33,9 +33,88 @@ fn write_exec(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn resume_records(c: &Client, pane: Option<PaneId>) -> Vec<PaneResumeRecords> {
+thread_local! {
+    /// The socket of the daemon this test connected to last (`Env::connect`).
+    pub(crate) static RECORDS_SOCKET: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The daemon answers `ResumeRecords` only to the `thurm` CLI (by its executable's name), so
+/// the tests ask through this test binary copied under that name into the test's directory
+/// (removed with it), running [`records_cli_helper`]: the check the daemon makes is the real
+/// one.
+fn records_cli(socket: &Path) -> PathBuf {
+    let cli = socket.parent().unwrap().join("cli").join("thurm");
+    if !cli.exists() {
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        let part = cli.with_extension("part");
+        std::fs::copy(std::env::current_exe().unwrap(), &part).unwrap();
+        std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&part, &cli).unwrap();
+    }
+    cli
+}
+
+fn resume_records(_c: &Client, pane: Option<PaneId>) -> Vec<PaneResumeRecords> {
+    let socket = RECORDS_SOCKET
+        .with(|s| s.borrow().clone())
+        .expect("connect to a daemon first");
+    let out = Command::new(records_cli(&socket))
+        .args([
+            "--exact",
+            "program_resume::records_cli_helper",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("THURM_E2E_RECORDS_SOCKET", &socket)
+        .env(
+            "THURM_E2E_RECORDS_PANE",
+            pane.map(|p| p.to_string()).unwrap_or_default(),
+        )
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // On a line of its own, though libtest may print the test's name before it.
+    let Some(json) = stdout
+        .lines()
+        .find_map(|l| l.split_once("RECORDS_JSON:").map(|(_, j)| j))
+    else {
+        panic!(
+            "no records from the CLI helper: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    serde_json::from_str(json).unwrap()
+}
+
+/// Run by [`resume_records`] from the copy named `thurm`: asks the daemon for the records and
+/// prints them. Does nothing when run as a test.
+#[test]
+#[ignore = "run by resume_records as the thurm CLI"]
+fn records_cli_helper() {
+    let Some(socket) = std::env::var_os("THURM_E2E_RECORDS_SOCKET") else {
+        return;
+    };
+    let pane = std::env::var("THURM_E2E_RECORDS_PANE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<PaneId>().unwrap());
+    let c = Client::connect(
+        ConnectOptions {
+            socket: PathBuf::from(socket),
+            spawn_daemon: None,
+            client_name: "thurm",
+            ui: false,
+        },
+        |_| {},
+        || {},
+    )
+    .expect("connect");
     match c.request(Request::ResumeRecords { pane }).unwrap() {
-        Response::ResumeRecords(list) => list,
+        Response::ResumeRecords(list) => {
+            println!("\nRECORDS_JSON:{}", serde_json::to_string(&list).unwrap());
+        }
         other => panic!("unexpected response: {other:?}"),
     }
 }
@@ -490,6 +569,69 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
             "{shell_name}: a resume file was written"
         );
     }
+}
+
+/// A shell behind a PTY proxy (`script`, started from the shell's startup file) reports from
+/// the proxy's terminal and runs the typed resume line there, not on the pane's: the daemon
+/// follows the proxy for both, as it reads the pane.
+#[test]
+fn a_shell_behind_script_still_resumes() {
+    if running_as_root() || !Path::new("/usr/bin/script").exists() {
+        return;
+    }
+    let env = Env::new("resume-script-proxy");
+    let custom_bin = env.dir.join("custom-bin");
+    write_exec(
+        &custom_bin.join("proxiedprog"),
+        "#!/bin/sh\necho PROXIED_RESUMED\nsleep 30\n",
+    );
+    // `sh` starts the proxy from its startup file (`ENV`), once: its shell is the one behind
+    // it. The proxy's own syntax: BSD `script [-q] file command...`, util-linux `-q -c cmd file`.
+    let proxy = if cfg!(target_os = "macos") {
+        "/usr/bin/script -q /dev/null /bin/sh"
+    } else {
+        "/usr/bin/script -q -c /bin/sh /dev/null"
+    };
+    let envrc = env.dir.join("envrc");
+    std::fs::write(
+        &envrc,
+        format!("[ -z \"$BEHIND\" ] && {{ export BEHIND=1; exec {proxy}; }}\n"),
+    )
+    .unwrap();
+    write_config(
+        &env,
+        &format!(
+            "[terminal]\nshell = [\"/bin/sh\"]\nshell_integration = true\n\
+             [terminal.env]\nENV = {:?}\n\
+             [session]\nsnapshot_interval_secs = 60\nresume_programs = \"all\"\n",
+            envrc.display().to_string()
+        ),
+    );
+    let reporter = env.dir.join("report.sh");
+    let enc = b64_argv(&[&custom_bin.join("proxiedprog").display().to_string()]);
+    write_exec(
+        &reporter,
+        &format!("#!/bin/sh\n{EMIT_SH}\nemit_7577 \"$$\" \"argv={enc}\"\necho READY\nsleep 60\n"),
+    );
+
+    let mut daemon = env.start_clean(&[]);
+    let (c, _) = env.connect();
+    let pane = create(&c, &env.dir);
+    // Typed again until the shell behind the proxy reads it (what comes before is lost).
+    send_until(
+        &c,
+        pane,
+        format!("'{}'\r", reporter.display()).as_bytes(),
+        "(?m)^READY",
+    );
+    wait_records(&c, pane, "proxied record", |r| r.len() == 1 && r[0].trusted);
+    c.request(Request::Shutdown { kill_panes: true }).unwrap();
+    daemon.wait_exit();
+    drop(c);
+
+    let _daemon2 = env.start_clean(&[]);
+    let (c2, _) = env.connect();
+    wait_match(&c2, pane, "PROXIED_RESUMED");
 }
 
 /// Ctrl-C on a resumed bash job unwinds the prompt hook that started it: bash's own xtrace (on
@@ -1028,8 +1170,7 @@ fn clear_reject_exit_grace_and_close_pane_remove_records() {
     wait_match(&c, pane, "EXIT_SOON");
     wait_records(&c, pane, "short-lived set", |r| r.len() == 1);
     wait_snapshot(&env, "short-lived record saved", |snap| {
-        snap["panes"][0]["id"] == pane
-            && opened_record(&env, snap, 0)["argv"][1] == "exit-step"
+        snap["panes"][0]["id"] == pane && opened_record(&env, snap, 0)["argv"][1] == "exit-step"
     });
     std::fs::write(&exit_gate, "").unwrap();
     wait_records(&c, pane, "expired after exit grace", |r| r.is_empty());

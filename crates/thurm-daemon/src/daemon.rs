@@ -278,9 +278,11 @@ fn read_groups(len: usize, groups: &[(usize, Option<u32>)]) -> Vec<(usize, usize
     out
 }
 
-/// Follows program reports (OSC 7501) through PTY reads, which split them anywhere.
-#[derive(Default)]
+/// Follows program reports (OSC 7501 status, OSC 7577 resume) through PTY reads, which split
+/// them anywhere: a read with one is looked at behind PTY proxies, where the reporter runs.
 struct ReportScan {
+    /// The report's OSC marker ([`ReportScan::STATUS`], [`ReportScan::RESUME`]).
+    marker: &'static [u8],
     /// The last read's last bytes: the start of a marker the next read may finish.
     tail: Vec<u8>,
     /// Inside a report: its end is still to come.
@@ -288,7 +290,16 @@ struct ReportScan {
 }
 
 impl ReportScan {
-    const MARKER: &[u8] = b"]7501;";
+    const STATUS: &[u8] = b"]7501;";
+    const RESUME: &[u8] = b"]7577;";
+
+    fn new(marker: &'static [u8]) -> Self {
+        Self {
+            marker,
+            tail: Vec::new(),
+            open: false,
+        }
+    }
 
     /// Whether this read has a part of a report from its marker on.
     fn read(&mut self, data: &[u8]) -> bool {
@@ -296,12 +307,12 @@ impl ReportScan {
         let mut at = 0;
         let mut joined = std::mem::take(&mut self.tail);
         let kept = joined.len();
-        joined.extend_from_slice(&data[..data.len().min(Self::MARKER.len() - 1)]);
-        if let Some(i) = memchr::memmem::find(&joined, Self::MARKER) {
+        joined.extend_from_slice(&data[..data.len().min(self.marker.len() - 1)]);
+        if let Some(i) = memchr::memmem::find(&joined, self.marker) {
             // Too short to hold a marker on either side: it spans the two reads.
             touched = true;
             self.open = true;
-            at = i + Self::MARKER.len() - kept;
+            at = i + self.marker.len() - kept;
         }
         loop {
             if self.open {
@@ -312,14 +323,14 @@ impl ReportScan {
                 self.open = false;
                 at += i + 1;
             }
-            let Some(i) = memchr::memmem::find(&data[at..], Self::MARKER) else {
+            let Some(i) = memchr::memmem::find(&data[at..], self.marker) else {
                 break;
             };
             touched = true;
             self.open = true;
-            at += i + Self::MARKER.len();
+            at += i + self.marker.len();
         }
-        let keep = Self::MARKER.len() - 1;
+        let keep = self.marker.len() - 1;
         self.tail = if data.len() >= keep {
             data[data.len() - keep..].to_vec()
         } else {
@@ -506,32 +517,26 @@ impl Client {
     /// executable is named `thurm`. What only the CLI asks for and carries programs' arguments
     /// ([`Request::ResumeRecords`]) is for it alone: a same-user socket forward over SSH comes
     /// from `sshd`, whose caller may have no shell here. (A process of the user here could pose
-    /// as the CLI, but it can already type into the panes.) Unknown: not the CLI. A debug
-    /// build started with `THURM_TRUST_UI_CLIENTS=1` (the tests' daemon) takes any local peer;
-    /// a release build ignores that, so no setting opens the records to a forward.
+    /// as the CLI, but it can already type into the panes.) Unknown: not the CLI. No setting
+    /// opens this up (the tests ask through a copy of their binary named `thurm`).
     pub fn is_local_cli(&self) -> bool {
         if !self.is_local_peer() {
             return false;
-        }
-        if cfg!(debug_assertions) && crate::daemon::ext::unverified_ui_allowed() {
-            return true;
         }
         let pid = *self.peer_pid.lock();
         pid.and_then(crate::procinfo::exe_path)
             .is_some_and(|exe| is_cli_executable(&exe))
     }
 
-    /// Whether the connecting process runs on the terminal whose slave device is `rdev` (a
-    /// pane's): its controlling terminal is that one. Unknown: no. The helper that redeems a
-    /// pane's resume ticket runs in the pane's shell; a same-user socket forward over SSH has
-    /// no such terminal, so a ticket seen elsewhere (the typed line shows in the pane) can
-    /// only be redeemed in the pane itself.
-    pub fn runs_on_terminal(&self, rdev: Option<u64>) -> bool {
+    /// Whether the connecting process runs on one of `ttys` (slave devices: a pane's, and the
+    /// one a verified PTY proxy in it runs its shell on): its controlling terminal is one of
+    /// them. Unknown: no. The helper that redeems a pane's resume ticket runs in the pane's
+    /// shell; a same-user socket forward over SSH has no such terminal, so a ticket seen
+    /// elsewhere (the typed line shows in the pane) can only be redeemed in the pane itself.
+    pub fn runs_on_terminal(&self, ttys: &[u64]) -> bool {
         let pid = *self.peer_pid.lock();
-        let (Some(pid), Some(rdev)) = (pid, rdev) else {
-            return false;
-        };
-        crate::procinfo::controlling_tty(pid) == Some(rdev)
+        pid.and_then(crate::procinfo::controlling_tty)
+            .is_some_and(|tty| ttys.contains(&tty))
     }
 
     /// `n` clipboard bytes left the queue. Never below zero: after [`Client::writer_ended`]
@@ -1467,7 +1472,8 @@ impl Daemon {
         }
         let mut buf = vec![0u8; 64 * 1024];
         let mut last_read = Instant::now();
-        let mut reports = ReportScan::default();
+        let mut reports = ReportScan::new(ReportScan::STATUS);
+        let mut resumes = ReportScan::new(ReportScan::RESUME);
         loop {
             self.readers.park_if_paused();
             let n = match pty::read_pty(&mut reader, &mut buf, self.readers.wake_fd()) {
@@ -1486,7 +1492,8 @@ impl Daemon {
             let mut group = pty::foreground_of(&reader);
             // Behind a PTY proxy, the reporting program is on the proxy's terminal. Looking
             // there takes a few more calls, so only for reads with a report in them.
-            if reports.read(&buf[..n]) {
+            // Both scanned every read: each follows its reports across reads.
+            if reports.read(&buf[..n]) | resumes.read(&buf[..n]) {
                 group = group.map(procinfo::behind_proxy);
             }
             let quiet = last_read.elapsed() >= QUIET;
@@ -2963,6 +2970,7 @@ impl Daemon {
                 &TrustSubject {
                     argv: &rec.argv,
                     cwd: resolved_cwd.as_deref(),
+                    launch_cwd: rec.launch_cwd.as_deref(),
                     process_exe: &rec.process_exe,
                     launch: program_resume::Launch::Saved {
                         evidence: rec.launch.as_ref(),
@@ -4626,10 +4634,20 @@ impl Daemon {
                         .find(|t| t.expires > now && program_resume::ticket_eq(&t.ticket, &ticket))
                         .map(|t| t.pane)
                 };
-                let pane_tty = ticket_pane
-                    .and_then(|id| self.pane(id))
-                    .and_then(|p| p.state.lock().pty.slave_rdev());
-                if ticket_pane.is_some() && !client.runs_on_terminal(pane_tty) {
+                // The pane's terminal, and the one its shell runs on behind a PTY proxy
+                // (`script`, `atuin pty-proxy`): the terminal of the pane's foreground group,
+                // which `Pty::foreground_pgrp` follows only through proxies that read the
+                // pane's terminal (as the agent detection does).
+                let mut pane_ttys = Vec::new();
+                if let Some(p) = ticket_pane.and_then(|id| self.pane(id)) {
+                    let (slave, fg) = {
+                        let st = p.state.lock();
+                        (st.pty.slave_rdev(), st.pty.foreground_pgrp())
+                    };
+                    pane_ttys.extend(slave);
+                    pane_ttys.extend(fg.and_then(procinfo::controlling_tty));
+                }
+                if ticket_pane.is_some() && !client.runs_on_terminal(&pane_ttys) {
                     return Err("not allowed".into());
                 }
                 let spec = {
@@ -5667,7 +5685,7 @@ mod tests {
     fn reports_are_found_across_reads() {
         let stream = b"ab\x1b]7501;state=working:app=x\x1b\\cd\x1b]7501;app=y\x07ef";
         // Where each report ends: the first ESC or BEL after its marker.
-        let ends: Vec<usize> = memchr::memmem::find_iter(stream, ReportScan::MARKER)
+        let ends: Vec<usize> = memchr::memmem::find_iter(stream, ReportScan::STATUS)
             .map(|m| {
                 m + stream[m..]
                     .iter()
@@ -5677,7 +5695,7 @@ mod tests {
             .collect();
         assert_eq!(ends.len(), 2);
         let check = |cuts: &[usize]| {
-            let mut scan = ReportScan::default();
+            let mut scan = ReportScan::new(ReportScan::STATUS);
             let mut start = 0;
             for &end in cuts.iter().chain([&stream.len()]) {
                 let touched = scan.read(&stream[start..end]);
@@ -5698,10 +5716,17 @@ mod tests {
                 check(&[a, b]);
             }
         }
-        let mut scan = ReportScan::default();
+        let mut scan = ReportScan::new(ReportScan::STATUS);
         for chunk in b"plain ]750 output\x1b]0;title\x07 and 1;7501;".chunks(3) {
             assert!(!scan.read(chunk), "{chunk:?}");
         }
+        // Program resume reports are followed alike, each kind by its own scan.
+        let mut resume = ReportScan::new(ReportScan::RESUME);
+        let mut status = ReportScan::new(ReportScan::STATUS);
+        let parts: [&[u8]; 3] = [b"x\x1b]75", b"77;v=1;pid=4;argv=", b"YQ==\x07y"];
+        let touched: Vec<bool> = parts.iter().map(|p| resume.read(p)).collect();
+        assert_eq!(touched, [false, true, true]);
+        assert!(parts.iter().all(|p| !status.read(p)));
     }
 
     /// A program behind a PTY proxy reports, then ends without a prompt mark: its report is
