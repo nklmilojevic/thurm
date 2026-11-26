@@ -218,7 +218,10 @@ final class GlyphCache {
         }
         let box = key.span > 0 ? cell.map { CellBox(width: $0.width * Int(key.span), height: $0.height,
                                                      baseline: $0.baseline) } : nil
-        let e = rasterize(glyph: key.glyph, font: font, isColor: isColor, fit: box)
+        guard let e = rasterize(glyph: key.glyph, font: font, isColor: isColor, fit: box) else {
+            // Transient atlas allocation failure: leave uncached so later frames retry.
+            return .empty
+        }
         // Rasterizing may wipe its atlas and bump its epoch; flush stale entries of that atlas
         // before recording the freshly uploaded entry.
         syncEpochs()
@@ -232,7 +235,9 @@ final class GlyphCache {
 
     /// Rasterizes one glyph. With `fit`, the glyph is scaled to fit the box (keeping its aspect)
     /// and centered in it, and the entry is positioned relative to the cell's pen position.
-    private func rasterize(glyph: CGGlyph, font: CTFont, isColor: Bool, fit: CellBox?) -> GlyphEntry {
+    /// Returns `nil` when lazy color atlas allocation fails transiently so the caller does not
+    /// cache `.empty` for that glyph.
+    private func rasterize(glyph: CGGlyph, font: CTFont, isColor: Bool, fit: CellBox?) -> GlyphEntry? {
         var g = glyph
         var rect = CGRect.zero
         CTFontGetBoundingRectsForGlyphs(font, .horizontal, &g, &rect, 1)
@@ -263,7 +268,7 @@ final class GlyphCache {
         let h = Int(ceil(target.maxY)) - bottom + pad
         guard w > 0, h > 0, w < 2048, h < 2048 else { return .empty }
 
-        guard let atlas = isColor ? ensureColorAtlas() : gray else { return .empty }
+        guard let atlas = isColor ? ensureColorAtlas() : gray else { return nil }
         let bpp = atlas.bytesPerPixel
         var buffer = [UInt8](repeating: 0, count: w * h * bpp)
         let drew: Bool = buffer.withUnsafeMutableBytes { raw -> Bool in

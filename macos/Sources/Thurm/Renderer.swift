@@ -1014,7 +1014,10 @@ final class TerminalRenderer {
                     let entry = shaper.glyphs.entry(for: GlyphKey(font: g.font, glyph: g.glyph, span: g.span),
                                                     font: shaper.font(g.font), isColor: g.color,
                                                     cell: CellBox(width: cw, height: ch, baseline: shaper.baseline))
-                    if entry.isEmpty { continue }
+                    if entry.isEmpty {
+                        if g.color && shaper.glyphs.color == nil { wantsAnotherFrame = true }
+                        continue
+                    }
                     let gx = (padX + Float(g.col) * fcw + g.x.rounded() + entry.left).rounded()
                     let gy = (baselineY - g.y.rounded() - entry.top).rounded()
                     glyphQuads.append(QuadInstance(
