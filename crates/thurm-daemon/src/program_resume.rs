@@ -1134,11 +1134,15 @@ pub enum Launch<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustVerdict {
+    /// `rule`: the trusting rule's name, for display only (a rule may have none).
     /// `dirs_restricted`: the rule that trusted it limits the program to some directories, so
     /// on restore it may only start in an existing one.
+    /// `pin_exe`: the rule trusted the owning process by its executable (`match_process`), so
+    /// on restore only a program found where that executable is may run.
     Trusted {
         rule: Option<String>,
         dirs_restricted: bool,
+        pin_exe: bool,
     },
     Untrusted(&'static str),
 }
@@ -1177,6 +1181,7 @@ fn evaluate_trust_with_root(
                 TrustVerdict::Trusted {
                     rule: None,
                     dirs_restricted: false,
+                    pin_exe: false,
                 }
             }
         }
@@ -1194,6 +1199,7 @@ fn evaluate_trust_with_root(
                         return TrustVerdict::Trusted {
                             rule: (!rule.name.is_empty()).then(|| rule.name.clone()),
                             dirs_restricted: !rule.dirs.is_empty(),
+                            pin_exe: rule.match_process,
                         };
                     }
                     Err(reason) => {
@@ -2779,6 +2785,7 @@ mod tests {
             TrustVerdict::Trusted {
                 rule: Some("claude".into()),
                 dirs_restricted: false,
+                pin_exe: true,
             }
         );
         // Running as root is always refused even in `all` mode.
@@ -2875,6 +2882,7 @@ mod tests {
             TrustVerdict::Trusted {
                 rule: Some("nvim".into()),
                 dirs_restricted: false,
+                pin_exe: true,
             }
         );
         assert_eq!(
@@ -2903,6 +2911,7 @@ mod tests {
             TrustVerdict::Trusted {
                 rule: Some("nvim".into()),
                 dirs_restricted: false,
+                pin_exe: true,
             }
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -2966,6 +2975,59 @@ mod tests {
         assert!(pinned_program("prog", Some(path.as_ref()), &pins).is_err());
         // Relative entries are never searched.
         assert!(pinned_program("prog", Some("good".as_ref()), &pins).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unnamed_rule_still_pins_the_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("thurm-pin-anon-{}", std::process::id()));
+        let (good, evil) = (root.join("good"), root.join("evil"));
+        for d in [&good, &evil] {
+            std::fs::create_dir_all(d).unwrap();
+            let f = d.join("prog");
+            std::fs::write(&f, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let exe = good.join("prog").display().to_string();
+        let mut rules = [ResumeRule {
+            command: strings(&["prog", "<id>"]),
+            ..Default::default()
+        }];
+        assert!(rules[0].name.is_empty() && rules[0].match_process);
+        let argv = strings(&["prog", "abc"]);
+        let launch = strings(&["prog"]);
+        let verdict = |rules: &[ResumeRule]| {
+            evaluate_trust_with_root(
+                &TrustSubject {
+                    argv: &argv,
+                    cwd: Some("/tmp"),
+                    process_exe: &exe,
+                    launch: Launch::Live(&launch),
+                    wrapped: false,
+                },
+                ResumeProgramsMode::Rules,
+                rules,
+                false,
+                false,
+            )
+        };
+        // Trusted by its executable, without a name: the pin comes with the verdict.
+        let TrustVerdict::Trusted { rule, pin_exe, .. } = verdict(&rules) else {
+            panic!("unnamed rule should trust the report");
+        };
+        assert_eq!(rule, None);
+        assert!(pin_exe);
+        // So a same-named program earlier on the restored PATH is refused.
+        let pins = pin_dirs(&exe, None);
+        let path = format!("{}:{}", evil.display(), good.display());
+        assert!(pinned_program("prog", Some(path.as_ref()), &pins).is_err());
+        // A rule that does not match the process has nothing to pin to.
+        rules[0].match_process = false;
+        assert!(matches!(
+            verdict(&rules),
+            TrustVerdict::Trusted { pin_exe: false, .. }
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3079,6 +3141,7 @@ mod tests {
         let trusted = TrustVerdict::Trusted {
             rule: Some("claude".into()),
             dirs_restricted: false,
+            pin_exe: true,
         };
         let differ = TrustVerdict::Untrusted("flags_differ");
 
@@ -3112,6 +3175,39 @@ mod tests {
             differ
         );
         assert_eq!(check(&[], &["claude"]), trusted);
+        // Explicit settings and the settings sources supply permission and sandbox rules: a
+        // report must carry them over, unchanged.
+        let settings = [
+            "claude",
+            "--settings",
+            "/s.json",
+            "--setting-sources",
+            "user",
+        ];
+        assert_eq!(check(&[], &settings), differ);
+        assert_eq!(check(&["--settings", "/s.json"], &settings), differ);
+        assert_eq!(check(&["--setting-sources", "user"], &settings), differ);
+        assert_eq!(
+            check(
+                &["--settings", "/other.json", "--setting-sources", "user"],
+                &settings
+            ),
+            differ
+        );
+        assert_eq!(
+            check(
+                &["--settings", "/s.json", "--setting-sources", "user,project"],
+                &settings
+            ),
+            differ
+        );
+        assert_eq!(
+            check(
+                &["--settings", "/s.json", "--setting-sources", "user"],
+                &settings
+            ),
+            trusted
+        );
         // Nothing to check restrictions against: refused.
         let mut unmatched = rules.clone();
         unmatched[0].match_process = false;

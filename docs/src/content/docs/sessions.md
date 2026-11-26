@@ -105,9 +105,11 @@ given, with the same values, when the program was launched. `preserve_flags` lis
 restricting options: when the program was launched with one, the report must carry every
 occurrence over unchanged and in the same order, or the program is not resumed. The Claude
 Code rule keeps `--disallowed-tools`, `--tools`, `--permission-mode`, `--restricted`,
-`--mcp-config` and `--strict-mcp-config`; the Codex rule keeps its sandbox and approval
-settings (`--sandbox`/`-s`, `--ask-for-approval`/`-a`, `--config`/`-c`, `--profile`/`-p`).
-A flag listed in both takes its `preserve_flags` arity.
+`--settings`, `--setting-sources`, `--mcp-config` and `--strict-mcp-config`; the Codex rule
+keeps its sandbox and approval settings (`--sandbox`/`-s`, `--ask-for-approval`/`-a`,
+`--config`/`-c`, `--profile`/`-p`). A flag listed in both must have the same arity in both,
+including against a built-in rule's `preserve_flags` an override inherits: conflicting
+arities disable the rule (with a config warning).
 
 `session.json` holds the full reported resume command as the program reported it, in plain
 text (the file is private to you, but it is still on disk and in backups). Programs should

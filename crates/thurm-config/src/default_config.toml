@@ -200,9 +200,9 @@ daemon_idle_exit_secs = 0
 
 # Trust an OSC 7577 resume command, or override/disable a built-in rule by `name`:
 # [[session.resume_rules]]
-# name = "nvim"
+# name = "mytool"
 # enabled = true
-# command = ["nvim", "-S", "<under:~/.local/state/nvim/sessions>"]
+# command = ["mytool", "resume", "<id>"]
 # dirs = ["~/code"]                 # optional: restrict where the program may resume
 # match_process = true              # require the owning process to match command[0]
 

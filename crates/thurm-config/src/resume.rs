@@ -157,6 +157,8 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
                 ("--mcp-config", Many),
                 ("--permission-mode", One),
                 ("--restricted", None),
+                ("--setting-sources", One),
+                ("--settings", One),
                 ("--strict-mcp-config", None),
                 ("--tools", Many),
             ]),
@@ -317,30 +319,23 @@ mod tests {
         // No built-in rule is ambiguous.
         let builtin = builtin_resume_rules();
         assert!(builtin.iter().all(|r| r.conflicting_flag().is_none()));
-        // An override's `flags` against a built-in's inherited `preserve_flags`.
-        if let Some((name, flag, arity)) = builtin.iter().find_map(|r| {
-            r.preserve_flags
+        // An override's `flags` against a built-in's inherited `preserve_flags`: Claude keeps
+        // `--tools` (`Many`), and an override giving it `One` drops the rule.
+        let claude = builtin.iter().find(|r| r.name == "claude").unwrap();
+        assert_eq!(claude.preserve_flags.get("--tools"), Some(&FlagArity::Many));
+        let mut over = ResumeRule {
+            name: "claude".into(),
+            ..Default::default()
+        };
+        over.flags.insert("--tools".into(), FlagArity::One);
+        assert!(
+            !resolve_resume_rules(true, std::slice::from_ref(&over))
                 .iter()
-                .next()
-                .map(|(f, a)| (r.name.clone(), f.clone(), *a))
-        }) {
-            let other = if arity == FlagArity::None {
-                FlagArity::One
-            } else {
-                FlagArity::None
-            };
-            let mut over = ResumeRule {
-                name: name.clone(),
-                ..Default::default()
-            };
-            over.flags.insert(flag, other);
-            assert!(
-                !resolve_resume_rules(true, std::slice::from_ref(&over))
-                    .iter()
-                    .any(|r| r.name == name)
-            );
-            assert_eq!(resume_rule_warnings(true, &[over]).len(), 1);
-        }
+                .any(|r| r.name == "claude")
+        );
+        let w = resume_rule_warnings(true, &[over]);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("claude") && w[0].contains("--tools"), "{w:?}");
     }
 
     #[test]
@@ -392,7 +387,13 @@ mod tests {
     fn builtin_rules_preserve_launch_restrictions() {
         let rules = builtin_resume_rules();
         let claude = rules.iter().find(|r| r.name == "claude").unwrap();
-        for f in ["--tools", "--permission-mode", "--restricted"] {
+        for f in [
+            "--tools",
+            "--permission-mode",
+            "--restricted",
+            "--settings",
+            "--setting-sources",
+        ] {
             assert!(claude.preserve_flags.contains_key(f), "{f}");
         }
         let codex = rules.iter().find(|r| r.name == "codex").unwrap();
