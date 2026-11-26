@@ -2842,11 +2842,12 @@ impl Daemon {
                 &resume_rules,
                 true,
             );
-            let (rule, dir_restricted) = match trust {
+            let (rule, dir_restricted, pin_exe) = match trust {
                 TrustVerdict::Trusted {
                     rule,
                     dirs_restricted,
-                } => (rule, dirs_restricted),
+                    pin_exe,
+                } => (rule, dirs_restricted, pin_exe),
                 TrustVerdict::Untrusted(reason) => {
                     skip(&format!("not_trusted trust_reason={reason}"));
                     plans.push(None);
@@ -2916,24 +2917,21 @@ impl Daemon {
                 _ => (resolved_cwd.clone(), None),
             };
             // A rule that trusted the owner by its executable also decides which program runs:
-            // only one found where that executable (or its script) is.
-            let exe_dirs = match rule
-                .as_deref()
-                .and_then(|n| resume_rules.iter().find(|r| r.enabled && r.name == n))
-            {
-                Some(r) if r.match_process => {
-                    let dirs = program_resume::pin_dirs(
-                        &rec.process_exe,
-                        rec.launch.as_ref().and_then(|l| l.script.as_deref()),
-                    );
-                    if dirs.is_empty() {
-                        skip("program_gone");
-                        plans.push(None);
-                        continue;
-                    }
-                    dirs
+            // only one found where that executable (or its script) is. Taken from the verdict,
+            // not looked up by the rule's name: a rule need not have one.
+            let exe_dirs = if pin_exe {
+                let dirs = program_resume::pin_dirs(
+                    &rec.process_exe,
+                    rec.launch.as_ref().and_then(|l| l.script.as_deref()),
+                );
+                if dirs.is_empty() {
+                    skip("program_gone");
+                    plans.push(None);
+                    continue;
                 }
-                _ => Vec::new(),
+                dirs
+            } else {
+                Vec::new()
             };
             rec.attempted = true;
             marked_attempted = true;
