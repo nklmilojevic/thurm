@@ -396,6 +396,34 @@ fn concealed_copy_drops_trailing_background_rows() {
     assert!(!t.selection_text().ends_with('\n'));
 }
 
+/// Concealed spaces other than the ASCII one are text: blanked by their cells.
+#[test]
+fn concealed_unicode_spaces_are_blanked() {
+    let mut t = term(20, 2);
+    t.advance("a\x1b[8m\u{3000}\x1b[mb c\x1b[8m\u{a0}x\x1b[md".as_bytes());
+    t.selection(SelectionOp::SelectAll);
+    assert_eq!(t.selection_text(), "a  b c  d");
+    // Only a concealed U+3000: still blanked.
+    let mut t = term(20, 2);
+    t.advance("a\x1b[8m\u{3000}\x1b[mb".as_bytes());
+    t.selection(SelectionOp::SelectAll);
+    assert_eq!(t.selection_text(), "a  b");
+}
+
+/// Should the styled pass fail, nothing says the plain text is safe: nothing is copied.
+#[test]
+fn copy_fails_closed_without_the_styled_pass() {
+    use crate::vt::FAIL_FORMAT;
+    let mut t = term(20, 2);
+    t.advance(b"pw: \x1b[8mhunter2\x1b[m");
+    t.selection(SelectionOp::SelectAll);
+    FAIL_FORMAT.with(|f| f.set(Some(ghostty_vt_rs_sys::FormatterFormat::VT)));
+    let text = t.selection_text();
+    FAIL_FORMAT.with(|f| f.set(None));
+    assert_eq!(text, "");
+    assert_eq!(t.selection_text(), "pw:");
+}
+
 #[test]
 fn styled_text_parses_escapes() {
     use crate::vt::styled_text;

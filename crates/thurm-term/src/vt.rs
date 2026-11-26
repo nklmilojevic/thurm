@@ -1095,14 +1095,20 @@ impl Vt {
             return String::new();
         }
         let format = |emit| {
-            let bytes = self.format_raw(emit, true, true, ffi::FORMATTER_EXTRAS_NONE, Some(&sel));
-            String::from_utf8_lossy(&bytes).into_owned()
+            let bytes =
+                self.try_format(emit, true, true, ffi::FORMATTER_EXTRAS_NONE, Some(&sel))?;
+            Some(String::from_utf8_lossy(&bytes).into_owned())
         };
-        let plain = format(ffi::FormatterFormat::PLAIN);
+        let Some(plain) = format(ffi::FormatterFormat::PLAIN) else {
+            return String::new();
+        };
         // Concealed cells (SGR 8, e.g. a password echoed hidden) are not shown, so they are not
         // copied either. The plain formatter has no notion of them; the styled one marks them,
-        // over exactly the cells the copy has, in one pass along the pages.
-        let styled = format(ffi::FormatterFormat::VT);
+        // over exactly the cells the copy has, in one pass along the pages. Without it, nothing
+        // says the plain text is safe to copy: nothing is copied.
+        let Some(styled) = format(ffi::FormatterFormat::VT) else {
+            return String::new();
+        };
         if !conceals(&styled) {
             return plain;
         }
@@ -1166,7 +1172,8 @@ impl Vt {
                 } else {
                     char::from_u32(c.codepoint).into_iter().collect()
                 };
-                if text.iter().all(|c| *c == '\0' || c.is_whitespace()) {
+                // Blank cells: the formatter's text has ASCII blanks there (or nothing).
+                if text.iter().all(|c| matches!(c, '\0' | ' ')) {
                     continue;
                 }
                 let hidden = c.has_styling
@@ -1188,7 +1195,8 @@ impl Vt {
         let (mut i, mut k) = (0, 0);
         while i < chars.len() {
             let c = chars[i];
-            if c.is_whitespace() {
+            // The formatter's blanks and line breaks (other spaces are cells' text).
+            if matches!(c, ' ' | '\n' | '\r') {
                 if c == '\n' {
                     let kept = out.trim_end_matches(' ').len();
                     out.truncate(kept);
@@ -1414,7 +1422,8 @@ impl Vt {
         self.format_raw(emit, unwrap, trim, extras.bits(), sel.as_ref())
     }
 
-    /// Format the active screen (or `sel`) with a formatter set to these options.
+    /// Format the active screen (or `sel`) with a formatter set to these options; empty
+    /// when formatting fails.
     fn format_raw(
         &self,
         emit: ffi::FormatterFormat::Type,
@@ -1423,11 +1432,29 @@ impl Vt {
         extras: ffi::FormatterExtras,
         sel: Option<&ffi::Selection>,
     ) -> Vec<u8> {
+        self.try_format(emit, unwrap, trim, extras, sel)
+            .unwrap_or_default()
+    }
+
+    /// Format the active screen (or `sel`) with a formatter set to these options; `None` when
+    /// formatting fails.
+    fn try_format(
+        &self,
+        emit: ffi::FormatterFormat::Type,
+        unwrap: bool,
+        trim: bool,
+        extras: ffi::FormatterExtras,
+        sel: Option<&ffi::Selection>,
+    ) -> Option<Vec<u8>> {
+        #[cfg(test)]
+        if FAIL_FORMAT.with(|f| f.get()) == Some(emit) {
+            return None;
+        }
         let mut f: ffi::Formatter = ptr::null_mut();
         if unsafe { ffi::ghostty_formatter_terminal_new(ptr::null(), &mut f, self.raw) }
             != ffi::Result::SUCCESS
         {
-            return Vec::new();
+            return None;
         }
         fn set<T>(f: ffi::Formatter, opt: ffi::FormatterOption::Type, value: &T) -> bool {
             let value = (value as *const T).cast();
@@ -1441,17 +1468,18 @@ impl Vt {
             && sel.is_none_or(|s| set(f, O::SELECTION, s));
         if !applied {
             unsafe { ffi::ghostty_formatter_free(f) };
-            return Vec::new();
+            return None;
         }
         let (mut out, mut len): (*mut u8, usize) = (ptr::null_mut(), 0);
         let r = unsafe { ffi::ghostty_formatter_format_alloc(f, ptr::null(), &mut out, &mut len) };
-        let bytes = if r == ffi::Result::SUCCESS && !out.is_null() {
+        let bytes = (r == ffi::Result::SUCCESS).then(|| {
+            if out.is_null() {
+                return Vec::new();
+            }
             let v = unsafe { std::slice::from_raw_parts(out, len) }.to_vec();
             unsafe { ffi::ghostty_free(ptr::null(), out, len) };
             v
-        } else {
-            Vec::new()
-        };
+        });
         unsafe { ffi::ghostty_formatter_free(f) };
         bytes
     }
@@ -1970,6 +1998,13 @@ mod kitty_ffi {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Formatting with this output format fails (to test what a failure leaves).
+    pub(crate) static FAIL_FORMAT: std::cell::Cell<Option<ffi::FormatterFormat::Type>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// A piece of the formatter's styled (VT) output.
 enum Piece<'a> {
     /// A character of the text, line breaks included.
@@ -2052,7 +2087,8 @@ pub(crate) fn conceals(styled: &str) -> bool {
     let mut any = false;
     pieces(styled, |p| match p {
         Piece::Sgr(params) => concealed = sgr_conceals(params, concealed),
-        Piece::Text(c) if concealed && !c.is_whitespace() => any = true,
+        // Concealed blanks copy as blanks anyway; other spaces (U+3000) are text.
+        Piece::Text(c) if concealed && !matches!(c, ' ' | '\n' | '\r') => any = true,
         _ => {}
     });
     any
