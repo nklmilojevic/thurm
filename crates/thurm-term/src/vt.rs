@@ -2262,6 +2262,13 @@ impl Blanker<'_> {
         let mut cells = 0;
         let mut rest = &self.hidden[..];
         while !rest.is_empty() {
+            // An ASCII blank (a written space, or the formatter's own for an empty cell) is
+            // one cell and none of the grid's cells with text.
+            if rest[0] == u32::from(' ') {
+                cells += 1;
+                rest = &rest[1..];
+                continue;
+            }
             match self.grid.split_first() {
                 Some(((text, w), next))
                     if rest.len() >= text.len()

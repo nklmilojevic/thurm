@@ -482,6 +482,9 @@ fn styled_text_parses_escapes() {
     // The grid's widths win over clustering's.
     let grid = [(vec!['👍'], 2), (vec!['🏽'], 2)];
     assert_eq!(styled_text("\x1b[8m👍🏽\x1b[28m|", true, &grid), "    |");
+    // A concealed ASCII blank is one cell of its own: the grid's cells still line up after it.
+    let grid = [(vec!['a'], 1), (vec!['👍'], 2), (vec!['🏽'], 2)];
+    assert_eq!(styled_text("\x1b[8ma 👍🏽\x1b[28m|", true, &grid), "      |");
     // Every trailing row without written cells is dropped, its blanks too.
     assert_eq!(s("a\r\n\x1b[44m\x1b[K\r\n\x1b[K\r\n\x1b[5C\x1b[m"), "a");
     // Skipped cells before a written one stay; a row of written blanks keeps its line.
