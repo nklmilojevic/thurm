@@ -90,6 +90,38 @@ fn wait_snapshot(env: &Env, what: &str, pred: impl Fn(&serde_json::Value) -> boo
     }
 }
 
+/// Pane `i`'s saved record in `snap`, opened with the daemon's key (beside the state
+/// directory), or `null` when it has none. The record is sealed on disk.
+fn opened_record(env: &Env, snap: &serde_json::Value, i: usize) -> serde_json::Value {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    let pane = &snap["panes"][i];
+    let Some(sealed) = pane["program_resume"].as_str() else {
+        return serde_json::Value::Null;
+    };
+    let evidence = std::fs::read(env.dir.join("state-keys/resume-evidence.key")).unwrap();
+    let mut mac = <Hmac<sha2::Sha256> as hmac::KeyInit>::new_from_slice(&evidence).unwrap();
+    mac.update(b"thurm program resume record seal v1");
+    let key: [u8; 32] = mac.finalize().into_bytes().into();
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(sealed.strip_prefix("sealed-v1:").unwrap())
+        .unwrap();
+    let (nonce, msg) = data.split_at(12);
+    let nonce: [u8; 12] = nonce.try_into().unwrap();
+    let aad = format!("thurm program resume record of pane {}", pane["id"]);
+    let json = aes_gcm::Aes256Gcm::new(&key.into())
+        .decrypt(
+            &nonce.into(),
+            Payload {
+                msg,
+                aad: aad.as_bytes(),
+            },
+        )
+        .unwrap();
+    serde_json::from_slice(&json).unwrap()
+}
+
 fn sha256_hex(s: &str) -> String {
     use sha2::Digest;
     sha2::Sha256::digest(s.as_bytes())
@@ -269,8 +301,14 @@ fn report_persists_resumes_verbatim_without_shell_parsing_and_never_retries_twic
     // Persisted on acceptance (not at the 60 s snapshot interval).
     let want = prog.display().to_string();
     wait_snapshot(&env, "record saved", |snap| {
-        snap["panes"][0]["program_resume"]["argv"][0] == want.as_str()
+        opened_record(&env, snap, 0)["argv"][0] == want.as_str()
     });
+    // Sealed: the reported arguments are not in the file.
+    let bytes = std::fs::read_to_string(env.dir.join("state/session.json")).unwrap();
+    assert!(
+        !bytes.contains("--flag") && !bytes.contains("$(touch"),
+        "{bytes}"
+    );
 
     // Cold restart.
     c.request(Request::Shutdown { kill_panes: true }).unwrap();
@@ -516,7 +554,8 @@ fn first_process_resumes_as_first_process() {
     let at_start: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&snap_at_start).unwrap()).unwrap();
     assert_eq!(
-        at_start["panes"][0]["program_resume"]["attempted"], true,
+        opened_record(&env, &at_start, 0)["attempted"],
+        true,
         "the attempt was not on disk before the command ran"
     );
 

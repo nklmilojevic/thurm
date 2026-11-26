@@ -111,15 +111,26 @@ keeps its sandbox and approval settings (`--sandbox`/`-s`, `--ask-for-approval`/
 including against a built-in rule's `preserve_flags` an override inherits: conflicting
 arities disable the rule (with a config warning).
 
-`session.json` holds the full reported resume command as the program reported it, in plain
-text (the file is private to you, but it is still on disk and in backups). Programs should
-not put credentials in reported arguments. From the original launch command line, only the
-options rules check are saved, and only as keyed digests of their values (HMAC-SHA256),
+`session.json` holds each saved program sealed (AES-256-GCM): the reported resume command,
+its working directory and what restore checks it against are not readable in the file or in
+copies of it, and a record that does not open (another key, or changed on disk) is dropped
+while the rest of the session restores. From the original launch command line, only the
+options rules check are kept, and only as keyed digests of their values (HMAC-SHA256),
 never the values themselves.
-The key lives outside the state directory: in `~/Library/Application Support/Thurm Keys` on
-macOS and `~/.local/share/thurm/keys` elsewhere (`THURM_KEY_DIR` overrides it). Without it,
-programs are not saved for resumption. A saved program whose rule now checks an option the
-session did not record is not resumed.
+The key lives outside the state directory, in the first of:
+
+1. `THURM_KEY_DIR`, which must not be in the state directory;
+2. with `THURM_STATE_DIR` set, the directory beside it with `-keys` appended
+   (`/srv/thurm/state-keys` for `/srv/thurm/state`);
+3. `~/Library/Application Support/Thurm Keys` on macOS and `~/.local/share/thurm/keys`
+   elsewhere, or the state directory's `-keys` sibling when that would be inside the state
+   directory (`XDG_DATA_HOME` and `XDG_STATE_HOME` the same directory).
+
+Moving the state directory to another machine without the key restores the layout, not the
+programs. Without the key, programs are not saved for resumption. A saved program whose rule
+now checks an option the session did not record is not resumed. If `settings.toml` cannot be
+read or parsed, or a program resume setting in it is rejected, program resumption is off
+until it loads.
 
 To disable a built-in rule, add an entry with its `name` and `enabled = false`. Set
 `session.resume_programs = "all"` to trust any verified report from an unwrapped process,
