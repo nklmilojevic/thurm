@@ -1760,15 +1760,30 @@ impl Config {
             Err(e) => return Err(fail(e.to_string())),
         };
         let overlay_path = overlay::path_beside(&path);
-        let (text, mut warnings) = match overlay::read(&overlay_path) {
+        // Whether program resume settings in the overlay may have been lost: it could not be
+        // read or parsed, or one of them was left out.
+        let (text, mut warnings, resume_lost) = match overlay::read(&overlay_path) {
             Ok(overlay) => {
                 let merged = overlay::merge(&text, &overlay).map_err(fail)?;
-                (merged.text, merged.warnings)
+                let lost = merged
+                    .rejected
+                    .iter()
+                    .any(|k| k == "*" || k == "session" || k.starts_with("session.resume"));
+                (merged.text, merged.warnings, lost)
             }
-            Err(e) => (text, vec![format!("{}: {e}", overlay_path.display())]),
+            Err(e) => (text, vec![format!("{}: {e}", overlay_path.display())], true),
         };
-        let (cfg, unknown) = Self::parse_with_warnings(&text).map_err(fail)?;
+        let (mut cfg, unknown) = Self::parse_with_warnings(&text).map_err(fail)?;
         warnings.extend(unknown);
+        // It may have been the overlay that turned program resume off: the base config (or the
+        // defaults) must not run a saved command the user meant to stop.
+        if resume_lost && cfg.session.resume_programs != ResumeProgramsMode::Off {
+            cfg.session.resume_programs = ResumeProgramsMode::Off;
+            warnings.push(format!(
+                "{}: program resume is off until it loads",
+                overlay_path.display()
+            ));
+        }
         Ok((with_session_theme(cfg), warnings))
     }
 
@@ -2938,6 +2953,48 @@ clipboard_read = "always"
             .try_fold(DEFAULT_CONFIG_TOML.to_owned(), |t, (k, v)| with_setting(&t, k, v))
             .unwrap();
         assert_eq!(all, DEFAULT_CONFIG_TOML);
+    }
+
+    #[test]
+    fn a_settings_overlay_that_fails_to_load_turns_program_resume_off() {
+        let dir = std::env::temp_dir().join(format!("thurm-overlay-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[session]\nresume_programs = \"all\"\n").unwrap();
+        let overlay = overlay::path_beside(&path);
+        let load = || Config::load_with_warnings_from(&path).unwrap();
+        let mode = || load().0.session.resume_programs;
+        assert_eq!(mode(), ResumeProgramsMode::All);
+        // Read and applied: its value holds.
+        std::fs::write(&overlay, "[session]\nresume_programs = \"rules\"\n").unwrap();
+        assert_eq!(mode(), ResumeProgramsMode::Rules);
+        // A setting of something else left out: the base's value holds.
+        std::fs::write(&overlay, "[font]\nsize = \"big\"\n").unwrap();
+        assert_eq!(mode(), ResumeProgramsMode::All);
+        // Not parsed, a resume setting left out, or not readable: off, with a warning.
+        for text in [
+            "[session\nresume_programs = \"off\"",
+            "[session]\nresume_programs = \"of\"\n",
+        ] {
+            std::fs::write(&overlay, text).unwrap();
+            let (cfg, warnings) = load();
+            assert_eq!(
+                cfg.session.resume_programs,
+                ResumeProgramsMode::Off,
+                "{text}"
+            );
+            assert!(
+                warnings.iter().any(|w| w.contains("program resume is off")),
+                "{warnings:?}"
+            );
+            // Other settings still come from the base.
+            assert_eq!(cfg.font.size, Config::default().font.size);
+        }
+        std::fs::remove_file(&overlay).unwrap();
+        std::fs::create_dir(&overlay).unwrap();
+        assert_eq!(mode(), ResumeProgramsMode::Off);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
