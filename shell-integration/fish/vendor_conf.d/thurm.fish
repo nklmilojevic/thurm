@@ -47,6 +47,8 @@ if status is-interactive; and not set -q __thurm_fish_loaded
     end
 
     function __thurm_prompt --on-event fish_prompt
+        # A restore's resume runs the prompt handlers ahead of the program: not a prompt yet.
+        set -q __thurm_resuming; and return
         printf '\e]7;file://%s%s\a' $hostname (string escape --style=url -- $PWD)
         # $PATH for Thurm's tab completion (only when it changed).
         set -l path (string join : -- $PATH)
@@ -71,21 +73,30 @@ if status is-interactive; and not set -q __thurm_fish_loaded
     end
 end
 
-# Armed by the `-C` command Thurm starts a restored fish with, which sets the ticket and
-# sources this file again after config.fish: the handler is registered after the prompt
-# handlers config.fish added (direnv's), so they run first and the program is looked up on the
-# PATH they made. It runs inside the handler, before fish queries the terminal for the prompt:
-# run as the prompt's command line instead (`commandline -f execute`), it would take the
-# terminal's answers to those queries, which fish 4 does not survive.
+# Run by the `-C` command Thurm starts a restored fish with, which sets the ticket and sources
+# this file again after config.fish. It runs as a top-level command there: fish hands such a
+# job the terminal (its process group in the foreground, the terminal's own modes) in every
+# job-control mode, which it never does for a job an event handler starts, and it comes before
+# fish's first prompt queries the terminal, whose answers would otherwise be read as input.
+# The prompt handlers config.fish registered (direnv's, mise's) run first, so the program is
+# looked up on the PATH they make; they run again at the first prompt. Thurm's own prompt mark
+# waits for that prompt: the program's output is not a prompt to clear on resize.
 if status is-interactive; and set -q __thurm_resume_ticket; and test -n "$THURM_RESUME_EXEC"
-    and not functions -q __thurm_resume
-    set -g __thurm_resume_exec $THURM_RESUME_EXEC
+    set -l ticket $__thurm_resume_ticket
+    set -l exec $THURM_RESUME_EXEC
+    set -e __thurm_resume_ticket
     set -e THURM_RESUME_EXEC
-    function __thurm_resume --on-event fish_prompt
-        functions -e __thurm_resume
-        set -l ticket $__thurm_resume_ticket
-        set -l exec $__thurm_resume_exec
-        set -e __thurm_resume_ticket __thurm_resume_exec
-        command $exec --exec-resume $ticket
-    end
+    set -g __thurm_resuming 1
+    emit fish_prompt
+    set -e __thurm_resuming
+    # Its own process group, as for a command typed at a prompt, so Ctrl-Z stops it (fish
+    # treats a `-C` command as non-interactive in its default job-control mode).
+    set -l jc none
+    status is-interactive-job-control; and set jc interactive
+    status is-full-job-control; and set jc full
+    status job-control full
+    printf '\e]133;C\a'
+    command $exec --exec-resume $ticket
+    printf '\e]133;D;%s\a' $status
+    status job-control $jc
 end

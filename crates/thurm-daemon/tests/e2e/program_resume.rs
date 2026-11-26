@@ -979,13 +979,19 @@ fn fish_integration_resume_uses_startup_path_and_bypasses_functions() {
     std::fs::create_dir_all(&custom_bin).unwrap();
 
     let prog = custom_bin.join("fishresumeprog");
-    write_exec(&prog, "#!/bin/sh\necho FISH_RESUMED_OK\n");
+    // It reads the terminal: fish must hand the resumed job the terminal, in full job control
+    // too (where a job an event handler starts gets its own process group, not the terminal).
+    write_exec(
+        &prog,
+        "#!/bin/sh\necho FISH_RESUMED_OK\nread line\necho \"FISH_GOT_${line}_END\"\nsleep 30\n",
+    );
     // The program is on PATH only once a prompt handler config.fish registered ran (as
     // direnv's does): the resume must come after it.
     std::fs::write(
         home.join(".config/fish/config.fish"),
         format!(
-            "function __my_env --on-event fish_prompt; fish_add_path -gp '{}'; end\n\
+            "status job-control full\n\
+             function __my_env --on-event fish_prompt; fish_add_path -gp '{}'; end\n\
              function fishresumeprog; touch '{}'; end\n",
             custom_bin.display(),
             fn_marker.display(),
@@ -1028,6 +1034,24 @@ fn fish_integration_resume_uses_startup_path_and_bypasses_functions() {
         !fn_marker.exists(),
         "fish function ran instead of PATH lookup"
     );
+    // The program's output is not a prompt fish redraws: resizing keeps it.
+    for cols in [60, 100] {
+        c2.request(Request::Resize {
+            pane,
+            size: PaneSize {
+                cols,
+                rows: 24,
+                cell_width: 8,
+                cell_height: 16,
+            },
+        })
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let shown = capture(&c2, pane);
+        assert!(shown.contains("FISH_RESUMED_OK"), "after resize to {cols}: {shown}");
+    }
+    run_line(&c2, pane, "typed");
+    wait_match(&c2, pane, "FISH_GOT_typed_END");
 }
 
 #[test]
