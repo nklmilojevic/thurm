@@ -2395,32 +2395,7 @@ impl Daemon {
                         };
                     st.info.title = pane_title(&st, fg.as_ref());
                     st.info.foreground = fg;
-                    if let Some((due, _)) = &st.pending_input
-                        && Instant::now() >= *due
-                        && let Some((_, input)) = st.pending_input.take()
-                    {
-                        // Typed only into the pane's own shell, waiting in the foreground, and
-                        // never after someone typed: a startup job would read it as input, and
-                        // a half-typed line would run with it.
-                        let shell_waits = st.info.foreground.as_ref().is_some_and(|p| {
-                            procinfo::is_shell(&p.name)
-                                && (st.info.pid == Some(p.pid)
-                                    || procinfo::parent(p.pid) == st.info.pid)
-                        });
-                        if shell_waits && !st.typed {
-                            pane.write(input);
-                        } else if !st.typed && st.pending_waits < PENDING_INPUT_WAITS {
-                            // The shell isn't up yet (slow startup files run something in the
-                            // foreground): wait for it, or for its first prompt.
-                            st.pending_waits += 1;
-                            st.pending_input = Some((Instant::now() + Duration::from_secs(1), input));
-                        } else {
-                            self.resume_tickets.lock().retain(|t| t.pane != pane.id);
-                            st.term.print(
-                                "\r\n[automatic resume skipped: the terminal was busy]\r\n",
-                            );
-                        }
-                    }
+                    self.type_pending_input(&pane, &mut st);
                     // idle_ms changes every tick; only report it along with other changes, or
                     // every 2 s for clients that display it.
                     let mut cmp = st.info.clone();
@@ -2584,6 +2559,40 @@ impl Daemon {
             }
         }
         true
+    }
+
+    /// Types a restored pane's pending resume line once it is due (see `pending_input`). Not
+    /// while an upgrade hands the panes over: the hand-off may already carry the line, for the
+    /// next image to type; it stays for this monitor if the upgrade gives up. Read under the
+    /// pane's lock, which `handoff` takes after setting the flag.
+    fn type_pending_input(&self, pane: &Arc<Pane>, st: &mut PaneState) {
+        if self.upgrading.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some((due, _)) = &st.pending_input
+            && Instant::now() >= *due
+            && let Some((_, input)) = st.pending_input.take()
+        {
+            // Typed only into the pane's own shell, waiting in the foreground, and
+            // never after someone typed: a startup job would read it as input, and
+            // a half-typed line would run with it.
+            let shell_waits = st.info.foreground.as_ref().is_some_and(|p| {
+                procinfo::is_shell(&p.name)
+                    && (st.info.pid == Some(p.pid) || procinfo::parent(p.pid) == st.info.pid)
+            });
+            if shell_waits && !st.typed {
+                pane.write(input);
+            } else if !st.typed && st.pending_waits < PENDING_INPUT_WAITS {
+                // The shell isn't up yet (slow startup files run something in the
+                // foreground): wait for it, or for its first prompt.
+                st.pending_waits += 1;
+                st.pending_input = Some((Instant::now() + Duration::from_secs(1), input));
+            } else {
+                self.resume_tickets.lock().retain(|t| t.pane != pane.id);
+                st.term
+                    .print("\r\n[automatic resume skipped: the terminal was busy]\r\n");
+            }
+        }
     }
 
     /// Lets the readers go on (the upgrade did not happen).
@@ -6747,6 +6756,41 @@ mod tests {
             .push(ticket_for(id, &t3, resume_policy(&off)));
         let got = daemon.dispatch(&client, Request::TakeResume { ticket: t3 });
         assert!(matches!(&got, Ok(Response::Text(_))), "{got:?}");
+        daemon.close_pane(id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// While an upgrade hands the panes over, a resume line that comes due stays pending (the
+    /// hand-off may carry it for the next image to type); if the upgrade gives up, this
+    /// image services it again.
+    #[test]
+    fn a_resume_line_due_during_an_upgrade_stays_pending() {
+        let dir = test_dir("upgrade-pending");
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let id = cat_pane(&daemon);
+        let pane = daemon.pane(id).unwrap();
+        let due = Instant::now();
+        pane.state.lock().pending_input = Some((due, b"x\r".to_vec()));
+        daemon.set_upgrading(true);
+        daemon.type_pending_input(&pane, &mut pane.state.lock());
+        {
+            let st = pane.state.lock();
+            assert_eq!(st.pending_input, Some((due, b"x\r".to_vec())));
+            assert_eq!(st.pending_waits, 0);
+        }
+        // Serviced again (`cat` is no shell: it waits for one).
+        daemon.set_upgrading(false);
+        daemon.type_pending_input(&pane, &mut pane.state.lock());
+        {
+            let st = pane.state.lock();
+            assert_eq!(st.pending_waits, 1);
+            assert!(st.pending_input.as_ref().is_some_and(|(d, _)| *d > due));
+        }
         daemon.close_pane(id);
         let _ = std::fs::remove_dir_all(dir);
     }
