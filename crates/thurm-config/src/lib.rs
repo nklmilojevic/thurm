@@ -517,6 +517,15 @@ pub enum TabStyle {
     Sidebar,
 }
 
+/// What the sidebar's usage limits count: what is left of each window, or what is used.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageShow {
+    #[default]
+    Left,
+    Used,
+}
+
 /// How fast pane moves and the chrome animate.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -611,10 +620,12 @@ pub struct WindowConfig {
     /// Retired with `sidebar_agents`.
     #[serde(skip_serializing)]
     pub sidebar_agent_rows: u32,
-    /// Show what is left of the Claude Code subscription limits at the bottom of the sidebar.
+    /// Show the Claude Code subscription limits at the bottom of the sidebar.
     pub sidebar_usage_claude: bool,
-    /// Show what is left of the Codex subscription limits at the bottom of the sidebar.
+    /// Show the Codex subscription limits at the bottom of the sidebar.
     pub sidebar_usage_codex: bool,
+    /// Whether the sidebar's usage limits show what is left or what is used.
+    pub sidebar_usage_show: UsageShow,
     pub mouse_navigation_buttons: bool,
 }
 
@@ -648,6 +659,7 @@ impl Default for WindowConfig {
             sidebar_agent_rows: 5,
             sidebar_usage_claude: false,
             sidebar_usage_codex: false,
+            sidebar_usage_show: UsageShow::Left,
             mouse_navigation_buttons: true,
         }
     }
@@ -3238,6 +3250,11 @@ clipboard_read = "always"
         let out = with_setting(&out, "window.sidebar_usage_codex", "true").unwrap();
         let window = Config::parse(&out).unwrap().window;
         assert!(!window.sidebar_usage_claude && window.sidebar_usage_codex);
+        assert_eq!(window.sidebar_usage_show, UsageShow::Left);
+        let out = with_setting(&out, "window.sidebar_usage_show", "\"used\"").unwrap();
+        let window = Config::parse(&out).unwrap().window;
+        assert_eq!(window.sidebar_usage_show, UsageShow::Used);
+        assert!(with_setting(&out, "window.sidebar_usage_show", "\"spent\"").is_err());
         assert!(with_setting(&out, "window.tab_style", "\"diagonal\"").is_err());
         assert!(with_setting(&out, "window.nope", "1").is_err());
         assert!(with_setting(&out, "tab_style", "1").is_err());

@@ -72,9 +72,11 @@ sidebar_all_workspaces = false
 sidebar_by_host = false
 sidebar_host = ""
 sidebar_active_only = false
-# What is left of the Claude Code / Codex subscription limits, at the bottom of the sidebar.
+# The Claude Code / Codex subscription limits, at the bottom of the sidebar.
 sidebar_usage_claude = false
 sidebar_usage_codex = false
+# "left" or "used": what the usage limits count.
+sidebar_usage_show = "left"
 # The mouse's back and forward buttons go back and forward through the tabs visited
 # (Window > Back / Forward). Off, they reach the program as mouse buttons.
 mouse_navigation_buttons = true

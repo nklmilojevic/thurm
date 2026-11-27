@@ -102,6 +102,7 @@ const OPTION_AS_ALT: &[&str] = &["none", "left", "right", "both"];
 const TAB_STYLE: &[&str] = &["native", "sidebar"];
 const ANIMATION_SPEED: &[&str] = &["normal", "slow", "slower"];
 const CURSOR_STYLE: &[&str] = &["block", "beam", "underline"];
+const USAGE_SHOW: &[&str] = &["left", "used"];
 const OSC52: &[&str] = &["disabled", "copy", "paste", "copy-paste"];
 const QUIT: &[&str] = &["detach", "terminate"];
 const RESUME_PROGRAMS: &[&str] = &["off", "rules", "all"];
@@ -218,6 +219,11 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
         "window.sidebar_usage_codex",
         "Codex usage limits in sidebar",
         Kind::Bool,
+    ),
+    (
+        "window.sidebar_usage_show",
+        "Usage limits show",
+        Kind::Enum(USAGE_SHOW),
     ),
     (
         "window.mouse_navigation_buttons",

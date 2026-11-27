@@ -113,10 +113,29 @@ final class UsageLimitsTests: XCTestCase {
                                            UsageWindow(minutes: 10080, usedPercent: 18)],
                                  updated: now, problem: "Anthropic answered 500")
         let m = UsageRowModel(provider: .claude, report: report, now: now)
-        XCTAssertEqual(m.gauges, [.init(label: "5h", left: 37), .init(label: "wk", left: 82)])
+        XCTAssertEqual(m.gauges.map(\.label), ["5h", "wk"])
+        XCTAssertEqual(m.gauges.map(\.shown), [37, 82])
         XCTAssertTrue(m.stale)
         XCTAssertTrue(m.tooltip.hasPrefix("Claude\n5-hour: 37% left, resets "))
         XCTAssertTrue(m.tooltip.contains("Weekly: 82% left"))
         XCTAssertTrue(m.tooltip.contains("Anthropic answered 500"))
+    }
+
+    func testRowModelShowsUsed() {
+        let now = Date()
+        let report = UsageReport(windows: [UsageWindow(minutes: 300, usedPercent: 2.4),
+                                           UsageWindow(minutes: 10080, usedPercent: 18,
+                                                       resetsAt: now.addingTimeInterval(-60))],
+                                 updated: now)
+        let m = UsageRowModel(provider: .claude, report: report, now: now, show: .used)
+        XCTAssertEqual(m.gauges.map(\.shown), [2, 0], "as /usage rounds it; a reset window shows nothing used")
+        XCTAssertEqual(m.gauges.map(\.left), [97, 100], "the warning colours still follow what is left")
+        XCTAssertTrue(m.tooltip.contains("5-hour: 2% used"))
+        XCTAssertTrue(m.tooltip.contains("Weekly: 0% used"))
+        let rows = UsagePanel.models(selected: [.claude], reports: [.claude: report], now: now, show: .used)
+        XCTAssertEqual(rows.first?.gauges.map(\.shown), [2, 0])
+        let edge = UsageReport(windows: [UsageWindow(minutes: 300, usedPercent: 2.9999999999999996)], updated: now)
+        XCTAssertEqual(UsageRowModel(provider: .claude, report: edge, now: now, show: .used).gauges.map(\.shown), [2],
+                       "floors the reported value, not 100 minus what is left")
     }
 }
