@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.29.0 - 2026-11-27
+
+This release restores programs after a restart when they report how to resume. It also fixes copy, keypad, shell trace, and mobile behavior.
+
+### New features
+
+- Thurm restores programs after a restart when they report how to resume (OSC 7577). Set `session.resume_programs` to `off` to keep the previous restore behavior.
+- The mobile app reconnects after a network change and times out stalled SSH connections. Closing a mosh pane now ends its session on the host.
+
+### Fixes
+
+- Two phones with the same name now both get push notifications. A follow update no longer overwrites a Live Activity permission prompt.
+- Copies blank concealed text, such as a hidden password, instead of copying it. Keypad keys now send the correct codes under the kitty keyboard protocol.
+- The shell token no longer appears in trace output from zsh, bash or fish.
+
+### Other changes
+
+- The Metal renderer uses less GPU memory for large Kitty images on iOS. It retries failed GPU allocations on the next frame.
+
 ## v0.28.0 - 2026-11-25
 
 This release makes the macOS app switch workspaces and tabs faster. It also adds icons for remote hosts and fixes LAN access on macOS.
