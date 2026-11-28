@@ -166,6 +166,7 @@ the defaults alone.
 | `toggle_sidebar_all_workspaces` | View > Tabs from All Workspaces |
 | `toggle_sidebar_by_host` | View > Tabs by Host |
 | `toggle_sidebar_active_only` | View > Only Active Tabs |
+| `toggle_sidebar_compact` | View > Compact Tabs |
 | `toggle_sidebar_usage_claude` | View > Usage Limits in Sidebar > Claude Code |
 | `toggle_sidebar_usage_codex` | View > Usage Limits in Sidebar > Codex |
 | `toggle_sidebar` | View > Hide Sidebar |

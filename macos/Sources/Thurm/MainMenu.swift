@@ -426,6 +426,8 @@ enum MainMenu {
             alias.allowsKeyEquivalentWhenHidden = true
             menu.addItem(alias)
         }
+        menu.addItem(item("Compact Tabs", #selector(AppDelegate.toggleSidebarCompact(_:)),
+                          name: "toggle_sidebar_compact"))
         let usage = NSMenu(title: "Usage Limits in Sidebar")
         usage.addItem(item("Claude Code", #selector(AppDelegate.toggleSidebarUsageClaude(_:)),
                            name: "toggle_sidebar_usage_claude"))

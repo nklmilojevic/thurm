@@ -424,3 +424,203 @@ final class CommandHoldTests: XCTestCase {
         XCTAssertEqual(row.shownShortcut, "")
     }
 }
+
+final class CompactTabSidebarTests: XCTestCase {
+    private let manager = SessionManager.shared
+    private var savedConfig: AppConfig!
+    private var savedWorkspaces: [Workspace] = []
+    private var savedPanes: [PaneKey: PaneInfo] = [:]
+    private var controllers: [TerminalWindowController] = []
+
+    override func setUp() {
+        super.setUp()
+        _ = NSApplication.shared
+        savedConfig = manager.config
+        savedWorkspaces = manager.workspaces
+        savedPanes = manager.panes
+        manager.config = AppConfig()
+        manager.workspaces = []
+        manager.panes = [:]
+        manager.config.sidebarTabs = true
+        manager.config.sidebarGroupByRepo = false
+    }
+
+    override func tearDown() {
+        for c in controllers {
+            c.closingWithoutConfirmation = true
+            c.window?.close()
+        }
+        controllers = []
+        manager.config = savedConfig
+        manager.workspaces = savedWorkspaces
+        manager.panes = savedPanes
+        super.tearDown()
+    }
+
+    private func outline(_ sidebar: TabSidebarViewController) throws -> NSOutlineView {
+        func find(_ view: NSView) -> NSOutlineView? {
+            if let o = view as? NSOutlineView { return o }
+            for sub in view.subviews {
+                if let found = find(sub) { return found }
+            }
+            return nil
+        }
+        return try XCTUnwrap(find(sidebar.view))
+    }
+
+    /// Compact rows hide the subtitle, fade overflowing titles, and cleanly toggle back to normal on reuse.
+    func testCompactRowHidesSubtitleFadesOverflowAndTogglesCleanly() {
+        let row = TabRowView()
+        row.frame = NSRect(x: 0, y: 0, width: 200, height: TabRowView.compactHeight)
+
+        var longTab = SidebarTab(controller: nil, title: "1Password CLI headless authentication workflow",
+                                 subtitle: "~/dev/personal/thurm", branch: "main", added: 12, removed: 3,
+                                 status: .idle, shortcut: 1, selected: true, icon: .claude)
+        row.configure(longTab, compact: true)
+        row.layoutSubtreeIfNeeded()
+        XCTAssertTrue(row.isCompact)
+        XCTAssertTrue(row.isSubtitleHidden)
+        XCTAssertTrue(row.titleBox.fadesOverflow)
+        XCTAssertTrue(row.titleBox.isFading)
+        XCTAssertTrue(row.toolTip?.contains("main") == true)
+        XCTAssertTrue(row.toolTip?.contains("~/dev/personal/thurm") == true)
+
+        // Short title fits without a fade mask.
+        let shortTab = SidebarTab(controller: nil, title: "~/nix-config", subtitle: "~/nix-config",
+                                  selected: true, icon: .shell)
+        row.configure(shortTab, compact: true)
+        row.layoutSubtreeIfNeeded()
+        XCTAssertFalse(row.titleBox.isFading)
+
+        // Switching back to normal mode restores the subtitle and disables fading.
+        longTab.selected = false
+        row.frame = NSRect(x: 0, y: 0, width: 200, height: TabRowView.normalHeight)
+        row.configure(longTab, compact: false)
+        row.layoutSubtreeIfNeeded()
+        XCTAssertFalse(row.isCompact)
+        XCTAssertFalse(row.isSubtitleHidden)
+        XCTAssertFalse(row.titleBox.fadesOverflow)
+        XCTAssertFalse(row.titleBox.isFading)
+    }
+
+    /// Compact rows keep Command-hold shortcuts, working dots, and progress bars working without overlap.
+    func testCompactRowKeepsShortcutWorkingDotsAndProgress() {
+        var scheduled: [DispatchWorkItem] = []
+        let hold = CommandHold { scheduled.append($0) }
+        let row = TabRowView(hold: hold)
+        row.frame = NSRect(x: 0, y: 0, width: 180, height: TabRowView.compactHeight)
+
+        var tab = SidebarTab(controller: nil, title: "Building release bundle", status: .working,
+                             shortcut: 3, selected: false, icon: .claude)
+        tab.progress = ProgressReport(state: .normal, percent: 60)
+        row.configure(tab, compact: true)
+        row.layoutSubtreeIfNeeded()
+
+        let bar = row.subviews.compactMap { $0 as? ProgressBarView }.first!
+        let working = row.subviews.compactMap { $0 as? WorkingDots }.first!
+        XCTAssertFalse(bar.isHidden)
+        XCTAssertTrue(working.isShown)
+        XCTAssertEqual(row.shownShortcut, "")
+        XCTAssertLessThanOrEqual(row.titleBox.frame.maxX, working.frame.minX)
+
+        hold.update(.flagsChanged, .command)
+        scheduled.forEach { $0.perform() }
+        scheduled = []
+        row.layoutSubtreeIfNeeded()
+        XCTAssertEqual(row.shownShortcut, "⌘3")
+        XCTAssertLessThanOrEqual(row.titleBox.frame.maxX, working.frame.minX)
+        XCTAssertTrue(row.titleBox.isFading)
+    }
+
+    /// Toggling `config.sidebarCompact` invalidates the sidebar cache and updates row heights and cells.
+    func testSidebarReloadSwitchesRowHeightWhenCompactToggles() throws {
+        let ws = manager.makeWorkspace(name: "main")
+        let pane = PaneKey.local(1)
+        manager.panes[pane] = PaneInfo(json: ["id": 1, "cwd": "/tmp/work", "title": "~/nix-config"])!
+        let c = manager.makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
+        c.workspaceID = ws.id
+        controllers.append(c)
+
+        let sidebar = try XCTUnwrap(c.sidebar)
+        sidebar.view.frame = NSRect(x: 0, y: 0, width: 240, height: 400)
+        let outline = try outline(sidebar)
+
+        manager.config.sidebarCompact = false
+        sidebar.reload()
+        sidebar.view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(outline.numberOfRows, 1)
+        XCTAssertEqual(outline.rect(ofRow: 0).height, TabRowView.normalHeight)
+        let normalCell = try XCTUnwrap(outline.view(atColumn: 0, row: 0, makeIfNecessary: true) as? TabRowView)
+        XCTAssertFalse(normalCell.isCompact)
+
+        manager.config.sidebarCompact = true
+        sidebar.reload()
+        sidebar.view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(outline.rect(ofRow: 0).height, TabRowView.compactHeight)
+        let compactCell = try XCTUnwrap(outline.view(atColumn: 0, row: 0, makeIfNecessary: true) as? TabRowView)
+        XCTAssertTrue(compactCell.isCompact)
+        XCTAssertTrue(compactCell.isSubtitleHidden)
+
+        // Switching back restores normal height.
+        manager.config.sidebarCompact = false
+        sidebar.reload()
+        sidebar.view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(outline.rect(ofRow: 0).height, TabRowView.normalHeight)
+        let restoredCell = try XCTUnwrap(outline.view(atColumn: 0, row: 0, makeIfNecessary: true) as? TabRowView)
+        XCTAssertFalse(restoredCell.isCompact)
+    }
+
+    /// `refreshAges` keeps agent rows compact in Only Active Tabs mode.
+    func testRefreshAgesPreservesCompactMode() throws {
+        let ws = manager.makeWorkspace(name: "main")
+        let pane = PaneKey.local(1)
+        var info = PaneInfo(json: ["id": 1, "agent": ["name": "Claude Code", "status": "Working"]])!
+        info.agent?.updatedAtMs = 1_800_000_000_000
+        manager.panes[pane] = info
+        let c = manager.makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
+        c.workspaceID = ws.id
+        controllers.append(c)
+
+        manager.config.sidebarActiveOnly = true
+        manager.config.sidebarCompact = true
+        let sidebar = try XCTUnwrap(c.sidebar)
+        sidebar.view.frame = NSRect(x: 0, y: 0, width: 240, height: 400)
+        sidebar.reload()
+        sidebar.view.layoutSubtreeIfNeeded()
+        let outline = try outline(sidebar)
+        let rowIndex = try XCTUnwrap((0..<outline.numberOfRows).first { outline.item(atRow: $0) is TabBox })
+
+        sidebar.refreshAges(now: Date(timeIntervalSince1970: 1_800_000_020))
+        let cell = try XCTUnwrap(outline.view(atColumn: 0, row: rowIndex, makeIfNecessary: true) as? TabRowView)
+        XCTAssertTrue(cell.isCompact)
+        XCTAssertTrue(cell.isSubtitleHidden)
+        XCTAssertEqual(cell.shownShortcut, "updated 20s ago")
+    }
+
+    /// `AppConfig` parses `window.sidebar_compact`, and `View > Compact Tabs` validates properly.
+    func testConfigParsingAndMenuValidation() throws {
+        let cfg = AppConfig()
+        XCTAssertFalse(cfg.sidebarCompact)
+        cfg.apply(["config": ["window": ["sidebar_compact": true]]])
+        XCTAssertTrue(cfg.sidebarCompact)
+
+        let main = MainMenu.build()
+        let item = try XCTUnwrap(MainMenu.item(forAction: "toggle_sidebar_compact", in: main))
+        XCTAssertEqual(item.title, "Compact Tabs")
+        XCTAssertEqual(item.action, #selector(AppDelegate.toggleSidebarCompact(_:)))
+
+        let delegate = AppDelegate()
+        manager.config.sidebarTabs = true
+        manager.config.sidebarByHost = true
+        manager.config.sidebarCompact = true
+        XCTAssertTrue(delegate.validateMenuItem(item))
+        XCTAssertEqual(item.state, .on)
+
+        manager.config.sidebarCompact = false
+        XCTAssertTrue(delegate.validateMenuItem(item))
+        XCTAssertEqual(item.state, .off)
+
+        manager.config.sidebarTabs = false
+        XCTAssertFalse(delegate.validateMenuItem(item))
+    }
+}

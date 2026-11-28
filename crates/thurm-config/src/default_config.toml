@@ -95,6 +95,9 @@ sidebar_host = ""
 # reporting progress, and the selected tab when its focused pane has no agent row. The filter
 # button next to the sidebar button, View > Only Active Tabs.
 sidebar_active_only = false
+# Single-line rows in the sidebar: icon and title only, hiding the branch or directory line.
+# View > Compact Tabs.
+sidebar_compact = false
 # Show what is left of a subscription's limits (the 5-hour and weekly windows) at the bottom of
 # the sidebar. View > Usage Limits in Sidebar.
 # Claude Code: read from Anthropic with Claude Code's sign-in.

@@ -604,6 +604,8 @@ pub struct WindowConfig {
     /// List only what is going on, by status: every agent that isn't idle, one row per pane,
     /// and the tabs with progress.
     pub sidebar_active_only: bool,
+    /// Single-line rows in the sidebar (icon and title only, hiding the branch/directory line).
+    pub sidebar_compact: bool,
     /// Retired: the sidebar's agents panel, replaced by `sidebar_active_only`. Kept so the
     /// configs that still set it load without a warning.
     #[serde(skip_serializing)]
@@ -644,6 +646,7 @@ impl Default for WindowConfig {
             sidebar_by_host: false,
             sidebar_host: String::new(),
             sidebar_active_only: false,
+            sidebar_compact: false,
             sidebar_agents: true,
             sidebar_agent_rows: 5,
             sidebar_usage_claude: false,
@@ -3213,13 +3216,17 @@ clipboard_read = "always"
         assert_eq!(Config::parse(&out).unwrap().window.sidebar_width, 300.0);
         let window = Config::parse(&out).unwrap().window;
         assert!(window.sidebar_group_by_repo, "grouped by default");
-        assert!(!window.sidebar_all_workspaces && !window.sidebar_active_only, "opt-in");
+        assert!(
+            !window.sidebar_all_workspaces && !window.sidebar_active_only && !window.sidebar_compact,
+            "opt-in"
+        );
         let out = with_setting(&out, "window.sidebar_group_by_repo", "false").unwrap();
         let out = with_setting(&out, "window.sidebar_all_workspaces", "true").unwrap();
         let out = with_setting(&out, "window.sidebar_active_only", "true").unwrap();
+        let out = with_setting(&out, "window.sidebar_compact", "true").unwrap();
         let window = Config::parse(&out).unwrap().window;
         assert!(!window.sidebar_group_by_repo);
-        assert!(window.sidebar_all_workspaces && window.sidebar_active_only);
+        assert!(window.sidebar_all_workspaces && window.sidebar_active_only && window.sidebar_compact);
         assert!(
             !window.sidebar_by_host && window.sidebar_host.is_empty(),
             "opt-in"

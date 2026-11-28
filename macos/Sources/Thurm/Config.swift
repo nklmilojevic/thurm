@@ -224,6 +224,8 @@ final class AppConfig {
     var sidebarHost: HostId?
     /// `window.sidebar_active_only`: only the tabs where something is going on.
     var sidebarActiveOnly = false
+    /// `window.sidebar_compact`: single-line rows in the sidebar (icon and title only).
+    var sidebarCompact = false
     var mouseNavigationButtons = true
     /// `window.sidebar_usage_claude` / `_codex`: whose subscription limits show below the tabs.
     var sidebarUsage: Set<UsageProvider> = []
@@ -428,6 +430,7 @@ final class AppConfig {
             sidebarByHost = jsonBool(w["sidebar_by_host"]) ?? sidebarByHost
             if let host = jsonString(w["sidebar_host"]) { sidebarHost = host.isEmpty ? nil : host }
             sidebarActiveOnly = jsonBool(w["sidebar_active_only"]) ?? sidebarActiveOnly
+            sidebarCompact = jsonBool(w["sidebar_compact"]) ?? sidebarCompact
             mouseNavigationButtons = jsonBool(w["mouse_navigation_buttons"]) ?? mouseNavigationButtons
             for p in UsageProvider.allCases {
                 if let on = jsonBool(w["sidebar_usage_\(p.rawValue)"]) {
