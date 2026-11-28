@@ -1157,9 +1157,9 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     /// How the sidebar lists tabs (View > Group Tabs by Repository, Tabs from All Workspaces,
-    /// Only Active Tabs, and the filter button next to the sidebar button): switch the setting `key` that `path`
-    /// reads. Saved to the config when it can be written; otherwise it switches for
-    /// this session only.
+    /// Only Active Tabs, Compact Tabs, and the filter button next to the sidebar button): switch
+    /// the setting `key` that `path` reads. Saved to the config when it can be written; otherwise
+    /// it switches for this session only.
     func toggleSidebarListing(_ key: String, _ path: WritableKeyPath<AppConfig, Bool>) {
         let on = !config[keyPath: path]
         sidebarListingOverride[path] = toggleSetting(key, to: on)

@@ -260,6 +260,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         SessionManager.shared.toggleSidebarListing("window.sidebar_active_only", \.sidebarActiveOnly)
     }
 
+    @objc func toggleSidebarCompact(_ sender: Any?) {
+        SessionManager.shared.toggleSidebarListing("window.sidebar_compact", \.sidebarCompact)
+    }
+
     @objc func toggleActivePaneBorder(_ sender: Any?) {
         SessionManager.shared.toggleActivePaneBorder()
     }
@@ -369,6 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             #selector(toggleSidebarAllWorkspaces(_:)): \.sidebarAllWorkspaces,
             #selector(toggleSidebarByHost(_:)): \.sidebarByHost,
             #selector(toggleSidebarActiveOnly(_:)): \.sidebarActiveOnly,
+            #selector(toggleSidebarCompact(_:)): \.sidebarCompact,
         ]
         if let action = menuItem.action, let path = listing[action] {
             let config = SessionManager.shared.config

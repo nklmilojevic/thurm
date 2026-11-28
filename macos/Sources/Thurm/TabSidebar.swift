@@ -388,7 +388,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     private var reloadHeld = false
     /// The rows as last shown: agents retitle their panes several times a second, which
     /// mostly changes nothing the sidebar shows.
-    private var shown: (names: [[String]], tabs: [[SidebarTab]], theme: Theme)?
+    private var shown: (names: [[String]], tabs: [[SidebarTab]], theme: Theme, compact: Bool)?
 
     private let outline = SidebarOutlineView()
     private let dropLine: NSView = {
@@ -530,6 +530,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     /// a status or membership change comes with a full reload.
     func refreshAges(now: Date = Date()) {
         let panes = SessionManager.shared.panes
+        let compact = SessionManager.shared.config.sidebarCompact
         let visible = outline.rows(in: outline.visibleRect)
         for row in visible.location..<NSMaxRange(visible) {
             guard let box = outline.item(atRow: row) as? TabBox, let pane = box.tab.pane,
@@ -538,7 +539,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             guard age != box.tab.trailingDetail else { continue }
             box.tab.trailingDetail = age
             (outline.view(atColumn: 0, row: row, makeIfNecessary: false) as? TabRowView)?
-                .configure(box.tab, truncateTail: true)
+                .configure(box.tab, compact: compact, truncateTail: true)
         }
     }
 
@@ -1089,13 +1090,14 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         }
         let tabs = leaves.map(\.tabs)
         let theme = SessionManager.shared.config.theme
-        if let s = shown, s.names == names, s.theme == theme,
+        let compact = config.sidebarCompact
+        if let s = shown, s.names == names, s.theme == theme, s.compact == compact,
            Self.sameRows(s.tabs.map(Self.identities), tabs.map(Self.identities)) {
             // The same tabs in the same places, so only a title, status or branch changed:
             // reconfigure those rows. reloadData would rebuild every row view, and a working
             // agent retitles its tab several times a second.
             if s.tabs != tabs {
-                shown = (names, tabs, theme)
+                shown = (names, tabs, theme, compact)
                 for (g, new) in zip(groups.flatMap(\.flattened).filter { $0.host == nil }, tabs) {
                     g.tabs = new
                     for (box, tab) in zip(g.boxes, new) where box.tab != tab {
@@ -1110,14 +1112,14 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                             view.setProgress(tab.progress)
                         } else {
                             view.showsHoverCard = tab.pane == nil && tab.controller != nil
-                            view.configure(tab, truncateTail: tab.pane != nil)
+                            view.configure(tab, compact: compact, truncateTail: tab.pane != nil)
                         }
                     }
                 }
             }
         } else {
             let savedScroll = scrollOffset
-            shown = (names, tabs, theme)
+            shown = (names, tabs, theme, compact)
             for g in leaves { g.boxes = g.tabs.map { TabBox($0, group: g) } }
             groups = order
             // Every workspace listed: each under its name, also when the others have no tabs to
@@ -1378,7 +1380,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
         if let g = item as? SidebarGroup { return g.host != nil ? SidebarHeadingView.hostHeight : SidebarHeadingView.height }
         if item is NewWorkspaceBox { return NewWorkspaceRowView.height }
-        return 40
+        return SessionManager.shared.config.sidebarCompact ? TabRowView.compactHeight : TabRowView.normalHeight
     }
 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
@@ -1396,7 +1398,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             ?? TabRowView()
         // A tab's card previews the tab, not an agent's pane.
         cell.showsHoverCard = box.tab.pane == nil && box.tab.controller != nil
-        cell.configure(box.tab, truncateTail: box.tab.pane != nil)
+        cell.configure(box.tab, compact: SessionManager.shared.config.sidebarCompact, truncateTail: box.tab.pane != nil)
         return cell
     }
 
@@ -1863,21 +1865,114 @@ func abbreviatePath(_ path: String) -> String {
     return parts.joined(separator: "/")
 }
 
+/// Single-line label that optionally fades its trailing edge instead of truncating with an
+/// ellipsis when its text overflows the available width.
+final class FadingLabelView: NSView {
+    static let fadeWidth: CGFloat = 22
+
+    let label = NSTextField(labelWithString: "")
+    private let fadeMask: CAGradientLayer = {
+        let layer = CAGradientLayer()
+        let opaque = CGColor(gray: 0, alpha: 1)
+        let clear = CGColor(gray: 0, alpha: 0)
+        layer.colors = [opaque, opaque, clear]
+        return layer
+    }()
+
+    var fadesOverflow = false {
+        didSet {
+            guard fadesOverflow != oldValue else { return }
+            label.lineBreakMode = fadesOverflow ? .byClipping : .byTruncatingTail
+            label.cell?.usesSingleLineMode = fadesOverflow
+            label.cell?.wraps = false
+            label.cell?.isScrollable = false
+            updateMask()
+        }
+    }
+
+    var isFading: Bool { layer?.mask != nil }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        clipsToBounds = true
+        label.maximumNumberOfLines = 1
+        label.lineBreakMode = .byTruncatingTail
+        label.cell?.wraps = false
+        label.cell?.isScrollable = false
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor),
+            label.topAnchor.constraint(equalTo: topAnchor),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override func layout() {
+        super.layout()
+        updateMask()
+    }
+
+    func updateMask() {
+        guard fadesOverflow, bounds.width > 0 else {
+            if layer?.mask != nil { layer?.mask = nil }
+            return
+        }
+        guard label.intrinsicContentSize.width > bounds.width + 0.5 else {
+            if layer?.mask != nil { layer?.mask = nil }
+            return
+        }
+        let fade = min(Self.fadeWidth, bounds.width * 0.4)
+        let stop = max(0, 1 - fade / bounds.width)
+        let rtl = userInterfaceLayoutDirection == .rightToLeft
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        fadeMask.frame = bounds
+        fadeMask.startPoint = CGPoint(x: rtl ? 1 : 0, y: 0.5)
+        fadeMask.endPoint = CGPoint(x: rtl ? 0 : 1, y: 0.5)
+        fadeMask.locations = [0, NSNumber(value: Double(stop)), 1]
+        if layer?.mask !== fadeMask { layer?.mask = fadeMask }
+        CATransaction.commit()
+    }
+}
+
 /// One sidebar row: icon tile with a status dot, title over branch/diff (or directory) and the
-/// progress bar, working dots and the Cmd+N hint (shown while Command is held).
+/// progress bar, working dots and the Cmd+N hint (shown while Command is held). In compact mode
+/// (`window.sidebar_compact`), it collapses to a single line with just the icon and fading title.
 final class TabRowView: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("TabRow")
+    static let normalHeight: CGFloat = 40
+    static let compactHeight: CGFloat = 30
+    static let normalIconSize: CGFloat = 20
+    static let compactIconSize: CGFloat = 18
 
     private let icon = NSImageView()
     private let dot = NSView()
     private let working = WorkingDots()
-    private let title = NSTextField(labelWithString: "")
+    let titleBox = FadingLabelView()
+    private var title: NSTextField { titleBox.label }
     private let subtitle = NSTextField(labelWithString: "")
     private let shortcut = NSTextField(labelWithString: "")
     private var trailingDetail: String?
     private var shortcutHint = ""
     private let hold: CommandHold
+    private var iconWidth: NSLayoutConstraint!
+    private var iconHeight: NSLayoutConstraint!
+    private var iconBottom: NSLayoutConstraint!
+    private var dotCenterY: NSLayoutConstraint!
+    private var titleEnd: NSLayoutConstraint!
     private var subtitleEnd: NSLayoutConstraint!
+    private var normalConstraints: [NSLayoutConstraint] = []
+    private var compactConstraints: [NSLayoutConstraint] = []
+    private(set) var isCompact = false
     private let progress = ProgressBarView()
     /// Tab rows show the tab's hover card; agent rows (one pane each) don't.
     var showsHoverCard = false
@@ -1896,112 +1991,171 @@ final class TabRowView: NSTableCellView {
         dot.layer?.cornerRadius = 4
         dot.layer?.borderWidth = 1.5
         title.font = .systemFont(ofSize: 13)
-        title.lineBreakMode = .byTruncatingTail
         subtitle.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         subtitle.textColor = SessionManager.shared.config.chrome.contentSecondary
         subtitle.lineBreakMode = .byTruncatingMiddle
         subtitle.maximumNumberOfLines = 1
-        title.maximumNumberOfLines = 1
         shortcut.font = .systemFont(ofSize: 11)
         shortcut.textColor = SessionManager.shared.config.chrome.contentTertiary
         progress.isHidden = true
-        for v in [icon, dot, title, subtitle, working, shortcut, progress] {
+        for v in [icon, dot, titleBox, subtitle, working, shortcut, progress] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
         }
-        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         subtitle.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         shortcut.setContentHuggingPriority(.required, for: .horizontal)
         // An empty hint has no width, and the gap goes with it: the branch gets the row back.
+        iconWidth = icon.widthAnchor.constraint(equalToConstant: Self.normalIconSize)
+        iconHeight = icon.heightAnchor.constraint(equalToConstant: 26)
+        iconBottom = icon.bottomAnchor.constraint(equalTo: centerYAnchor, constant: 10)
+        dotCenterY = dot.centerYAnchor.constraint(equalTo: icon.bottomAnchor, constant: -19)
+        titleEnd = titleBox.trailingAnchor.constraint(lessThanOrEqualTo: working.leadingAnchor, constant: -6)
         subtitleEnd = subtitle.trailingAnchor.constraint(lessThanOrEqualTo: shortcut.leadingAnchor)
-        NSLayoutConstraint.activate([
+        normalConstraints = [
+            titleBox.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            working.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            working.centerYAnchor.constraint(equalTo: titleBox.centerYAnchor),
+            subtitle.leadingAnchor.constraint(equalTo: titleBox.leadingAnchor),
+            subtitle.topAnchor.constraint(equalTo: titleBox.bottomAnchor, constant: 1),
             subtitleEnd,
+            shortcut.firstBaselineAnchor.constraint(equalTo: subtitle.firstBaselineAnchor),
+        ]
+        compactConstraints = [
+            titleBox.centerYAnchor.constraint(equalTo: centerYAnchor),
+            working.trailingAnchor.constraint(equalTo: shortcut.leadingAnchor),
+            working.centerYAnchor.constraint(equalTo: centerYAnchor),
+            shortcut.firstBaselineAnchor.constraint(equalTo: title.firstBaselineAnchor),
+        ]
+        NSLayoutConstraint.activate([
             icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
             // Centered on the row, not the title: the status dot on its corner stays inside
             // the selection.
             // The tile's bottom stays put; the panes stacked behind it rise above.
-            icon.bottomAnchor.constraint(equalTo: centerYAnchor, constant: 10),
-            icon.widthAnchor.constraint(equalToConstant: 20),
-            icon.heightAnchor.constraint(equalToConstant: 26),
+            iconBottom,
+            iconWidth,
+            iconHeight,
             dot.centerXAnchor.constraint(equalTo: icon.trailingAnchor, constant: -1),
-            dot.centerYAnchor.constraint(equalTo: icon.bottomAnchor, constant: -19),
+            dotCenterY,
             dot.widthAnchor.constraint(equalToConstant: 8),
             dot.heightAnchor.constraint(equalToConstant: 8),
-            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
-            title.topAnchor.constraint(equalTo: topAnchor, constant: 4),
-            title.trailingAnchor.constraint(lessThanOrEqualTo: working.leadingAnchor, constant: -6),
-            working.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            working.centerYAnchor.constraint(equalTo: title.centerYAnchor),
-            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 1),
+            titleBox.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
+            titleEnd,
             shortcut.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            shortcut.firstBaselineAnchor.constraint(equalTo: subtitle.firstBaselineAnchor),
             // Under the title and branch, in the row's bottom padding: the row keeps its height.
-            progress.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            progress.leadingAnchor.constraint(equalTo: titleBox.leadingAnchor),
             progress.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             progress.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
             progress.heightAnchor.constraint(equalToConstant: ProgressBarView.height),
-        ])
+        ] + normalConstraints)
         NotificationCenter.default.addObserver(self, selector: #selector(commandHeldChanged),
                                                name: CommandHold.changed, object: hold)
     }
 
+    private func setCompact(_ compact: Bool) {
+        guard compact != isCompact else { return }
+        isCompact = compact
+        subtitle.isHidden = compact
+        titleBox.fadesOverflow = compact
+        iconWidth.constant = compact ? Self.compactIconSize : Self.normalIconSize
+        iconHeight.constant = compact ? 23 : 26
+        iconBottom.constant = compact ? 9 : 10
+        dotCenterY.constant = compact ? -17 : -19
+        if compact {
+            NSLayoutConstraint.deactivate(normalConstraints)
+            NSLayoutConstraint.activate(compactConstraints)
+        } else {
+            NSLayoutConstraint.deactivate(compactConstraints)
+            NSLayoutConstraint.activate(normalConstraints)
+        }
+        updateTrailingSpacing()
+    }
+
+    private func updateTrailingSpacing() {
+        if isCompact {
+            titleEnd.constant = (working.isShown || !shortcut.stringValue.isEmpty) ? -6 : 0
+        } else {
+            titleEnd.constant = -6
+            subtitleEnd.constant = shortcut.stringValue.isEmpty ? 0 : -4
+        }
+    }
+
     @objc private func commandHeldChanged() {
         shortcut.stringValue = trailingDetail ?? (hold.held ? shortcutHint : "")
-        subtitleEnd.constant = shortcut.stringValue.isEmpty ? 0 : -4
+        updateTrailingSpacing()
     }
 
     /// The Cmd+N hint as shown, empty while hidden.
     var shownShortcut: String { shortcut.stringValue }
 
+    /// Whether the subtitle line is currently hidden (compact mode).
+    var isSubtitleHidden: Bool { subtitle.isHidden }
+
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not supported")
     }
 
-    func configure(_ tab: SidebarTab, truncateTail: Bool = false) {
+    func configure(_ tab: SidebarTab, compact: Bool = false, truncateTail: Bool = false) {
+        setCompact(compact)
         controller = tab.controller
         self.tab = tab.tab ?? tab.controller?.selectedTab
-        subtitle.lineBreakMode = truncateTail ? .byTruncatingTail : .byTruncatingMiddle
+        let chrome = SessionManager.shared.config.chrome
         title.stringValue = tab.title
         title.font = .systemFont(ofSize: 13, weight: tab.selected ? .medium : .regular)
-        trailingDetail = tab.trailingDetail
-        shortcutHint = tab.shortcut.map { "⌘\($0)" } ?? ""
-        commandHeldChanged()
-        if let branch = tab.branch {
-            // Attributed strings don't inherit the field's line break mode: keep one line, and
-            // shorten the branch rather than the diff counts.
-            let para = NSMutableParagraphStyle()
-            para.lineBreakMode = .byTruncatingMiddle
-            let chrome = SessionManager.shared.config.chrome
-            let base: [NSAttributedString.Key: Any] = [.foregroundColor: chrome.contentSecondary,
-                                                      .font: subtitle.font!, .paragraphStyle: para]
-            let s = NSMutableAttributedString(string: branch, attributes: base)
-            if tab.added > 0 {
-                s.append(NSAttributedString(string: "  +\(tab.added)",
-                                            attributes: base.merging([.foregroundColor: chrome.success]) { $1 }))
+        title.textColor = chrome.contentPrimary
+        shortcut.textColor = chrome.contentTertiary
+        if !compact {
+            subtitle.lineBreakMode = truncateTail ? .byTruncatingTail : .byTruncatingMiddle
+            if let branch = tab.branch {
+                // Attributed strings don't inherit the field's line break mode: keep one line, and
+                // shorten the branch rather than the diff counts.
+                let para = NSMutableParagraphStyle()
+                para.lineBreakMode = .byTruncatingMiddle
+                let base: [NSAttributedString.Key: Any] = [.foregroundColor: chrome.contentSecondary,
+                                                          .font: subtitle.font!, .paragraphStyle: para]
+                let s = NSMutableAttributedString(string: branch, attributes: base)
+                if tab.added > 0 {
+                    s.append(NSAttributedString(string: "  +\(tab.added)",
+                                                attributes: base.merging([.foregroundColor: chrome.success]) { $1 }))
+                }
+                if tab.removed > 0 {
+                    s.append(NSAttributedString(string: " −\(tab.removed)",
+                                                attributes: base.merging([.foregroundColor: chrome.danger]) { $1 }))
+                }
+                subtitle.attributedStringValue = s
+            } else {
+                // The directory, unless the title already says the same.
+                let dir = tab.subtitle ?? ""
+                subtitle.textColor = chrome.contentSecondary
+                subtitle.stringValue = dir == tab.title || tab.title.hasSuffix(dir) ? "" : dir
             }
-            if tab.removed > 0 {
-                s.append(NSAttributedString(string: " −\(tab.removed)",
-                                            attributes: base.merging([.foregroundColor: chrome.danger]) { $1 }))
-            }
-            subtitle.attributedStringValue = s
-        } else {
-            // The directory, unless the title already says the same.
-            let dir = tab.subtitle ?? ""
-            subtitle.stringValue = dir == tab.title || tab.title.hasSuffix(dir) ? "" : dir
         }
-        icon.image = tab.icon.tile(size: 20, behind: tab.behind, badge: nil)
+        let iconSize = compact ? Self.compactIconSize : Self.normalIconSize
+        icon.image = tab.icon.tile(size: iconSize, behind: tab.behind, badge: nil)
         // A working agent shows the moving dots; the badge on the tile is for the states that
         // want attention. Idle agents show neither.
         working.isShown = tab.status == .working
-        working.color = SessionManager.shared.config.chrome.contentSecondary
+        working.color = chrome.contentSecondary
+        trailingDetail = tab.trailingDetail
+        shortcutHint = tab.shortcut.map { "⌘\($0)" } ?? ""
+        commandHeldChanged()
         dot.isHidden = tab.status == nil || tab.status == .idle || tab.status == .working
         dot.layer?.backgroundColor = tab.status?.color.cgColor
         dot.layer?.borderColor = SessionManager.shared.config.sidebarColor.cgColor
-        progress.track = SessionManager.shared.config.chrome.control
+        progress.track = chrome.control
         setProgress(tab.progress)
+        titleBox.updateMask()
         // The other tabs have their hover card instead.
-        toolTip = showsHoverCard && !tab.selected ? nil : [tab.title, tab.subtitle].compactMap { $0 }.joined(separator: "\n")
+        if showsHoverCard && !tab.selected {
+            toolTip = nil
+        } else if compact {
+            var lines: [String] = []
+            for part in [tab.title, tab.branch, tab.subtitle].compactMap({ $0 }) where !part.isEmpty && !lines.contains(part) {
+                lines.append(part)
+            }
+            toolTip = lines.joined(separator: "\n")
+        } else {
+            toolTip = [tab.title, tab.subtitle].compactMap { $0 }.joined(separator: "\n")
+        }
     }
 
     /// Sets the bar alone: its fill layer moves, the rest of the row stays as it is. Like the

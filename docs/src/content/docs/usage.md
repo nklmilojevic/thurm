@@ -148,6 +148,9 @@ The View menu changes what the sidebar lists, as do the settings below:
   away. Each row shows what the agent is doing and when it last reported. An agent keeps its
   place within its status. Under **Tabs** come the tabs with a program reporting progress,
   and the selected tab when its focused pane has no agent row. Dragging rows does not reorder tabs in this list.
+- **Compact Tabs** (`window.sidebar_compact`). Single-line rows in the sidebar showing only
+  the icon and title, hiding the branch or directory line. Long titles fade out at the right
+  edge, and hovering a tab still shows its full details.
 
 To keep a tab in sight whatever workspace the sidebar shows, right-click it and choose
 **Pin Tab**, or use **Window > Pin Tab**. Pinned tabs show under **Pinned** at the top of the
